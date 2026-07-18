@@ -1,0 +1,399 @@
+from __future__ import absolute_import, print_function
+
+from numba import jit, njit
+import numpy
+import numpy as np
+import numpy.linalg as np_linalg
+import scipy
+import scipy as sp
+import scipy.linalg as sp_linalg
+import scipy.special as sp_special
+import scipy.stats as stats
+
+from kanly.utils.logit_functions import logit, log_d_expit, expit, d_expit
+from kanly.automatic_differentiation.elementary_functions import (
+    sin, cos, tan, arcsin, arccos, arctan, cbrt,
+    sqrt, log, log2, log10, exp)
+from kanly.utils.stats_functions import (
+    std_normal_cdf, normal_cdf, normal_pdf,
+    normal_logpdf, log_normal_pdf, log_normal_logpdf, log_normal_cdf)
+
+from kanly.stats.distributions.nopython_logpdf import logpdf_beta
+from kanly.stats.distributions.nopython_logpdf import logpdf_cauchy
+from kanly.stats.distributions.nopython_logpdf import logpdf_chi2
+from kanly.stats.distributions.nopython_logpdf import logpdf_expon
+from kanly.stats.distributions.nopython_logpdf import logpdf_f
+from kanly.stats.distributions.nopython_logpdf import logpdf_gamma
+from kanly.stats.distributions.nopython_logpdf import logpdf_genextreme
+from kanly.stats.distributions.nopython_logpdf import logpdf_halfcauchy
+from kanly.stats.distributions.nopython_logpdf import logpdf_halfnorm
+from kanly.stats.distributions.nopython_logpdf import logpdf_invgamma
+from kanly.stats.distributions.nopython_logpdf import logpdf_laplace
+from kanly.stats.distributions.nopython_logpdf import logpdf_logistic
+from kanly.stats.distributions.nopython_logpdf import logpdf_lognorm
+from kanly.stats.distributions.nopython_logpdf import logpdf_multivariate_normal
+from kanly.stats.distributions.nopython_logpdf import logpdf_multivariate_t
+from kanly.stats.distributions.nopython_logpdf import logpdf_norm
+from kanly.stats.distributions.nopython_logpdf import logpdf_pareto
+from kanly.stats.distributions.nopython_logpdf import logpdf_t
+from kanly.stats.distributions.nopython_logpdf import logpdf_truncnorm
+from kanly.stats.distributions.nopython_logpdf import logpdf_weibull_min
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_beta
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_cauchy
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_chi2
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_expon
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_f
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_gamma
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_genextreme
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_halfcauchy
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_halfnorm
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_invgamma
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_laplace
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_logistic
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_lognorm
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_multivariate_normal
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_multivariate_t
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_norm
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_pareto
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_t
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_truncnorm
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_weibull_min
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_beta
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_cauchy
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_chi2
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_expon
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_f
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_gamma
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_genextreme
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_halfcauchy
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_halfnorm
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_invgamma
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_laplace
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_logistic
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_lognorm
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_multivariate_normal
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_multivariate_t
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_norm
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_pareto
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_t
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_truncnorm
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_weibull_min
+from kanly.stats.distributions.nopython_logpdf import pdf_beta
+from kanly.stats.distributions.nopython_logpdf import pdf_cauchy
+from kanly.stats.distributions.nopython_logpdf import pdf_chi2
+from kanly.stats.distributions.nopython_logpdf import pdf_expon
+from kanly.stats.distributions.nopython_logpdf import pdf_f
+from kanly.stats.distributions.nopython_logpdf import pdf_gamma
+from kanly.stats.distributions.nopython_logpdf import pdf_genextreme
+from kanly.stats.distributions.nopython_logpdf import pdf_halfcauchy
+from kanly.stats.distributions.nopython_logpdf import pdf_halfnorm
+from kanly.stats.distributions.nopython_logpdf import pdf_invgamma
+from kanly.stats.distributions.nopython_logpdf import pdf_laplace
+from kanly.stats.distributions.nopython_logpdf import pdf_logistic
+from kanly.stats.distributions.nopython_logpdf import pdf_lognorm
+from kanly.stats.distributions.nopython_logpdf import pdf_multivariate_normal
+from kanly.stats.distributions.nopython_logpdf import pdf_multivariate_t
+from kanly.stats.distributions.nopython_logpdf import pdf_norm
+from kanly.stats.distributions.nopython_logpdf import pdf_pareto
+from kanly.stats.distributions.nopython_logpdf import pdf_t
+from kanly.stats.distributions.nopython_logpdf import pdf_truncnorm
+from kanly.stats.distributions.nopython_logpdf import pdf_weibull_min
+
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_genextreme
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_norm
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_truncnorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_beta
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_cauchy
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_laplace
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_expon
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_t
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_gamma
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_lognorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_invgamma
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_logistic
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_chi2
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_gennorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_multivariate_normal
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_multivariate_t
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_halfnorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_pareto
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_halfcauchy
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_loguniform
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_f
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_weibull_min
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_dirichlet
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_norm
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_halfnorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_beta
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_cauchy
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_laplace
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_expon
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_t
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_multivariate_t
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_gamma
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_lognorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_invgamma
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_logistic
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_chi2
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_gennorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_multivariate_normal
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_truncnorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_pareto
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_halfcauchy
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_loguniform
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_genextreme
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_f
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_weibull_min
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_dirichlet
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_pareto
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_norm
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_truncnorm
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_halfnorm
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_beta
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_cauchy
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_laplace
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_expon
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_t
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_gamma
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_invgamma
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_lognorm
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_logistic
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_gennorm
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_chi2
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_multivariate_normal
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_halfcauchy
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_multivariate_t
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_uniform
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_flat
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_loguniform
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_genextreme
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_f
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_weibull_min
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_dirichlet
+
+from kanly.stats.distributions.nopython_scipy_special import (
+    beta, betaln, ndtr, erf, erfc, gamma, gammaln
+)
+
+from numba import jit, njit
+import numpy
+import numpy as np
+import numpy.linalg as np_linalg
+import scipy
+import scipy as sp
+import scipy.linalg as sp_linalg
+import scipy.special as sp_special
+import scipy.stats as stats
+# import numba_scipy
+from kanly.utils.logit_functions import logit, log_d_expit, expit, d_expit
+from kanly.automatic_differentiation.elementary_functions import (
+    sin, cos, tan, arcsin, arccos, arctan, cbrt,
+    sqrt, log, log2, log10, exp)
+from kanly.utils.stats_functions import (
+    std_normal_cdf, normal_cdf, normal_pdf,
+    normal_logpdf, log_normal_pdf, log_normal_logpdf, log_normal_cdf)
+
+from kanly.stats.distributions.nopython_logpdf import logpdf_beta
+from kanly.stats.distributions.nopython_logpdf import logpdf_cauchy
+from kanly.stats.distributions.nopython_logpdf import logpdf_chi2
+from kanly.stats.distributions.nopython_logpdf import logpdf_expon
+from kanly.stats.distributions.nopython_logpdf import logpdf_f
+from kanly.stats.distributions.nopython_logpdf import logpdf_gamma
+from kanly.stats.distributions.nopython_logpdf import logpdf_genextreme
+from kanly.stats.distributions.nopython_logpdf import logpdf_halfcauchy
+from kanly.stats.distributions.nopython_logpdf import logpdf_halfnorm
+from kanly.stats.distributions.nopython_logpdf import logpdf_invgamma
+from kanly.stats.distributions.nopython_logpdf import logpdf_laplace
+from kanly.stats.distributions.nopython_logpdf import logpdf_logistic
+from kanly.stats.distributions.nopython_logpdf import logpdf_lognorm
+from kanly.stats.distributions.nopython_logpdf import logpdf_multivariate_normal
+from kanly.stats.distributions.nopython_logpdf import logpdf_multivariate_t
+from kanly.stats.distributions.nopython_logpdf import logpdf_norm
+from kanly.stats.distributions.nopython_logpdf import logpdf_pareto
+from kanly.stats.distributions.nopython_logpdf import logpdf_t
+from kanly.stats.distributions.nopython_logpdf import logpdf_truncnorm
+from kanly.stats.distributions.nopython_logpdf import logpdf_weibull_min
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_beta
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_cauchy
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_chi2
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_expon
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_f
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_gamma
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_genextreme
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_halfcauchy
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_halfnorm
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_invgamma
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_laplace
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_logistic
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_lognorm
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_multivariate_normal
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_multivariate_t
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_norm
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_pareto
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_t
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_truncnorm
+from kanly.stats.distributions.nopython_logpdf import nopython_logpdf_weibull_min
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_beta
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_cauchy
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_chi2
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_expon
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_f
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_gamma
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_genextreme
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_halfcauchy
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_halfnorm
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_invgamma
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_laplace
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_logistic
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_lognorm
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_multivariate_normal
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_multivariate_t
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_norm
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_pareto
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_t
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_truncnorm
+from kanly.stats.distributions.nopython_logpdf import nopython_pdf_weibull_min
+from kanly.stats.distributions.nopython_logpdf import pdf_beta
+from kanly.stats.distributions.nopython_logpdf import pdf_cauchy
+from kanly.stats.distributions.nopython_logpdf import pdf_chi2
+from kanly.stats.distributions.nopython_logpdf import pdf_expon
+from kanly.stats.distributions.nopython_logpdf import pdf_f
+from kanly.stats.distributions.nopython_logpdf import pdf_gamma
+from kanly.stats.distributions.nopython_logpdf import pdf_genextreme
+from kanly.stats.distributions.nopython_logpdf import pdf_halfcauchy
+from kanly.stats.distributions.nopython_logpdf import pdf_halfnorm
+from kanly.stats.distributions.nopython_logpdf import pdf_invgamma
+from kanly.stats.distributions.nopython_logpdf import pdf_laplace
+from kanly.stats.distributions.nopython_logpdf import pdf_logistic
+from kanly.stats.distributions.nopython_logpdf import pdf_lognorm
+from kanly.stats.distributions.nopython_logpdf import pdf_multivariate_normal
+from kanly.stats.distributions.nopython_logpdf import pdf_multivariate_t
+from kanly.stats.distributions.nopython_logpdf import pdf_norm
+from kanly.stats.distributions.nopython_logpdf import pdf_pareto
+from kanly.stats.distributions.nopython_logpdf import pdf_t
+from kanly.stats.distributions.nopython_logpdf import pdf_truncnorm
+from kanly.stats.distributions.nopython_logpdf import pdf_weibull_min
+
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_genextreme
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_norm
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_truncnorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_beta
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_cauchy
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_laplace
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_expon
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_t
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_gamma
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_lognorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_invgamma
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_logistic
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_chi2
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_gennorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_multivariate_normal
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_multivariate_t
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_halfnorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_pareto
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_halfcauchy
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_loguniform
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_f
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_weibull_min
+from kanly.stats.distributions.nopython_frozen_logpdf import __frozen_internal_logpdf_dirichlet
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_norm
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_halfnorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_beta
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_cauchy
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_laplace
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_expon
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_t
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_multivariate_t
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_gamma
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_lognorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_invgamma
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_logistic
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_chi2
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_gennorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_multivariate_normal
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_truncnorm
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_pareto
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_halfcauchy
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_loguniform
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_genextreme
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_f
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_weibull_min
+from kanly.stats.distributions.nopython_frozen_logpdf import __nopython_frozen_internal_logpdf_dirichlet
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_pareto
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_norm
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_truncnorm
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_halfnorm
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_beta
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_cauchy
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_laplace
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_expon
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_t
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_gamma
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_invgamma
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_lognorm
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_logistic
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_gennorm
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_chi2
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_multivariate_normal
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_halfcauchy
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_multivariate_t
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_uniform
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_flat
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_loguniform
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_genextreme
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_f
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_weibull_min
+from kanly.stats.distributions.nopython_frozen_logpdf import get_frozen_logpdf_dirichlet
+
+# print('from kanly.stats.common import(')
+# for v in list(globals().keys()):
+#      print(v, end=', ')
+# print(')')
+
+IMPORT_STR = """from kanly.stats.common import (
+    jit, njit, numpy, np, np_linalg, scipy, sp, sp_linalg, sp_special, stats, logit, log_d_expit, expit, d_expit, sin,
+    cos, tan, arcsin, arccos, arctan, cbrt, sqrt, log, log2, log10, exp, std_normal_cdf, normal_cdf, normal_pdf,
+    normal_logpdf, log_normal_pdf, log_normal_logpdf, log_normal_cdf, logpdf_beta, logpdf_cauchy, logpdf_chi2,
+    logpdf_expon, logpdf_f, logpdf_gamma, logpdf_genextreme, logpdf_halfcauchy, logpdf_halfnorm, logpdf_invgamma,
+    logpdf_laplace, logpdf_logistic, logpdf_lognorm, logpdf_multivariate_normal, logpdf_multivariate_t, logpdf_norm,
+    logpdf_pareto, logpdf_t, logpdf_truncnorm, logpdf_weibull_min, nopython_logpdf_beta, nopython_logpdf_cauchy,
+    nopython_logpdf_chi2, nopython_logpdf_expon, nopython_logpdf_f, nopython_logpdf_gamma, nopython_logpdf_genextreme,
+    nopython_logpdf_halfcauchy, nopython_logpdf_halfnorm, nopython_logpdf_invgamma, nopython_logpdf_laplace,
+    nopython_logpdf_logistic, nopython_logpdf_lognorm, nopython_logpdf_multivariate_normal,
+    nopython_logpdf_multivariate_t, nopython_logpdf_norm, nopython_logpdf_pareto, nopython_logpdf_t,
+    nopython_logpdf_truncnorm, nopython_logpdf_weibull_min, nopython_pdf_beta, nopython_pdf_cauchy, nopython_pdf_chi2,
+    nopython_pdf_expon, nopython_pdf_f, nopython_pdf_gamma, nopython_pdf_genextreme, nopython_pdf_halfcauchy,
+    nopython_pdf_halfnorm, nopython_pdf_invgamma, nopython_pdf_laplace, nopython_pdf_logistic, nopython_pdf_lognorm,
+    nopython_pdf_multivariate_normal, nopython_pdf_multivariate_t, nopython_pdf_norm, nopython_pdf_pareto,
+    nopython_pdf_t, nopython_pdf_truncnorm, nopython_pdf_weibull_min, pdf_beta, pdf_cauchy, pdf_chi2, pdf_expon, pdf_f,
+    pdf_gamma, pdf_genextreme, pdf_halfcauchy, pdf_halfnorm, pdf_invgamma, pdf_laplace, pdf_logistic, pdf_lognorm,
+    pdf_multivariate_normal, pdf_multivariate_t, pdf_norm, pdf_pareto, pdf_t, pdf_truncnorm, pdf_weibull_min,
+    __frozen_internal_logpdf_genextreme, __frozen_internal_logpdf_norm, __frozen_internal_logpdf_truncnorm,
+    __frozen_internal_logpdf_beta, __frozen_internal_logpdf_cauchy, __frozen_internal_logpdf_laplace,
+    __frozen_internal_logpdf_expon, __frozen_internal_logpdf_t, __frozen_internal_logpdf_gamma,
+    __frozen_internal_logpdf_lognorm, __frozen_internal_logpdf_invgamma, __frozen_internal_logpdf_logistic,
+    __frozen_internal_logpdf_chi2, __frozen_internal_logpdf_gennorm, __frozen_internal_logpdf_multivariate_normal,
+    __frozen_internal_logpdf_multivariate_t, __frozen_internal_logpdf_halfnorm, __frozen_internal_logpdf_pareto,
+    __frozen_internal_logpdf_halfcauchy, __frozen_internal_logpdf_loguniform, __frozen_internal_logpdf_f,
+    __frozen_internal_logpdf_weibull_min, __frozen_internal_logpdf_dirichlet, __nopython_frozen_internal_logpdf_norm,
+    __nopython_frozen_internal_logpdf_halfnorm, __nopython_frozen_internal_logpdf_beta,
+    __nopython_frozen_internal_logpdf_cauchy, __nopython_frozen_internal_logpdf_laplace,
+    __nopython_frozen_internal_logpdf_expon, __nopython_frozen_internal_logpdf_t,
+    __nopython_frozen_internal_logpdf_multivariate_t, __nopython_frozen_internal_logpdf_gamma,
+    __nopython_frozen_internal_logpdf_lognorm, __nopython_frozen_internal_logpdf_invgamma,
+    __nopython_frozen_internal_logpdf_logistic, __nopython_frozen_internal_logpdf_chi2,
+    __nopython_frozen_internal_logpdf_gennorm, __nopython_frozen_internal_logpdf_multivariate_normal,
+    __nopython_frozen_internal_logpdf_truncnorm, __nopython_frozen_internal_logpdf_pareto,
+    __nopython_frozen_internal_logpdf_halfcauchy, __nopython_frozen_internal_logpdf_loguniform,
+    __nopython_frozen_internal_logpdf_genextreme, __nopython_frozen_internal_logpdf_f,
+    __nopython_frozen_internal_logpdf_weibull_min, __nopython_frozen_internal_logpdf_dirichlet,
+    get_frozen_logpdf_pareto, get_frozen_logpdf_norm, get_frozen_logpdf_truncnorm, get_frozen_logpdf_halfnorm,
+    get_frozen_logpdf_beta, get_frozen_logpdf_cauchy, get_frozen_logpdf_laplace, get_frozen_logpdf_expon,
+    get_frozen_logpdf_t, get_frozen_logpdf_gamma, get_frozen_logpdf_invgamma, get_frozen_logpdf_lognorm,
+    get_frozen_logpdf_logistic, get_frozen_logpdf_gennorm, get_frozen_logpdf_chi2,
+    get_frozen_logpdf_multivariate_normal, get_frozen_logpdf_halfcauchy, get_frozen_logpdf_multivariate_t,
+    get_frozen_logpdf_uniform, get_frozen_logpdf_flat, get_frozen_logpdf_loguniform, get_frozen_logpdf_genextreme,
+    get_frozen_logpdf_f, get_frozen_logpdf_weibull_min, get_frozen_logpdf_dirichlet,
+    beta, betaln, gamma, gammaln, erf, erfc, ndtr
+)"""
