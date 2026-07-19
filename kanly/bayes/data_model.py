@@ -1506,54 +1506,54 @@ class DataModel(ParameterCollection):
 #
 #     fit.multi_scatter(['a', 'a', 'sigma'], show=True)
 #
-if __name__ == '__main__':
-    import pandas as pd
-    import numpy as np
-    from kanly.api import lm, blm, build_data_model
-    from numpy.linalg import pinv
-    from scipy.stats import invgamma
+# if __name__ == '__main__':
+#     import pandas as pd
+#     import numpy as np
+#     from kanly.api import lm, blm, build_data_model
+#     from numpy.linalg import pinv
+#     from scipy.stats import invgamma
 
-    n = 100
-    k = 3
-    np.random.seed(0)
+#     n = 100
+#     k = 3
+#     np.random.seed(0)
 
-    X = np.random.randn(n, k)
-    beta = np.random.rand(k)
-    y = X.dot(beta) + .15 * np.random.randn(n)
+#     X = np.random.randn(n, k)
+#     beta = np.random.rand(k)
+#     y = X.dot(beta) + .15 * np.random.randn(n)
 
-    df = pd.DataFrame(X, columns=[f'x{j}' for j in range(k)])
-    df['y'] = y
+#     df = pd.DataFrame(X, columns=[f'x{j}' for j in range(k)])
+#     df['y'] = y
 
-    sigma = .0001
+#     sigma = .0001
 
-    data_code = f'''
-    self.y = `y`
-    self.x0 = `x0`
-    self.x1 = `x1`
-    self.x2 = `x2`
-    '''
+#     data_code = f'''
+#     self.y = `y`
+#     self.x0 = `x0`
+#     self.x1 = `x1`
+#     self.x2 = `x2`
+#     '''
 
-    model_code = f'''
-    $sigma2<0,np.inf>$
-    sigma = $sigma2$ ** .5
+#     model_code = f'''
+#     $sigma2<0,np.inf>$
+#     sigma = $sigma2$ ** .5
 
-    $beta[3]$
+#     $beta[3]$
 
-    pred = x0 * $beta$[0] + x1 * $beta$[1] + x2 * $beta$[2]
-    llf = logpdf_norm(y, pred, sigma).sum()
-    prior = logpdf_norm($beta$[2], .3, {sigma})
-    prior += logpdf_norm($beta$[2], 2.3, .01)
+#     pred = x0 * $beta$[0] + x1 * $beta$[1] + x2 * $beta$[2]
+#     llf = logpdf_norm(y, pred, sigma).sum()
+#     prior = logpdf_norm($beta$[2], .3, {sigma})
+#     prior += logpdf_norm($beta$[2], 2.3, .01)
 
-    return llf + prior
-    '''
+#     return llf + prior
+#     '''
 
-    model = build_data_model(data_code, model_code, df).to_bayesian_model()
-    print(model)
+#     model = build_data_model(data_code, model_code, df).to_bayesian_model()
+#     print(model)
 
-    f = model.sample({'sigma2': 1}, debug=True, do_parallel=False)
-    print(f)
+#     f = model.sample({'sigma2': 1}, debug=True, do_parallel=False)
+#     print(f)
 
-    import matplotlib.pyplot as plt
-    plt.hist(f.get_sample('beta[2]'), density=True, bins=30, alpha=.6)
-    plt.plot(*get_normal_pdf_x_y(.3, sigma, num_sigma=5), lw=2)
-    plt.show()
+#     import matplotlib.pyplot as plt
+#     plt.hist(f.get_sample('beta[2]'), density=True, bins=30, alpha=.6)
+#     plt.plot(*get_normal_pdf_x_y(.3, sigma, num_sigma=5), lw=2)
+#     plt.show()
