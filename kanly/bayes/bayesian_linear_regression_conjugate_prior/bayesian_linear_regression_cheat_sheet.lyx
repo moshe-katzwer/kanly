@@ -1,0 +1,881 @@
+#LyX 2.4 created this file. For more info see https://www.lyx.org/
+\lyxformat 620
+\begin_document
+\begin_header
+\save_transient_properties true
+\origin unavailable
+\textclass article
+\use_default_options true
+\maintain_unincluded_children no
+\language english
+\language_package default
+\inputencoding auto-legacy
+\fontencoding auto
+\font_roman "default" "default"
+\font_sans "default" "default"
+\font_typewriter "default" "default"
+\font_math "auto" "auto"
+\font_default_family default
+\use_non_tex_fonts false
+\font_sc false
+\font_roman_osf false
+\font_sans_osf false
+\font_typewriter_osf false
+\font_sf_scale 100 100
+\font_tt_scale 100 100
+\use_microtype false
+\use_dash_ligatures true
+\graphics default
+\default_output_format default
+\output_sync 0
+\bibtex_command default
+\index_command default
+\paperfontsize default
+\use_hyperref false
+\papersize default
+\use_geometry false
+\use_package amsmath 1
+\use_package amssymb 1
+\use_package cancel 1
+\use_package esint 1
+\use_package mathdots 1
+\use_package mathtools 1
+\use_package mhchem 1
+\use_package stackrel 1
+\use_package stmaryrd 1
+\use_package undertilde 1
+\cite_engine basic
+\cite_engine_type default
+\use_bibtopic false
+\use_indices false
+\paperorientation portrait
+\suppress_date false
+\justification true
+\use_refstyle 1
+\use_formatted_ref 0
+\use_minted 0
+\use_lineno 0
+\index Index
+\shortcut idx
+\color #008000
+\end_index
+\secnumdepth 3
+\tocdepth 3
+\paragraph_separation indent
+\paragraph_indentation default
+\is_math_indent 0
+\math_numbering_side default
+\quotes_style english
+\dynamic_quotes 0
+\papercolumns 1
+\papersides 1
+\paperpagestyle default
+\tablestyle default
+\tracking_changes false
+\output_changes false
+\change_bars false
+\postpone_fragile_content false
+\html_math_output 0
+\html_css_as_file 0
+\html_be_strict false
+\docbook_table_output 0
+\docbook_mathml_prefix 1
+\end_header
+
+\begin_body
+
+\begin_layout Section
+Notation
+\end_layout
+
+\begin_layout Subsection
+Distributions
+\end_layout
+
+\begin_layout Itemize
+\begin_inset Formula $\text{IG}(a,b)$
+\end_inset
+
+ is the distribution with pdf 
+\begin_inset Formula 
+\[
+f(x;a,b)=\frac{b^{a}}{\Gamma(a)}\frac{1}{x^{a+1}}e^{-b/x}.
+\]
+
+\end_inset
+
+
+\end_layout
+
+\begin_deeper
+\begin_layout Itemize
+Note that as 
+\begin_inset Formula $a,b\to0$
+\end_inset
+
+ then this converges to a pdf proportional to 
+\begin_inset Formula $1/x$
+\end_inset
+
+.
+ 
+\end_layout
+
+\begin_layout Itemize
+The mean is 
+\begin_inset Formula $b/(a-1)$
+\end_inset
+
+.
+ 
+\end_layout
+
+\end_deeper
+\begin_layout Itemize
+\begin_inset Formula $\mathfrak{t}_{p}(\boldsymbol{\mu},\boldsymbol{\Sigma},\nu)$
+\end_inset
+
+ denotes a 
+\begin_inset Formula $p$
+\end_inset
+
+-dimension multivariate 
+\begin_inset Formula $t$
+\end_inset
+
+ distribution with mean and variance 
+\begin_inset Formula $\boldsymbol{\mu},\boldsymbol{\Sigma}$
+\end_inset
+
+,
+ and 
+\begin_inset Formula $\nu$
+\end_inset
+
+ degrees of freedom.
+\end_layout
+
+\begin_layout Itemize
+\begin_inset Formula $\mathcal{N}_{p}(\boldsymbol{\mu},\boldsymbol{\Sigma})$
+\end_inset
+
+ denotes a 
+\begin_inset Formula $p$
+\end_inset
+
+-dimension multivariate normal distribution with mean and variance 
+\begin_inset Formula $\boldsymbol{\mu},\boldsymbol{\Sigma}$
+\end_inset
+
+.
+ 
+\end_layout
+
+\begin_layout Subsubsection
+Regression problem
+\end_layout
+
+\begin_layout Standard
+Suppose 
+\begin_inset Formula $y\in\mathbb{R}^{n}$
+\end_inset
+
+ and 
+\begin_inset Formula $X\in\mathbb{R}^{n\times p}$
+\end_inset
+
+.
+ We are going to assume that 
+\begin_inset Formula 
+\[
+y|_{x}\,\,\sim_{\text{iid}}\,\,\mathcal{N}_{1}\left(x^{\top}\beta,\sigma^{2}\right).
+\]
+
+\end_inset
+
+The likelihood is therefore 
+\begin_inset Formula 
+\begin{align*}
+\pi\left(y\mid X,\beta,\sigma^{2}\right) & =\prod_{i}\frac{1}{\sqrt{2\pi\sigma^{2}}}\exp\left\{ -\frac{1}{2}\frac{\left(y_{i}-x_{i}^{\top}\beta\right)^{2}}{\sigma^{2}}\right\} \\
+ & =\left(\frac{1}{2\pi\sigma^{2}}\right)^{n/2}\exp\left\{ -\frac{1}{2\sigma^{2}}\,\text{SSR}\left(\beta\mid y,X\right)\right\} 
+\end{align*}
+
+\end_inset
+
+where 
+\begin_inset Formula $\text{SSR}\left(\beta\mid y,X\right)=\sum_{i}\left(y_{i}-x_{i}^{\top}\beta\right)^{2}$
+\end_inset
+
+.
+ 
+\end_layout
+
+\begin_layout Standard
+We then apply a prior 
+\begin_inset Formula $\pi(\beta,\sigma^{2})$
+\end_inset
+
+ to form a posterior 
+\begin_inset Formula 
+\begin{align*}
+\pi(\beta,\sigma^{2}\mid y,X) & \propto\pi(\beta,\sigma^{2})\times\pi(y\mid X,\beta,\sigma^{2}).
+\end{align*}
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Section
+Analytically Tractable Priors
+\end_layout
+
+\begin_layout Subsection
+Normal-Inverse-Gaussian (NIG)
+\end_layout
+
+\begin_layout Standard
+Assume a prior 
+\begin_inset Formula 
+\begin{align*}
+\sigma^{2} & \sim\text{IG}(a_{0},b_{0})\\
+\beta|_{\sigma^{2}} & \sim\mathcal{N}_{p}\left(\boldsymbol{\mu}_{0},\sigma^{2}\boldsymbol{\Lambda}_{0}^{-1}\right)
+\end{align*}
+
+\end_inset
+
+Then we update the posterior as follows:
+\end_layout
+
+\begin_layout Standard
+\begin_inset Formula 
+\begin{eqnarray*}
+\boldsymbol{\Lambda}_{0} & \to & \hat{\boldsymbol{\Lambda}}=X^{\top}X+\boldsymbol{\Lambda}_{0}\\
+\boldsymbol{\mu}_{0} & \to & \hat{\boldsymbol{\mu}}=\hat{\boldsymbol{\Lambda}}^{-1}\left(X^{\top}y+\boldsymbol{\Lambda}_{0}\boldsymbol{\mu}_{0}\right)\\
+a_{0} & \to & \hat{a}=a_{0}+\frac{n}{2}\qquad(\text{SHOULD THIS BE }\frac{n-p}{2})??\\
+b_{0} & \to & \hat{b}=b_{0}+\frac{1}{2}\left(y^{\top}y+\boldsymbol{\mu}_{0}^{\top}\boldsymbol{\Lambda}_{0}\boldsymbol{\mu}_{0}-\hat{\boldsymbol{\mu}}^{\top}\hat{\boldsymbol{\Lambda}}\hat{\boldsymbol{\mu}}\right)
+\end{eqnarray*}
+
+\end_inset
+
+You sometimes see the parametrization 
+\begin_inset Formula $a=\frac{1}{2}\nu,b=\frac{1}{2}\nu\sigma_{0}^{2}$
+\end_inset
+
+,
+ which implies a distribution on the prior with 
+\begin_inset Formula 
+\[
+E[\sigma^{2}]=\frac{\nu}{\nu-2}\sigma_{0}^{2},\qquad V[\sigma^{2}]=\frac{\frac{1}{4}\nu^{2}}{(\frac{1}{2}\nu-1)^{2}(\frac{1}{2}\nu-2)}\sigma_{0}^{2}.
+\]
+
+\end_inset
+
+You can see that as 
+\begin_inset Formula $\nu\to\infty$
+\end_inset
+
+ the mean goes 
+\begin_inset Formula $\sigma_{0}^{2}$
+\end_inset
+
+ and the variance goes to zero (since you have squared over cubed).
+ So 
+\begin_inset Formula $\sigma_{0}^{2}$
+\end_inset
+
+ is our 
+\begin_inset Quotes eld
+\end_inset
+
+guess
+\begin_inset Quotes erd
+\end_inset
+
+ on the scale and 
+\begin_inset Formula $\nu$
+\end_inset
+
+ is our 
+\begin_inset Quotes eld
+\end_inset
+
+confidence
+\begin_inset Quotes erd
+\end_inset
+
+.
+ 
+\end_layout
+
+\begin_layout Subsubsection
+Marginal Posteriors
+\end_layout
+
+\begin_layout Standard
+\begin_inset Formula 
+\begin{eqnarray*}
+\sigma^{2}\mid_{y,X} & \sim & \text{IG}(\hat{a},\hat{b})\\
+\beta^{2}\mid_{y,X} & \sim & \mathcal{\mathfrak{t}}_{p}\left(\hat{\mu},\frac{\hat{b}}{\hat{a}}\hat{\boldsymbol{\Lambda}}^{-1},2\hat{a}\right)
+\end{eqnarray*}
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Subsubsection
+Conditional Posteriors
+\end_layout
+
+\begin_layout Standard
+\begin_inset Formula 
+\begin{align*}
+\beta|_{\sigma^{2},y,X} & \sim\mathcal{N}_{p}\left(\hat{\mu},\sigma^{2}\hat{\boldsymbol{\Lambda}}^{-1}\right)\\
+\sigma^{2}|_{\beta,y,X} & \sim\text{IG}\left(a_{0}+\frac{n+2}{2},b_{0}+\frac{1}{2}\left(y-X\beta\right)^{\top}\left(y-X\beta\right)+\frac{1}{2}\left(\beta-\boldsymbol{\mu}_{0}\right)^{\top}\boldsymbol{\Lambda}_{0}\left(\beta-\boldsymbol{\mu}_{0}\right)\right)
+\end{align*}
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Subsection
+Diffuse (Jeffrey's Prior)
+\end_layout
+
+\begin_layout Standard
+Assume a prior 
+\begin_inset Formula $\pi(\beta,\sigma^{2})\propto1/\sigma^{2}$
+\end_inset
+
+.
+ Then
+\end_layout
+
+\begin_layout Subsubsection
+Marginal Posteriors
+\end_layout
+
+\begin_layout Standard
+\begin_inset Formula 
+\[
+\beta|_{X,y}\sim\mathfrak{t}_{p+1}\left(\hat{\beta},\hat{\Sigma},t-p\right)
+\]
+
+\end_inset
+
+where 
+\begin_inset Formula 
+\begin{align*}
+\hat{\beta} & =\left(X^{\top}X\right)^{-1}X^{\top}y\\
+\hat{\sigma}^{2} & =\frac{\left(y-X\hat{\beta}\right)^{\top}\left(y-X\hat{\beta}\right)}{n}\\
+\hat{\Sigma} & =\hat{\sigma}^{2}(X^{\top}X)^{-1}
+\end{align*}
+
+\end_inset
+
+and 
+\begin_inset Formula 
+\[
+\sigma^{2}|_{X,y}\sim\text{IG}\left(\frac{n-p}{2},\frac{n}{2}\hat{\sigma}^{2}\right).
+\]
+
+\end_inset
+
+Note that 
+\begin_inset Formula $\hat{\beta},\hat{\sigma}$
+\end_inset
+
+ are the MAP estimates.
+\end_layout
+
+\begin_layout Subsubsection
+Conditional Posteriors
+\end_layout
+
+\begin_layout Standard
+\begin_inset Formula 
+\begin{align*}
+\beta|_{\sigma^{2},y,X} & \sim\mathcal{N}_{p}\left(\hat{\beta},\sigma^{2}\left(X^{\top}X\right)^{-1}\right)\\
+\sigma^{2}|_{\beta,y,X} & \sim\text{IG}\left(\frac{n}{2},\frac{n}{2}\hat{\sigma}^{2}\right)
+\end{align*}
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Subsubsection
+Joint Posterior
+\begin_inset Formula 
+\[
+\beta,\sigma^{2}|_{y,X}\propto\mathcal{N}_{p}\left(\hat{\beta},\sigma^{2}\left(X^{\top}X\right)^{-1}\right)\times\text{IG}\left(\frac{n-p}{2},\frac{n}{2}\hat{\sigma}^{2}\right)
+\]
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Section
+Connection to Ridge Regression
+\end_layout
+
+\begin_layout Standard
+The Bayesian Linear Regression with the prior 
+\begin_inset Formula 
+\[
+\beta|_{\sigma^{2}}\sim\mathcal{N}\left(\mu,\sigma^{2}\,\text{Diag}(\{\lambda_{k}^{-1}\}_{k})\right)
+\]
+
+\end_inset
+
+is equivalent to the Ridge regression
+\begin_inset Formula 
+\[
+\min_{\beta}\,\,\,\frac{1}{2n}\sum_{i}w_{i}\left(y_{i}-x_{i}'\beta\right)^{2}+\sum_{k}\frac{\tilde{\lambda}_{k}}{2}\left(\beta_{k}-\bar{\beta}_{k}\right)^{2}.
+\]
+
+\end_inset
+
+where 
+\begin_inset Formula $\tilde{\lambda}_{k}=\lambda_{k}/\left(\sum_{i}w_{i}\right)$
+\end_inset
+
+ ,
+ where 
+\begin_inset Formula $w_{i}$
+\end_inset
+
+ are the weights.
+\end_layout
+
+\begin_layout Section
+Sources
+\end_layout
+
+\begin_layout Itemize
+\begin_inset CommandInset href
+LatexCommand href
+name "https://www.mathworks.com/help/econ/what-is-bayesian-linear-regression.html"
+target "https://www.mathworks.com/help/econ/what-is-bayesian-linear-regression.html"
+literal "false"
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Itemize
+\begin_inset CommandInset href
+LatexCommand href
+name "https://en.wikipedia.org/wiki/Bayesian_linear_regression#:~:text=Bayesian%20linear%20regression%20is%20a,distribution%20of%20the%20regressand)%20and"
+target "https://en.wikipedia.org/wiki/Bayesian_linear_regression#:~:text=Bayesian%20linear%20regression%20is%20a,distribution%20of%20the%20regressand)%20and"
+literal "false"
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Itemize
+\begin_inset CommandInset href
+LatexCommand href
+name "https://ams206-winter19-01.courses.soe.ucsc.edu/system/files/attachments/banerjee-bayesian-linear-model-details.pdf"
+target "https://ams206-winter19-01.courses.soe.ucsc.edu/system/files/attachments/banerjee-bayesian-linear-model-details.pdf"
+literal "false"
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Itemize
+TODO 
+\begin_inset CommandInset href
+LatexCommand href
+name "https://en.wikipedia.org/wiki/G-prior"
+target "https://en.wikipedia.org/wiki/G-prior"
+literal "false"
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Section
+Appendix:
+ Derivation
+\end_layout
+
+\begin_layout Standard
+Suppose 
+\begin_inset Formula $\sigma^{2}\sim\text{InvGamma}(a_{0},b_{0})$
+\end_inset
+
+ and 
+\begin_inset Formula $\beta|_{\sigma^{2}}\sim\mathcal{N}\left(\mu_{0},\sigma^{2}\Lambda_{0}^{-1}\right)$
+\end_inset
+
+.
+ This suggests a posterior of the form 
+\begin_inset Formula 
+\begin{eqnarray*}
+p\left(\beta,\sigma^{2}\mid y\right) & \propto & \frac{b_{0}^{a_{0}}}{\Gamma(a_{0})}\frac{1}{(\sigma^{2})^{a+1}}e^{-b_{0}/\sigma_{2}}\\
+ &  & \qquad\times(2\pi)^{-p/2}\det\left(\sigma^{2}\Lambda_{0}^{-1}\right)^{-1/2}\exp\left\{ -\frac{1}{2\sigma^{2}}\left(\beta-\mu_{0}\right)^{\top}\Lambda_{0}\left(\beta-\mu_{0}\right)\right\} \\
+ &  & \qquad\times(2\pi)^{-n/2}\det\left(\sigma^{2}I_{n}\right)^{-1/2}\exp\left\{ -\frac{1}{2\sigma^{2}}\left(y-X\beta\right)^{\top}\left(y-X\beta\right)\right\} 
+\end{eqnarray*}
+
+\end_inset
+
+Grouping the exponential terms,
+ 
+\begin_inset Formula 
+\begin{align*}
+ & \exp\left\{ -\frac{1}{2\sigma^{2}}\left(\beta-\mu_{0}\right)^{\top}\Lambda_{0}\left(\beta-\mu_{0}\right)\right\} \exp\left\{ -\frac{1}{2\sigma^{2}}\left(y-X\beta\right)^{\top}\left(y-X\beta\right)\right\} \\
+= & \exp\left\{ -\frac{1}{2\sigma^{2}}\left[\left(\beta-\mu_{0}\right)^{\top}\Lambda_{0}\left(\beta-\mu_{0}\right)+\left(y-X\beta\right)^{\top}\left(y-X\beta\right)\right]\right\} \\
+= & \exp\left\{ -\frac{1}{2\sigma^{2}}\left[\beta^{\top}\Lambda_{0}\beta-2\beta^{\top}\Lambda_{0}\mu_{0}-\mu_{0}^{\top}\Lambda_{0}\mu_{0}+y^{\top}y-2y^{\top}X\beta+\beta^{\top}X^{\top}X\beta\right]\right\} \\
+= & \exp\left\{ -\frac{1}{2\sigma^{2}}\left[\beta^{\top}\left(\Lambda_{0}+X^{\top}X\right)\beta-2\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\beta-\mu_{0}^{\top}\Lambda_{0}\mu_{0}+y^{\top}y\right]\right\} 
+\end{align*}
+
+\end_inset
+
+Now,
+ let 
+\begin_inset Formula $\mu_{n}=\left(\Lambda_{0}+X^{\top}X\right)^{-1}\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)$
+\end_inset
+
+,
+ note that this maximizes the quadratic form in the exponential.
+ Now,
+ note that 
+\begin_inset Formula 
+\begin{align*}
+\left(\beta-\mu_{n}\right)^{\top}\left(\Lambda_{0}+X^{\top}X\right)\left(\beta-\mu_{n}\right) & =\beta^{\top}\left(\Lambda_{0}+X^{\top}X\right)\beta-2\mu_{n}^{\top}\left(\Lambda_{0}+X^{\top}X\right)\beta+\mu_{n}^{\top}\left(\Lambda_{0}+X^{\top}X\right)\mu_{n}\\
+\left(\beta-\mu_{n}\right)^{\top}\left(\Lambda_{0}+X^{\top}X\right)\left(\beta-\mu_{n}\right) & =\beta^{\top}\left(\Lambda_{0}+X^{\top}X\right)\beta-2\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\beta+\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\left(\Lambda_{0}+X^{\top}X\right)^{-1}\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\\
+\beta^{\top}\left(\Lambda_{0}+X^{\top}X\right)\beta & =\left(\beta-\mu_{n}\right)^{\top}\left(\Lambda_{0}+X^{\top}X\right)\left(\beta-\mu_{n}\right)+2\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\beta-\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\left(\Lambda_{0}+X^{\top}X\right)^{-1}\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)
+\end{align*}
+
+\end_inset
+
+
+\begin_inset Formula 
+\begin{eqnarray*}
+\beta^{\top}\left(\Lambda_{0}+X^{\top}X\right)\beta-2\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\beta-\mu_{0}^{\top}\Lambda_{0}\mu_{0}+y^{\top}y & = & \left(\beta-\mu_{n}\right)^{\top}\left(\Lambda_{0}+X^{\top}X\right)\left(\beta-\mu_{n}\right)+2\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\beta\\
+ &  & -\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\left(\Lambda_{0}+X^{\top}X\right)^{-1}\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\\
+ &  & -2\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\beta-\mu_{0}^{\top}\Lambda_{0}\mu_{0}+y^{\top}y\\
+ & = & \left(\beta-\mu_{n}\right)^{\top}\left(\Lambda_{0}+X^{\top}X\right)\left(\beta-\mu_{n}\right)\\
+ &  & -\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\mu_{n}-\mu_{0}^{\top}\Lambda_{0}\mu_{0}+y^{\top}y
+\end{eqnarray*}
+
+\end_inset
+
+Now
+\begin_inset Formula 
+\begin{align*}
+\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right) & =\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\left(\Lambda_{0}+X^{\top}X\right)^{-1}\left(\Lambda_{0}+X^{\top}X\right)\\
+ & =\mu_{n}^{\top}\left(\Lambda_{0}+X^{\top}X\right)
+\end{align*}
+
+\end_inset
+
+So 
+\begin_inset Formula 
+\[
+\beta^{\top}\left(\Lambda_{0}+X^{\top}X\right)\beta-2\left(\mu_{0}^{\top}\Lambda_{0}+y^{\top}X\right)\beta-\mu_{0}^{\top}\Lambda_{0}\mu_{0}+y^{\top}y=\left(\beta-\mu_{n}\right)^{\top}\left(\Lambda_{0}+X^{\top}X\right)\left(\beta-\mu_{n}\right)-\mu_{n}^{\top}\left(\Lambda_{0}+X^{\top}X\right)\mu_{n}-\mu_{0}^{\top}\Lambda_{0}\mu_{0}+y^{\top}y
+\]
+
+\end_inset
+
+Finally,
+ define 
+\begin_inset Formula $\Lambda_{n}=\Lambda_{0}+X^{\top}X$
+\end_inset
+
+.
+ Then the quadratic form becomes
+\begin_inset Formula 
+\[
+\left(\beta-\mu_{n}\right)^{\top}\Lambda_{n}\left(\beta-\mu_{n}\right)-\mu_{n}^{\top}\Lambda_{n}\mu_{n}-\mu_{0}^{\top}\Lambda_{0}\mu_{0}+y^{\top}y
+\]
+
+\end_inset
+
+and we can now rewrite the posterior as 
+\begin_inset Formula 
+\begin{eqnarray*}
+p\left(\beta,\sigma^{2}\mid y\right) & \propto & \frac{b_{0}^{a_{0}}}{\Gamma(a_{0})}\frac{1}{(\sigma^{2})^{a+1}}\exp\left\{ -b_{0}/\sigma_{2}\right\} \\
+ &  & \qquad\times(2\pi)^{-p/2}\det\left(\sigma^{2}\Lambda_{0}^{-1}\right)^{-1/2}\\
+ &  & \qquad\times(2\pi)^{-n/2}\det\left(\sigma^{2}I_{n}\right)^{-1/2}\times\exp\left\{ -\frac{\left(\beta-\mu_{n}\right)^{\top}\Lambda_{n}\left(\beta-\mu_{n}\right)}{2\sigma^{2}}\right\} \exp\left\{ \frac{y^{\top}y-\mu_{n}^{\top}\Lambda_{n}\mu_{n}+\mu_{0}^{\top}\Lambda_{0}\mu_{0}}{2\sigma^{2}}\right\} 
+\end{eqnarray*}
+
+\end_inset
+
+It's now clear that in the posterior,
+ 
+\begin_inset Formula $\beta|_{\sigma^{2}}\sim\mathcal{N}\left(\mu_{n}\sigma^{2}\Lambda_{n}^{-1}\right)$
+\end_inset
+
+.
+ Taking the log,
+ we have 
+\begin_inset Formula 
+\begin{eqnarray*}
+p\left(\beta,\sigma^{2}\mid y\right) & \propto & \frac{b_{0}^{a_{0}}}{\Gamma(a_{0})}\frac{1}{(\sigma^{2})^{a+1}}\exp\left\{ -b_{0}/\sigma_{2}\right\} \\
+ &  & \qquad\times(2\pi)^{-p/2}\det\left(\sigma^{2}\Lambda_{0}^{-1}\right)^{-1/2}\\
+ &  & \qquad\times(2\pi)^{-n/2}\det\left(\sigma^{2}I_{n}\right)^{-1/2}\times+\left\{ \frac{\left(\beta-\mu_{n}\right)^{\top}\Lambda_{n}\left(\beta-\mu_{n}\right)}{2\sigma^{2}}\right\} +\left\{ \frac{-\mu_{n}^{\top}\Lambda_{n}\mu_{n}-\mu_{0}^{\top}\Lambda_{0}\mu_{0}+y^{\top}y}{2\sigma^{2}}\right\} 
+\end{eqnarray*}
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Standard
+\begin_inset Note Note
+status collapsed
+
+\begin_layout Plain Layout
+\begin_inset Formula 
+\begin{align*}
+\pi(\sigma^{2}) & =\frac{b^{a}}{\Gamma(a)}\frac{1}{(\sigma^{2})^{a+1}}e^{-b/\sigma^{2}}\\
+ & \propto\frac{1}{(\sigma^{2})^{a+1}}e^{-b/\sigma^{2}}\\
+\log\pi(\sigma^{2}) & \propto-s(a+1)\log\sigma^{2}-\frac{b}{\sigma^{2}}\\
+\pi(\beta|\sigma^{2}) & \propto\exp\left\{ -\frac{1}{2\sigma^{2}}(\beta-\mu)\Lambda_{n}(\beta-\mu)\right\} \\
+\log\pi(\beta|\sigma^{2}) & \propto-\frac{1}{2\sigma^{2}}(\beta-\mu)\Lambda_{n}(\beta-\mu)
+\end{align*}
+
+\end_inset
+
+
+\end_layout
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Section
+Weighted Least Squares
+\end_layout
+
+\begin_layout Subsection
+Matrix Rank
+\end_layout
+
+\begin_layout Standard
+Note that if 
+\begin_inset Formula $Z\in\mathbb{R}^{k\times k}$
+\end_inset
+
+ and 
+\begin_inset Formula $c$
+\end_inset
+
+ scalar,
+ then 
+\begin_inset Formula $\det(cZ)=c^{k}\det\left(Z\right)$
+\end_inset
+
+.
+ Therefore,
+ if 
+\begin_inset Formula $\beta|_{\sigma^{2}}\sim\mathcal{N}(\mu,\sigma^{2}\Lambda^{-1})$
+\end_inset
+
+,
+ then the pdf is 
+\begin_inset Formula 
+\begin{align*}
+\pi\left(\beta\mid\sigma^{2}\right) & =\left(2\pi\right)^{-p/2}\det\left(\sigma^{2}\Lambda^{-1}\right)^{-1/2}\exp\left(-\frac{1}{2}\left(\beta-\mu\right)^{\top}\Lambda\left(\beta-\mu\right)\right)\\
+ & =\left(2\pi\sigma^{2}\right)^{-p/2}\left[\det\Lambda^{-1}\right]^{-1/2}\exp\left(-\frac{1}{2}\left(\beta-\mu\right)^{\top}\Lambda\left(\beta-\mu\right)\right)\\
+ & =\left(2\pi\sigma^{2}\right)^{-p/2}\left[\det\Lambda^{-1}\right]^{-1/2}\exp\left(-\frac{1}{2}\left(\beta-\mu\right)^{\top}\Lambda\left(\beta-\mu\right)\right)\\
+\pi(\beta\mid\sigma^{2}) & \propto\left(\sigma^{2}\right)^{-p/2}\exp\left(-\frac{1}{2}\left(\beta-\mu\right)^{\top}\Lambda\left(\beta-\mu\right)\right)
+\end{align*}
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Subsection
+Problem
+\end_layout
+
+\begin_layout Standard
+\begin_inset Formula 
+\begin{eqnarray*}
+\pi(y\mid\beta,\sigma^{2}) & = & \left[\prod_{i}\left(\frac{1}{\sqrt{2\pi\sigma^{2}/w_{i}}}\right)\right]\exp\left\{ -\frac{1}{2\sigma^{2}}\left(y-X\beta\right)^{\top}W\left(y-X\beta\right)\right\} \\
+\pi(y\mid\beta,\sigma^{2}) & \propto & \left(\frac{1}{\sqrt{\sigma^{2}}}\right)^{n}\left[\prod_{i}\sqrt{w_{i}}\right]\exp\left\{ -\frac{1}{2\sigma^{2}}\left(y-X\beta\right)^{\top}W\left(y-X\beta\right)\right\} \\
+\log\pi(y\mid\beta,\sigma^{2}) & \propto & -\frac{n}{2}\log\sigma^{2}-\frac{1}{2\sigma^{2}}\left(y-X\beta\right)^{\top}W\left(y-X\beta\right)
+\end{eqnarray*}
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Standard
+\begin_inset Formula 
+\[
+\pi(\sigma^{2})=\frac{b^{a_{0}}}{\Gamma(a_{0})}\frac{1}{\left(\sigma^{2}\right)^{a_{0}+1}}e^{-b_{0}/\sigma^{2}}
+\]
+
+\end_inset
+
+so 
+\begin_inset Formula 
+\[
+\log\pi(\sigma^{2})\propto-(a_{0}+1)\log\sigma^{2}-\frac{b_{0}}{\sigma_{2}}
+\]
+
+\end_inset
+
+We have 
+\begin_inset Formula 
+\begin{align*}
+\pi\left(\beta\mid\sigma^{2}\right) & =\left(2\pi\right)^{-p/2}\det\left(\sigma^{2}\Lambda_{0}^{-1}\right)^{-1/2}\exp\left\{ -\frac{1}{2\sigma^{2}}\left(\beta-\mu_{0}\right)^{\top}\Lambda_{0}\left(\beta-\mu_{0}\right)\right\} \\
+ & =\left(2\pi\right)^{-p/2}\left(\sigma^{2}\right)^{p/2}\det\left(\Lambda_{0}^{-1}\right)^{-1/2}\exp\left\{ -\frac{1}{2\sigma^{2}}\left(\beta-\mu_{0}\right)^{\top}\Lambda_{0}\left(\beta-\mu_{0}\right)\right\} \\
+ & \propto\left(\sigma^{2}\right)^{p/2}\exp\left\{ -\frac{1}{2\sigma^{2}}\left(\beta-\mu_{0}\right)^{\top}\Lambda_{0}\left(\beta-\mu_{0}\right)\right\} \\
+\log\pi\left(\beta\mid\sigma^{2}\right) & \propto-\frac{p}{2}\log\sigma^{2}-\frac{1}{2\sigma^{2}}\left(\beta-\mu_{0}\right)^{\top}\Lambda_{0}\left(\beta-\mu_{0}\right)
+\end{align*}
+
+\end_inset
+
+Putting this all together,
+ 
+\begin_inset Formula 
+\begin{eqnarray*}
+\log\pi\left(\beta,\sigma^{2}\mid y\right) & \propto & -(a_{0}+1)\log\sigma^{2}-\frac{b_{0}}{\sigma_{2}}\\
+ &  & -\frac{p}{2}\log\sigma^{2}-\frac{1}{2\sigma^{2}}\left(\beta-\mu_{0}\right)^{\top}\Lambda_{0}\left(\beta-\mu_{0}\right)\\
+ &  & -\frac{n}{2}\log\sigma^{2}-\frac{1}{2\sigma^{2}}\left(y-X\beta\right)^{\top}W\left(y-X\beta\right)\\
+ & \propto & -(a_{0}+1)\log\sigma^{2}-\frac{b_{0}}{\sigma_{2}}\\
+ &  & -\frac{p}{2}\log\sigma^{2}-\frac{n}{2}\log\sigma^{2}+\frac{1}{2}\sum_{i}\log w_{i}\\
+ &  & -\frac{1}{2\sigma^{2}}\underbrace{\left[\left(y-X\beta\right)^{\top}W\left(y-X\beta\right)+\left(\beta-\mu_{0}\right)^{\top}\Lambda_{0}\left(\beta-\mu_{0}\right)\right]}_{Q}
+\end{eqnarray*}
+
+\end_inset
+
+Grouping and expanding the quadratic terms,
+ 
+\begin_inset Formula 
+\begin{eqnarray*}
+Q & = & \left(y-X\beta\right)^{\top}W\left(y-X\beta\right)+\left(\beta-\mu_{0}\right)^{\top}\Lambda_{0}\left(\beta-\mu_{0}\right)\\
+ & = & y^{\top}Wy-2y^{\top}WX\beta+\beta^{\top}X^{\top}WX\beta+\beta^{\top}\Lambda_{0}\beta-2\mu_{0}^{\top}\Lambda_{0}\beta+\mu_{0}\Lambda_{0}\mu_{0}\\
+ & = & \beta^{\top}\left(X^{\top}WX+\Lambda_{0}\right)\beta-2\left(y^{\top}WX+\mu_{0}^{\top}\Lambda_{0}\right)\beta+\left[y^{\top}Wy+\mu_{0}\Lambda_{0}\mu_{0}\right]
+\end{eqnarray*}
+
+\end_inset
+
+Let 
+\begin_inset Formula 
+\begin{align*}
+\Lambda^{*} & =X^{\top}WX+\Lambda_{0}\\
+\mu^{*} & =\left(\Lambda^{*}\right)^{-1}\left(y^{\top}WX+\mu_{0}^{\top}\Lambda_{0}\right)
+\end{align*}
+
+\end_inset
+
+Note that 
+\begin_inset Formula $\mu^{*}$
+\end_inset
+
+ minimizes the quadratic from above (in the log-posterior,
+ it has a negative coefficient,
+ 
+\begin_inset Formula $-1/2\sigma^{2}$
+\end_inset
+
+,
+ so 
+\begin_inset Formula $\mu^{*}$
+\end_inset
+
+ it's a maximizer).
+ So 
+\begin_inset Formula 
+\[
+Q=\beta^{\top}\Lambda^{*}\beta-2\left(y^{\top}WX+\mu_{0}^{\top}\Lambda_{0}\right)\beta+\left[y^{\top}Wy+\mu_{0}\Lambda_{0}\mu_{0}\right]
+\]
+
+\end_inset
+
+Note that 
+\begin_inset Formula 
+\begin{align*}
+\left(y^{\top}WX+\mu_{0}^{\top}\Lambda_{0}\right) & =\Lambda^{*}\left(\Lambda^{*}\right)^{-1}\left(y^{\top}WX+\mu_{0}^{\top}\Lambda_{0}\right)\\
+ & =\Lambda^{*}\mu^{*}
+\end{align*}
+
+\end_inset
+
+So
+\begin_inset Formula 
+\[
+Q=\beta^{\top}\Lambda^{*}\beta-2\left(\mu^{*}\right)^{\top}\Lambda^{*}\beta+\left[y^{\top}Wy+\mu_{0}\Lambda_{0}\mu_{0}\right]
+\]
+
+\end_inset
+
+(I am being loose with tranposes.) 
+\begin_inset Formula 
+\begin{align*}
+\left(\beta-\mu^{*}\right)^{\top}\Lambda^{*}\left(\beta-\mu^{*}\right) & =\mu^{*}{}^{\top}\Lambda^{*}\beta-2\mu^{*}{}^{\top}\Lambda^{*}\beta+\mu^{*}{}^{\top}\Lambda^{*}\mu^{*}\\
+\mu^{*}{}^{\top}\Lambda^{*}\beta & =\left(\beta-\mu^{*}\right)^{\top}\Lambda^{*}\left(\beta-\mu^{*}\right)+2\mu^{*}{}^{\top}\Lambda^{*}\beta-\mu^{*}{}^{\top}\Lambda^{*}\mu^{*}
+\end{align*}
+
+\end_inset
+
+So 
+\begin_inset Formula 
+\begin{align*}
+Q & =\left(\beta-\mu^{*}\right)^{\top}\Lambda^{*}\left(\beta-\mu^{*}\right)+2\mu^{*}{}^{\top}\Lambda^{*}\beta-\mu^{*}{}^{\top}\Lambda^{*}\mu^{*}-2\left(\mu^{*}\right)^{\top}\Lambda^{*}\beta+\left[y^{\top}Wy+\mu_{0}\Lambda_{0}\mu_{0}\right]\\
+Q & =\left(\beta-\mu^{*}\right)^{\top}\Lambda^{*}\left(\beta-\mu^{*}\right)+\left[y^{\top}Wy+\mu_{0}\Lambda_{0}\mu_{0}-\mu^{*}{}^{\top}\Lambda^{*}\mu^{*}\right]
+\end{align*}
+
+\end_inset
+
+Plugging back into our log-posterior
+\begin_inset Formula 
+\begin{eqnarray*}
+\log\pi\left(\beta,\sigma^{2}\mid y\right) & \propto & -(a_{0}+1)\log\sigma^{2}-\frac{b_{0}}{\sigma_{2}}\\
+ &  & -\frac{p}{2}\log\sigma^{2}-\frac{n}{2}\log\sigma^{2}\\
+ &  & -\frac{1}{2\sigma^{2}}\left[\left(\beta-\mu^{*}\right)^{\top}\Lambda^{*}\left(\beta-\mu^{*}\right)+\left[y^{\top}Wy+\mu_{0}\Lambda_{0}\mu_{0}-\mu^{*}{}^{\top}\Lambda^{*}\mu^{*}\right]\right]\\
+ & \propto & -\underbrace{\left(\underbrace{a_{0}+\frac{n-p}{2}}_{a^{*}}+1\right)\log\sigma^{2}-\left(\underbrace{b_{0}+\frac{y^{\top}Wy+\mu_{0}\Lambda_{0}\mu_{0}-\mu^{*}{}^{\top}\Lambda^{*}\mu^{*}}{2}}_{b^{*}}\right)\frac{1}{\sigma^{2}}}_{\text{IG}(a^{*},b^{*})}\\
+ &  & \underbrace{-\frac{1}{2\sigma^{2}}\left(\beta-\mu^{*}\right)^{\top}\Lambda^{*}\left(\beta-\mu^{*}\right)}_{\mathcal{N}\left(\mu^{*},\sigma^{2}\left(\Lambda^{*}\right)^{-1}\right)}
+\end{eqnarray*}
+
+\end_inset
+
+
+\end_layout
+
+\begin_layout Subsection*
+When 
+\begin_inset Formula $\beta\sim\mathcal{N}(0,\Lambda_{0}^{-1})$
+\end_inset
+
+ (not dependent on 
+\begin_inset Formula $\sigma^{2}$
+\end_inset
+
+)
+\end_layout
+
+\begin_layout Standard
+\begin_inset Formula 
+\begin{align*}
+\log\pi\left(\beta,\sigma^{2}\mid y\right) & \propto-(a_{0}+1)\log\sigma^{2}-\frac{b_{0}}{\sigma_{2}}-\frac{p}{2}\log\sigma^{2}-\frac{1}{2}\left(\beta-\mu_{0}\right)^{\top}\Lambda_{0}\left(\beta-\mu_{0}\right)-\frac{n}{2}\log\sigma^{2}-\frac{1}{2\sigma^{2}}\left(y-X\beta\right)^{\top}W\left(y-X\beta\right)\\
+ & \propto-(a_{0}+1)\log\sigma^{2}-\frac{b_{0}}{\sigma_{2}}\\
+ & -\frac{p}{2}\log\sigma^{2}-\frac{n}{2}\log\sigma^{2}+\frac{1}{2}\sum_{i}\log w_{i}\\
+ & -\frac{1}{2\sigma^{2}}\underbrace{\left[\left(y-X\beta\right)^{\top}W\left(y-X\beta\right)+\left(\beta-\mu_{0}\right)^{\top}\sigma^{2}\Lambda_{0}\left(\beta-\mu_{0}\right)\right]}_{Q(\sigma^{2})}
+\end{align*}
+
+\end_inset
+
+
+\end_layout
+
+\end_body
+\end_document
