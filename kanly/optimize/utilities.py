@@ -3,7 +3,7 @@ from __future__ import absolute_import, print_function
 import numpy as np
 
 
-def update_bfgs_hessian_approx(hessian_cur, grad_new, grad_cur, x_new, x_cur):
+def update_bfgs_hessian_approx(hessian_cur, grad_new, grad_cur, x_new, x_cur, use_inv_hessian):
     """
     https://en.wikipedia.org/wiki/Broyden%E2%80%93Fletcher%E2%80%93Goldfarb%E2%80%93Shanno_algorithm#:~:text=In%20numerical%20optimization%2C%20the%20Broyden,solving%20unconstrained%20nonlinear%20optimization%20problems.
 
@@ -15,6 +15,10 @@ def update_bfgs_hessian_approx(hessian_cur, grad_new, grad_cur, x_new, x_cur):
         grad_cur: Gradient at ``x_cur``.
         x_new: New parameter vector after an accepted step.
         x_cur: Previous parameter vector before the accepted step.
+        use_inv_hessian:
+            If False, apply the standard BFGS Hessian update.
+            If True, treat hessian_cur as an inverse Hessian and apply
+            the inverse-BFGS update.
 
     Returns:
         Updated Hessian approximation using the curvature pair
@@ -23,9 +27,37 @@ def update_bfgs_hessian_approx(hessian_cur, grad_new, grad_cur, x_new, x_cur):
 
     y = grad_new - grad_cur
     s = x_new - x_cur
-    return hessian_cur \
-        + np.outer(y, y) / np.dot(y, s) \
-        - hessian_cur.dot(np.outer(s, s)).dot(hessian_cur.T) / (s.dot(hessian_cur).dot(s))
+
+    ys = np.dot(y, s)
+    if ys <= 0:
+        raise ValueError(
+            f"BFGS curvature condition violated: y^T s = {ys}"
+        )
+
+    if use_inv_hessian:
+        # Inverse-BFGS update
+        Hinv = hessian_cur
+
+        rho = 1.0 / ys
+        I = np.eye(Hinv.shape[0])
+
+        V = I - rho * np.outer(s, y)
+
+        return V @ Hinv @ V.T + rho * np.outer(s, s)
+
+    else:
+        # Standard BFGS Hessian update
+        H = hessian_cur
+
+        Hy = H @ s
+        sHs = np.dot(s, Hy)
+
+        if sHs <= 0:
+            raise ValueError(
+                f"BFGS Hessian update failed: s^T H s = {sHs}"
+            )
+
+        return H + np.outer(y, y) / ys - np.outer(Hy, Hy) / sHs
 
 
 def get_gradient_function(func, onesided=True, dx=1e-6):

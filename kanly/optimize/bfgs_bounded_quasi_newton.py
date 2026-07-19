@@ -7,6 +7,7 @@ from numba import njit
 
 from kanly.optimize.optimization_results import OptimizationResult
 from kanly.optimize.utilities import update_bfgs_hessian_approx
+from kanly.utils.print_options import print_options
 from kanly.utils.user_prompt_for_more_iters import user_prompt_for_more_iters_method
 from kanly.utils.util import print_iter_info
 
@@ -95,18 +96,20 @@ def is_valid(x, lb, ub):
     return np.all(x >= lb) and np.all(x <= ub) and np.all(lb < ub)
 
 
-#@njit
-def get_direction(g, B, free_set=None):
+def get_direction(g, H, is_hessian, free_set=None):
     """Compute a descent direction from a Hessian approximation.
 
     Args:
         g: Gradient vector at the current iterate.
-        B: Hessian or inverse-curvature approximation to solve against.
+        H: Hessian or inverse-curvature approximation to solve against.
+        is_hessian: if `True`, then H is the hessian (and we need to solve a
+            linear system to find the direction).  Otherwise, it is the inverse
+            Hessian and we just do `H @ -g`.
         free_set: Optional indices that are allowed to move. If omitted, all
             coordinates are considered free.
 
     Returns:
-        Tuple ``(p, B_out)`` where ``p`` is a descent direction and ``B_out``
+        Tuple ``(p, H_out)`` where ``p`` is a descent direction and ``H_out``
         is either the provided matrix or an identity reset when the solve fails
         or produces a non-descent direction.
     """
@@ -114,43 +117,49 @@ def get_direction(g, B, free_set=None):
 
     if free_set is None or len(free_set) == n:
         try:
-            p = np.linalg.solve(B, -g)
+            if is_hessian:
+                p = np.linalg.solve(H, -g)
+            else:
+                p = H.dot(-g)
             if p.dot(g) >= 0:
                 raise Exception
             else:
-                return p, B
+                return p, H
         except:
             # Fall back to steepest descent when the Hessian approximation is
             # singular, ill-conditioned, or yields a non-descent step.
             return -g, np.eye(n)
 
     else:
-        B_sub = B[np.ix_(free_set, free_set)]
+        H_sub = H[np.ix_(free_set, free_set)]
         g_sub = g[free_set]
         try:
-            p_sub = np.linalg.solve(B_sub, -g_sub)
+            if is_hessian:
+                p_sub = np.linalg.solve(H_sub, -g_sub)
+            else:
+                p_sub = H_sub.dot(-g_sub)
             p = np.zeros(n)
             p[free_set] = p_sub
             if p.dot(g) >= 0:
                 raise Exception
             else:
-                return p, B
+                return p, H
 
         except:
             # Reset only after a failed restricted solve; the returned step
             # still respects the free coordinates chosen by the caller.
-            B = np.eye(n)
+            H = np.eye(n)
             p = np.zeros(n)
             p[free_set] = -g[free_set]
-            return p, B
+            return p, H
 
 
 
 class BFGSPQNResults(OptimizationResult):
     """Result object returned by bounded projected quasi-Newton optimization."""
 
-    def __init__(self, fun, x, num_params, grad, grad_projected, hess, converged, message, time_elapsed, fun_callable,
-                 ferr, xerr, gnorm, iter, B0, ub_binding, lb_binding, bounds, options, maximize, optimization_path):
+    def __init__(self, fun, x, num_params, grad, grad_projected, hess, hess_inv, converged, message, time_elapsed, fun_callable,
+                 ferr, xerr, gnorm, iter, H0, ub_binding, lb_binding, bounds, options, maximize, optimization_path):
         """Create a projected quasi-Newton result record.
 
         Args:
@@ -161,6 +170,7 @@ class BFGSPQNResults(OptimizationResult):
             grad: Gradient at the final iterate.
             grad_projected: Gradient with bound-blocked coordinates zeroed.
             hess: Final Hessian or BFGS Hessian approximation.
+            hess_inv: Final Inverse Hessian or Inverse BFGS Hessian approximation.
             converged: Whether a stopping criterion was met.
             message: Human-readable convergence or failure message.
             time_elapsed: Wall-clock runtime in seconds.
@@ -169,7 +179,7 @@ class BFGSPQNResults(OptimizationResult):
             xerr: Final relative parameter-change diagnostic.
             gnorm: Final projected-gradient convergence diagnostic.
             iter: Number of quasi-Newton iterations completed.
-            B0: User-supplied initial Hessian approximation, if any.
+            H0: User-supplied initial Hessian approximation, if any.
             ub_binding: Boolean mask for coordinates binding at upper bounds.
             lb_binding: Boolean mask for coordinates binding at lower bounds.
             bounds: Bounds used by the optimizer, or None for unbounded runs.
@@ -181,14 +191,15 @@ class BFGSPQNResults(OptimizationResult):
                          ferr, xerr, iter, bounds, options, maximize, optimization_path)
 
         self.hess = hess
+        self.hess_inv = hess_inv
         self.gnorm = gnorm
-        self.B0 = B0
+        self.H0 = H0
         self.ub_binding = ub_binding
         self.lb_binding = lb_binding
 
 
 def bfgs_pqn(
-        fun, x0, bounds=None, B0=None, xtol=DEFAULT_BFGS_PQN_XTOL, ftol=DEFAULT_BFGS_PQN_FTOL,
+        fun, x0, bounds=None, H0=None, xtol=DEFAULT_BFGS_PQN_XTOL, ftol=DEFAULT_BFGS_PQN_FTOL,
         gtol=DEFAULT_BFGS_PQN_GTOL, maxiter=DEFAULT_BFGS_PQN_MAXITER,
         onesided_fd=DEFAULT_BFGS_PQN_ONESIDED_FD, dx_fd=DEFAULT_BFGS_PQN_DX_DF,
         user_prompt_for_more_iters=DEFAULT_BFGS_PQN_USER_PROMPT_FOR_MORE_ITERS, momentum=DEFAULT_BFGS_PQN_MOMENTUM,
@@ -199,7 +210,8 @@ def bfgs_pqn(
         line_search_increase_scale=DEFAULT_BFGS_PQN_WOLFE_INCREASE_SCALE,
         save_optimization_path=DEFAULT_BFGS_SAVE_OPTIMIZATION_PATH,
         gradient_callable=None, hessian_callable=None,
-        prior_bfgs_num_call=1, max_total_bfgs_calls=10, prior_bfgs_B0=None,
+        prior_bfgs_num_call=1, max_total_bfgs_calls=10, prior_bfgs_H0=None,
+        use_inv_hessian=None,
     ) -> BFGSPQNResults:
     """
     Minimize or maximize an objective_function with projected quasi-Newton steps.
@@ -214,8 +226,9 @@ def bfgs_pqn(
         x0: Initial feasible parameter vector.
         bounds: Optional 2 x p array-like object. The first row contains lower
             bounds and the second row contains upper bounds.
-        B0: Optional initial Hessian approximation. A scalar is expanded to a
-            scaled identity matrix; an array is copied.
+        H0: Optional initial Hessian approximation. A scalar is expanded to a
+            scaled identity matrix; an array is copied.  If `use_inv_hessian=True`,
+            this is the inverse Hessian, otherwise it is the Hessian.
         xtol: Convergence tolerance for relative parameter changes.
         ftol: Convergence tolerance for relative objective_function improvement.
         gtol: Convergence tolerance for the projected-gradient norm.
@@ -249,7 +262,9 @@ def bfgs_pqn(
             values are encountered.
         max_total_bfgs_calls: Maximum number of recursive restarts after
             non-finite values.
-        prior_bfgs_B0: Internal record of the previous restart's Hessian scale.
+        prior_bfgs_H0: Internal record of the previous restart's Hessian scale.
+        use_inv_hessian: Whether to maintain the Hessian (False) or inverse Hessian
+            (True).
 
     Returns:
         A ``BFGSPQNResults`` instance containing the final point, objective_function
@@ -281,7 +296,10 @@ def bfgs_pqn(
             settings = dict(maxiter=maxiter, xtol=xtol, gtol=gtol, ftol=ftol, maximize=maximize,
                             c1_wolfe=c1_wolfe, c2_wolfe=c2_wolfe, wolfe_reduction_scale=wolfe_reduction_scale,
                             line_search_increase_scale=line_search_increase_scale,
-                            momentum=momentum)
+                            momentum=momentum,use_inv_hessian=use_inv_hessian,
+                            has_gradient=gradient_callable is not None,
+                            has_hessian=hessian_callable is not None)
+            print_options(settings, 'BFGS OPTIONS')
 
         time0 = time.time()
 
@@ -305,6 +323,12 @@ def bfgs_pqn(
                 hessian_func = lambda x: -hessian_callable(x)
             else:
                 hessian_func = hessian_callable
+            if use_inv_hessian is None:
+                use_inv_hessian = False
+            if use_inv_hessian:
+                raise Exception("Cannot supply a Hessian function and specify use_inv_hessian")
+        elif use_inv_hessian is None:
+            use_inv_hessian = True
 
         num_params = len(x0)
         is_bounded = bounds is not None
@@ -328,20 +352,29 @@ def bfgs_pqn(
             ub = +np.inf * np.ones(num_params)
 
         if has_hessian:
-            B0 = hessian_func(x0)
-            B0_orig = None
+            H0 = hessian_func(x0)
+            H0_orig = None
         else:
-            B0_orig = B0
-            if B0 is None:
+            # TODO handle scaling
+            H0_orig = H0
+            if H0 is None:
                 # Start with a large diagonal Hessian approximation so the
                 # first solve produces conservative steps in high dimensions.
-                B0 = np.eye(num_params) * min(10 ** num_params, 1_000_000)
-                # print(B0)
-            else:
-                if isinstance(B0, (float, int)):
-                    B0 = np.eye(num_params) * B0
+                hess_scale_0 = min(10 ** num_params, 1_000_000)
+                if use_inv_hessian:
+                    H0 = np.eye(num_params) * (1.0 / hess_scale_0)
                 else:
-                    B0 = B0.copy()
+                    H0 = np.eye(num_params) * hess_scale_0
+                # print(H0)
+            else:
+                if isinstance(H0, (float, int)):
+                    if use_inv_hessian:
+                        hess_scale_0 = 1.0 / H0
+                    else:
+                        hess_scale_0 = H0
+                    H0 = np.eye(num_params) * hess_scale_0
+                else:
+                    H0 = H0.copy()
 
         g0 = grad_func(x0)
         f0 = fun(x0)
@@ -379,17 +412,17 @@ def bfgs_pqn(
                         print(f"Ran out of BFGS restarts ({max_total_bfgs_calls})!")
                     break
 
-                if prior_bfgs_B0 is None:
-                    B0_new = 10.
+                if prior_bfgs_H0 is None:
+                    H0_new = 10.
                 else:
-                    B0_new = 10 * prior_bfgs_B0
+                    H0_new = 10 * prior_bfgs_H0
 
                 # Restart from the original point with a larger diagonal
                 # Hessian scale when the current run reaches non-finite values.
                 if debug:
                     print("\nStarting point `x0` must generate finite function and gradient value! Restarting...\n")
                 return bfgs_pqn(
-                    fun_original, x0_start, bounds=bounds, B0=B0_new, xtol=xtol, ftol=ftol,
+                    fun_original, x0_start, bounds=bounds, H0=H0_new, xtol=xtol, ftol=ftol,
                     gtol=gtol, maxiter=maxiter,
                     onesided_fd=onesided_fd, dx_fd=dx_fd,
                     user_prompt_for_more_iters=user_prompt_for_more_iters,
@@ -402,7 +435,8 @@ def bfgs_pqn(
                     save_optimization_path=save_optimization_path,
                     gradient_callable=gradient_callable, hessian_callable=hessian_callable,
                     prior_bfgs_num_call=prior_bfgs_num_call + 1,
-                    max_total_bfgs_calls=max_total_bfgs_calls, prior_bfgs_B0=B0_new,
+                    max_total_bfgs_calls=max_total_bfgs_calls, prior_bfgs_H0=H0_new,
+                    use_inv_hessian=use_inv_hessian,
                 )
 
 
@@ -434,7 +468,7 @@ def bfgs_pqn(
                     free_set1 = np.arange(num_params)
 
                 # compute a search direction
-                p, B0 = get_direction(g0, B0, free_set1)
+                p, H0 = get_direction(g0, H0, not use_inv_hessian, free_set1)
 
                 # compute second free set
                 if is_bounded:
@@ -450,10 +484,10 @@ def bfgs_pqn(
                 free_set = np.array(list(set(free_set1) & set(free_set2)))
                 if len(free_set) == 0:
                     if not has_hessian:
-                        B0 = np.eye(num_params)
-                    p, B0 = get_direction(g0, B0, free_set1)
+                        H0 = np.eye(num_params)
+                    p, H0 = get_direction(g0, H0, not use_inv_hessian, free_set1)
                 else:
-                    p, B0 = get_direction(g0, B0, free_set)
+                    p, H0 = get_direction(g0, H0, not use_inv_hessian, free_set)
 
                 if momentum > 0:
                     if np.dot(p + momentum * p_last, g0) < 0:
@@ -494,10 +528,10 @@ def bfgs_pqn(
                     g1 = grad_func(x1)
 
                     if has_hessian:
-                        B0 = hessian_func(x1)
+                        H0 = hessian_func(x1)
                     else:
                         try:
-                            B0 = update_bfgs_hessian_approx(B0, g1, g0, x1, x0)
+                            H0 = update_bfgs_hessian_approx(H0, g1, g0, x1, x0, use_inv_hessian)
                         except:
                             pass
 
@@ -512,10 +546,11 @@ def bfgs_pqn(
                     cnt_fail += 1
                     xerr, ferr, gerr = 1., 1., 1.
                     if not has_hessian:
-                        B0 = np.eye(num_params) * min(10**num_params, 1_000_000)
+                        H0 = np.eye(num_params) * min(10**num_params, 1_000_000)
+
                     accepted = False
                     last_alpha = 1.0
-                    #
+
                     # print()
                     # print(itr_, cnt_fail, f0)
                     # if cnt_fail >= 2:
@@ -583,7 +618,7 @@ def bfgs_pqn(
                             #     s = x1 - x0
                             #
                             #     try:
-                            #         B0 = B0 + np.outer(y, y) / np.dot(y, s) - B0.dot(np.outer(s, s)).dot(B0.T) / (s.dot(B0).dot(s))
+                            #         H0 = H0 + np.outer(y, y) / np.dot(y, s) - H0.dot(np.outer(s, s)).dot(H0.T) / (s.dot(H0).dot(s))
                             #     except:
                             #         pass
                             #
@@ -673,14 +708,27 @@ def bfgs_pqn(
             print_iter_info(iter_info, is_footer=True)
             print(message)
 
+        if maximize:
+            g0 = -g0
+            f0 = -f0
+            H0 = -H0
+
+        if use_inv_hessian:
+            hess = np.linalg.inv(H0)
+            hess_inv = H0
+        else:
+            hess = H0
+            hess_inv = np.linalg.inv(H0)
+
         return BFGSPQNResults(**{
-            'fun': -f0 if maximize else f0,
+            'fun': f0,
             'x': x0,
             'num_params': num_params,
             'grad': g0,
             'maximize': maximize,
             'grad_projected': g0 * (((g0 > 0) & (x0 > lb)) | ((g0 < 0) & (ub > x0))),
-            'hess': B0,
+            'hess': hess,
+            'hess_inv': hess_inv,
             'converged': converged,
             'message': message,
             'time_elapsed': time.time() - time0,
@@ -689,7 +737,7 @@ def bfgs_pqn(
             'xerr': xerr,
             'gnorm': gerr,
             'iter': itr_,
-            'B0': B0_orig,
+            'H0': H0_orig,
             'ub_binding': (ub - x0 < 1e-12) if is_bounded else None,
             'lb_binding': (x0 - lb < 1e-12) if is_bounded else None,
             'bounds': np.array(bounds).copy() if bounds is not None else None,
@@ -751,10 +799,10 @@ def bfgs_pqn(
 #
 #     res1 = bfgs_pqn(f, [-3040., -1486.], debug=True, momentum=0,
 #                     xtol=1e-8, gtol=1e-8, ftol=1e-50, save_optimization_path=True,
-#                     B0=100000)
+#                     H0=100000)
 #     res2 = bfgs_pqn(f, [-3040., -1486.], debug=True, momentum=.16,
 #                     xtol=1e-8, gtol=1e-8, ftol=1e-50, save_optimization_path=True,
-#                     B0=100000)
+#                     H0=100000)
 #
 #     import matplotlib.pyplot as plt
 #
