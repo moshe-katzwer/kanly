@@ -535,7 +535,7 @@ class RegressionResultsBase(TestingResultsBase):
             data={'coef': self.params},
         )
 
-        if self._cov_params is not None:
+        if hasattr(self, '_cov_params') and self._cov_params is not None:
             result['std err'] = self._bse
 
             result['t'] = self._tvalues
@@ -964,7 +964,7 @@ class RegressionResultsBase(TestingResultsBase):
             bool: Whether ``_cov_params`` has been set to a non-``None``
             value.
         """
-        return self._cov_params is not None
+        return hasattr(self, '_cov_params') and self._cov_params is not None
 
     def get_inference_string(self, **kwargs):
         """Build a human-readable description of the inference method used.
