@@ -30,7 +30,11 @@ def _get_l2_diagonal_for_cov(nobs, l2s, fit_intercept, first_column_constant, va
             l2_arr[0] = 0
         else:
             l2_arr = [0] + l2_arr
-    return np.diag(l2_arr) * var_weights.mean()
+    if isinstance(var_weights, (float, int)):
+        var_weights_mean = var_weights
+    else:
+        var_weights_mean = var_weights.mean()
+    return np.diag(l2_arr) * var_weights_mean
 
 
 def _get_XpX(exog_sparse, weights, fit_intercept, first_column_constant):
