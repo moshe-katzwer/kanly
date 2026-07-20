@@ -186,9 +186,12 @@ def _do_bspline(vals, col_name, term):
         vals = vals[:, 0]
 
     if 'bspline' in term.state['numerical'][numer_control.term_name_original_string]:
-        degree, bspline_df, knots, include_intercept = term.state['numerical'][numer_control.term_name_original_string]['bspline']
+        temp_dict =  term.state['numerical'][numer_control.term_name_original_string]['bspline']
+        degree, bspline_df, knots, include_intercept \
+            = temp_dict['degree'], temp_dict['bspline_df'], temp_dict['knots'], temp_dict['include_intercept']
         vals, knots = bspline_design_matrix(
             vals, knots=knots, degree=degree, n_bases=bspline_df, include_intercept=include_intercept, return_dense=False)
+
     else:
 
         degree, bspline_df, include_intercept, knots, lower_bound, upper_bound \
@@ -199,7 +202,8 @@ def _do_bspline(vals, col_name, term):
         vals, knots = bspline_design_matrix(
             vals, degree=degree, n_bases=bspline_df, include_intercept=include_intercept, return_dense=False)
 
-        term.state['numerical'][numer_control.term_name_original_string]['bspline'] = degree, bspline_df, knots, include_intercept
+        term.state['numerical'][numer_control.term_name_original_string]['bspline'] = dict(
+            degree=degree, bspline_df=bspline_df, knots=knots, include_intercept=include_intercept, return_dense=False)
 
     if not isinstance(col_name, str):
         col_name = col_name[0]
