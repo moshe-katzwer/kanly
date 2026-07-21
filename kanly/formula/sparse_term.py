@@ -434,7 +434,7 @@ class SparseTerm(object):
         return SparseTerm(cat_controls, num_controls, var_name=term_string)
 
     @staticmethod
-    def parse_to_terms(term_strings, do_absorb=False, debug=False):
+    def parse_to_terms(term_strings, do_absorb=False, drop_redundant_terms=True, debug=False):
         """Parse a list of term strings and compute drop-one metadata.
 
         Handles intercept insertion/removal and prunes nested/redundant sparse_terms
@@ -444,6 +444,7 @@ class SparseTerm(object):
             term_strings (list[str]): RHS term strings.
             do_absorb (bool): Whether absorb logic is active.
             debug (bool): Print dropped sparse_terms during pruning.
+            drop_redundant_terms (bool): whether to drop terms that are contained in other terms
 
         Returns:
             tuple: ``(terms_array, drop1_dict)``.
@@ -461,24 +462,25 @@ class SparseTerm(object):
         n = len(terms)
         valid = np.array([True] * n)
 
-        for i in range(n):
-            for j in range(i + 1, n):
+        if drop_redundant_terms:
+            for i in range(n):
+                for j in range(i + 1, n):
 
-                if (
-                        terms[i] <= terms[j] and
-                        ((terms[i].term_type == SparseTerm.FULL_CATEGORICAL
-                          and terms[j].term_type == SparseTerm.FULL_CATEGORICAL)
-                         or (terms[i].term_type == SparseTerm.NUMERICAL
-                             and terms[j].term_type == SparseTerm.MIXED)
-                        )
-                ):
-                        valid[i] = False
-                        if debug:
-                            print(f"\n\tDropping {str(terms[i])}' contained in {str(terms[j])}")
-                        break
+                    if (
+                            terms[i] <= terms[j] and
+                            ((terms[i].term_type == SparseTerm.FULL_CATEGORICAL
+                            and terms[j].term_type == SparseTerm.FULL_CATEGORICAL)
+                            or (terms[i].term_type == SparseTerm.NUMERICAL
+                                and terms[j].term_type == SparseTerm.MIXED)
+                            )
+                    ):
+                            valid[i] = False
+                            if debug:
+                                print(f"\n\tDropping {str(terms[i])}' contained in {str(terms[j])}")
+                            break
 
-        if len(terms):
-            terms = terms[valid]
+            if len(terms):
+                terms = terms[valid]
 
         return terms, SparseTerm.build_drop_1_list(terms, do_absorb)
 

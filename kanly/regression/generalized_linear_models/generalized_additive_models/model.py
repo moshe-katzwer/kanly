@@ -230,6 +230,7 @@ class SparseGeneralizedAdditiveModel(SparseGeneralizedLinearModel):
             for v in t.state['numerical']:
                 v_orig = new_exog_2_orig_map.get(v, None)
                 if v_orig in penalty:
+                    print(t.state['numerical'][v]['bspline'])
                     knots = t.state['numerical'][v]['bspline']['knots']
                     # factor 2 aligns user penalty with quadratic form added to X'WX in IRLS
                     penalty_matrix = (penalty[v_orig] * 2) * bspline_penalty(knots, include_intercept=False)

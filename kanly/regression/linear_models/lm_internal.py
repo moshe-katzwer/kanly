@@ -602,7 +602,8 @@ def get_exog_dot_endog(X, y, weights=None, sigma=None, sigma_inv=None):
 
     if is_weighted:
         if isspmatrix(X):
-            Xpy = X.transpose().dot(csc_matrix_by_column_array_broadcast(y, weights))
+            y_matrix = y.reshape((-1, 1)) if np.ndim(y) == 1 else y
+            Xpy = X.transpose().dot(csc_matrix_by_column_array_broadcast(y_matrix, weights))
         else:
             Xpy = X.T.dot(y * weights.reshape(np.shape(y)))
 
