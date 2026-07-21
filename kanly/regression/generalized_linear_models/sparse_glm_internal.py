@@ -457,7 +457,7 @@ def _get_starting_params(start_params, fit_intercept, first_column_constant,
         return intercept_user, params_user, lin_pred_user
 
 
-def _update_irls_iter(var_weights, lin_pred, family, link, endog, exog, gam_penalty):
+def _update_irls_iter(var_weights, lin_pred, family, link, endog, exog, L2_penalty_matrix, regularize_to_values):
     """
     Perform one iteratively reweighted least squares update.
 
@@ -475,13 +475,13 @@ def _update_irls_iter(var_weights, lin_pred, family, link, endog, exog, gam_pena
         Observed response values.
     exog : array-like or scipy.sparse matrix
         Design matrix.
-    gam_penalty : array-like or scipy.sparse matrix or None, optional
+    L2_penalty_matrix : array-like or scipy.sparse matrix or None, optional
         Penalty matrix added to the IRLS normal equations each iteration:
-        ``X'WX + gam_penalty`` before inversion. Used for **generalized additive
+        ``X'WX + L2_penalty_matrix`` before inversion. Used for **generalized additive
         models (GAM)**: a block-diagonal roughness penalty on B-spline coefficient
         blocks (built by :class:`~kanly.regression.generalized_linear_models.generalized_additive_models.model.SparseGeneralizedAdditiveModel`).
         ``None`` disables GAM penalization. Unlike ``alpha > 0`` elastic-net,
-        ``gam_penalty`` is compatible with the IRLS path (no coordinate descent).
+        ``L2_penalty_matrix`` is compatible with the IRLS path (no coordinate descent).
 
     Returns
     -------
@@ -507,8 +507,8 @@ def _update_irls_iter(var_weights, lin_pred, family, link, endog, exog, gam_pena
     XpX = exog.transpose().dot(exog_w)
 
     # GAM: add roughness penalty to weighted normal equations (penalized WLS step).
-    if gam_penalty is not None:
-        XpX_plus_gam = XpX + gam_penalty
+    if L2_penalty_matrix is not None:
+        XpX_plus_gam = XpX + L2_penalty_matrix
     else:
         XpX_plus_gam = XpX
 
@@ -522,7 +522,12 @@ def _update_irls_iter(var_weights, lin_pred, family, link, endog, exog, gam_pena
         # ncp = csc_matrix(ncp.reshape((exog.shape[1], exog.shape[1])))
 
     # Weighted least-squares normal-equation update.
-    params_new = ncp.dot(exog_w.transpose().dot(working_response).toarray())
+    rhs = exog_w.transpose().dot(working_response).toarray()
+    if regularize_to_values is not None:
+        # print(rhs, regularize_to_values)
+        rhs += regularize_to_values
+
+    params_new = ncp.dot(rhs)
     # del exog_w
 
     #params_new = csc_matrix(params_new)
@@ -536,7 +541,7 @@ def _update_irls_iter(var_weights, lin_pred, family, link, endog, exog, gam_pena
     return params_new, endog_predicted, irls_weights, g_prime, lin_pred, working_response, XpX, ncp
 
 
-def _get_opt_method(method, alpha):
+def _get_opt_method(method, alpha, l1_ratio):
     """
     Resolve and validate the optimization method.
 
@@ -570,8 +575,8 @@ def _get_opt_method(method, alpha):
 
     # Penalized models need coordinate descent because the IRLS solver below
     # handles only unpenalized weighted least squares.
-    if alpha > 0 and method in [METHOD_IRLS, METHOD_COORD_DESCENT_1_ITER]:
-        raise Exception("Cannot do method '%s' with penalization, must do '%s" % (method, METHOD_COORD_DESC))
+    if np.any(alpha) > 0 and np.any(l1_ratio > 0) and method in [METHOD_IRLS, METHOD_COORD_DESCENT_1_ITER]:
+        raise Exception("Cannot do method '%s' with non-ridge penalization, must do '%s" % (method, METHOD_COORD_DESC))
 
     if method not in [METHOD_IRLS, METHOD_COORD_DESC, METHOD_COORD_DESCENT_1_ITER]:
         raise NotImplementedError("Method '%s' not recognized!" % method)
@@ -579,10 +584,36 @@ def _get_opt_method(method, alpha):
     return method
 
 
+def _get_penalty_coefficients(alpha, l1_ratio, exog, var_weights, k_exog, normalize, fit_intercept,
+                              first_column_constant):
+
+    # Penalty weights are scaled by weighted predictor standard deviations when
+    # normalize=True. This makes the penalty less sensitive to column scale.
+    stds = ([wtd_std(exog.getcol(k).toarray().flatten() if isspmatrix(exog) else exog[:,k]
+                     , weights=var_weights)
+             for k in range(k_exog)]
+            if normalize else np.ones(k_exog))
+
+    if isinstance(alpha, (int, float, np.integer)):
+        alpha = [alpha] * k_exog
+    if isinstance(l1_ratio, (int, float, np.integer)):
+        l1_ratio = [l1_ratio] * k_exog
+
+    l1s = np.array([a * l * s for a, l, s in zip(alpha, l1_ratio, stds)])
+    l2s = np.array([.5 * a * (1.0 - l) * s ** 2 for a, l, s in zip(alpha, l1_ratio, stds)])
+
+    # Never penalize the explicit constant column.
+    if fit_intercept and first_column_constant:
+        l1s[0] = 0
+        l2s[0] = 0
+
+    return l1s, l2s
+
+
 def glm_internal(
-        endog, exog, var_weights=None, instruments=None, start_params=None, gam_penalty=None,
-        tol=DEFAULT_GLM_TOL, max_iter=DEFAULT_GLM_MAX_ITER, alpha=DEFAULT_GLM_ALPHA, l1_ratio=DEFAULT_GLM_L1_RATIO, debug=False,
-        family=DEFAULT_GLM_FAMILY, link=None, fit_intercept=True, normalize=True, penalize_scale=False,
+        endog, exog, var_weights=None, instruments=None, start_params=None, L2_penalty_matrix=None, regularize_to_values=None,
+        tol=DEFAULT_GLM_TOL, max_iter=DEFAULT_GLM_MAX_ITER, alpha=DEFAULT_GLM_ALPHA, l1_ratio=DEFAULT_GLM_L1_RATIO,
+        debug=False, family=DEFAULT_GLM_FAMILY, link=None, fit_intercept=True, normalize=True, penalize_scale=False,
         store_convergence_path=False, line_search_fallback=True, pick_default_start=True, is_endog_regressor=None,
         opt_method=METHOD_IRLS, first_column_constant=False, force_iv_projection=DEFAULT_GLM_FORCE_IV_PROJECTION,
         residual_inclusion=DEFAULT_GLM_RESIDUAL_INCLUSION, residual_inclusion_order=DEFAULT_GLM_RESIDUAL_INCLUSION_ORDER,
@@ -607,7 +638,7 @@ def glm_internal(
         Instrument matrix used for first-stage projection.
     start_params : array-like or None, optional
         Initial parameter values.
-    gam_penalty : array-like or scipy.sparse matrix or None, optional
+    L2_penalty_matrix : array-like or scipy.sparse matrix or None, optional
         Symmetric penalty matrix added to ``X'WX`` at each IRLS iteration (see
         :func:`_update_irls_iter`). For GAM fits this is the assembled B-spline
         roughness matrix; ``None`` for ordinary GLMs.
@@ -671,7 +702,7 @@ def glm_internal(
         Raised for unsupported optimization methods.
     """
     _time = time.time()
-    opt_method = _get_opt_method(opt_method, alpha)
+    opt_method = _get_opt_method(opt_method, alpha, l1_ratio)
 
     # The IRLS path expects the intercept to already be present as a constant
     # column if an intercept is fit.
@@ -720,7 +751,6 @@ def glm_internal(
     if not is_weighted:
         orig_weights = np.ones(nobs).astype(float)
         var_weights = orig_weights
-        var_weights = orig_weights
 
     # Keep a copy of the original weights for likelihood/statistic calculations,
     # then normalize the fitting weights to have mean one.
@@ -735,20 +765,37 @@ def glm_internal(
 
     intercept_last = intercept
 
-    # Penalty weights are scaled by weighted predictor standard deviations when
-    # normalize=True. This makes the penalty less sensitive to column scale.
-    stds = ([wtd_std(exog.getcol(k).toarray().flatten(), weights=var_weights)
-             for k in range(k_exog)]
-            if normalize else np.ones(k_exog))
+    # Handle penalty stuff ----
+    l1s, l2s = _get_penalty_coefficients(alpha, l1_ratio, exog, var_weights, k_exog, normalize, fit_intercept, first_column_constant)
 
-    l1s = np.array([alpha * l1_ratio * s for s in stds])
-    l2s = np.array([.5 * alpha * (1.0 - l1_ratio) * s ** 2 for s in stds])
+    if opt_method == METHOD_IRLS:
+        
+        L2_penalty_matrix_dense = (
+            L2_penalty_matrix.toarray() if isspmatrix(L2_penalty_matrix) else L2_penalty_matrix) if L2_penalty_matrix is not None else None
+        L2_penalty_matrix = csc_matrix(L2_penalty_matrix) if L2_penalty_matrix is not None else None
 
-    # Never penalize the explicit constant column.
-    if fit_intercept and first_column_constant:
-        l1s[0] = 0
-        l2s[0] = 0
+        if L2_penalty_matrix_dense is not None:
+            if regularize_to_values is not None:
+                regularize_to_values = (L2_penalty_matrix_dense @ np.array(regularize_to_values)).reshape((-1, 1))
+            else:
+                regularize_to_values= np.zeros(k_exog)
 
+        # override for ridge
+        if np.any(l2s > 0) and np.all(l1_ratio == 0):
+            L2_penalty_matrix_dense = np.diag(l2s) * nobs * 2
+            L2_penalty_matrix = csc_matrix(L2_penalty_matrix_dense)
+
+            if regularize_to_values is not None:
+                regularize_to_values = (L2_penalty_matrix_dense @ np.array(regularize_to_values)).reshape((-1, 1))
+            else:
+                regularize_to_values = np.zeros((k_exog,1))
+
+    # try:
+    #     print(f'\n**** {L2_penalty_matrix_dense=}')
+    # except:
+    #     pass
+
+    # -------------------------- #
     endog_predicted, irls_weights = None, None
 
     converged = False
@@ -789,7 +836,7 @@ def glm_internal(
     iter_time = time.time()
     itr = 0
     ncp = None
-    gam_penalty_dense = gam_penalty.toarray() if gam_penalty is not None else None
+
     while True:
 
         try:
@@ -826,7 +873,7 @@ def glm_internal(
                 # IRLS solves a weighted least-squares approximation to the GLM
                 # objective_function at the current linear predictor.
                 params, endog_predicted, irls_weights, g_prime, lin_pred, working_response,  XpX, ncp \
-                    = _update_irls_iter(var_weights, lin_pred, family, link, endog, exog, gam_penalty)
+                    = _update_irls_iter(var_weights, lin_pred, family, link, endog, exog, L2_penalty_matrix, regularize_to_values)
                 scale = _estimate_scale(
                     endog, link.inverse_link(lin_pred), orig_weights, family, df_resid, use_correction=False)
 
@@ -851,8 +898,8 @@ def glm_internal(
 
             penalty = _get_penalty(nobs, params, l1s, l2s, scale, penalize_scale)
             objective = -llf + penalty
-            if gam_penalty is not None:
-                objective += params.dot(gam_penalty_dense).dot(params)
+            if L2_penalty_matrix is not None:
+                objective += params.dot(L2_penalty_matrix_dense).dot(params)
 
             if debug:
                 if objective > objective_last * (1 + 1e-3):
@@ -870,8 +917,8 @@ def glm_internal(
             #         llf_new = family.log_likelihood(endog, theta_new, scale=1, var_weights=orig_weights)
             #         penalty_new = _get_penalty(nobs, params_new, l1s, l2s, scale, penalize_scale)
             #         objective_new = -llf_new + penalty_new
-            #         if gam_penalty is not None:
-            #             objective_new += params_new.dot(gam_penalty_dense).dot(params_new)
+            #         if L2_penalty_matrix is not None:
+            #             objective_new += params_new.dot(L2_penalty_matrix_dense).dot(params_new)
             #         if objective_new < objective:
             #             # print(aa, objective_new-objective_function, objective_new-objective_last)
             #             aa *= 1.25
@@ -900,8 +947,8 @@ def glm_internal(
                     llf = family.log_likelihood(endog, theta, scale=1, var_weights=orig_weights)
                     penalty = _get_penalty(nobs, params, l1s, l2s, scale, penalize_scale)
                     objective = -llf + penalty
-                    if gam_penalty is not None:
-                        objective += params.dot(gam_penalty_dense).dot(params)
+                    if L2_penalty_matrix is not None:
+                        objective += params.dot(L2_penalty_matrix_dense).dot(params)
                     if debug:
                         print("\t\t\tLine search%4d%15.2e%15.2e%15.2e" % (
                             cnt_line_search, objective, objective_last, objective - objective_last))
