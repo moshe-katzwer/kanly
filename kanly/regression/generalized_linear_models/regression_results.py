@@ -75,7 +75,7 @@ class SparseGLMRegressionResults(RegressionResultsBase):
                          cov_type=cov_type, cov_kwds=cov_kwds, test_level=test_level, use_t=use_t, alpha=alpha,
                          l1_ratio=l1_ratio, specification_name=specification_name)
 
-        self.is_gam = model.gam_penalty is not None
+        self.is_gam = model.is_gam
         self.set_properties_from_model(model, keep_model)
         self.var_weights_name = var_weights_name
 
@@ -129,6 +129,9 @@ class SparseGLMRegressionResults(RegressionResultsBase):
         self.cov_elapsed = cov_time
 
         self.exog_names = exog_names
+
+        self.loglike = self.model.get_log_likelihood_function(self.family, self.link)
+        self.loglike_obs = self.model.get_log_likelihood_function_obs(self.family, self.link)
 
     @staticmethod
     def get_result_type():
@@ -185,11 +188,12 @@ class SparseGLMRegressionResults(RegressionResultsBase):
         ret = 'fit_intercept = %s' % self.fit_intercept
         ret += '\nLink Function: ' + self.link.function_str()
 
-        if self.alpha > 0:
-            ret += "\nPenalization: alpha = %.4f, l1_ratio = %.4f"\
+        if np.any(self.alpha) > 0:
+            ret += "\nPenalization: alpha = %5s, l1_ratio = %5s" \
                    "\n              normalize = %s, penalize_scale = %s" % (
-                self.alpha, self.l1_ratio, self.normalize, self.penalize_scale)
-            ret += '\n{Note: Inference is *not* available\n since penalized regression is a biased estimator!}'
+                       str(self.alpha)[:5], str(self.l1_ratio)[:5], self.normalize, self.penalize_scale)
+            if np.any(self.l1_ratio > 0):
+                ret += '\n{Note: Inference is *not* available\n since penalized regression is a biased estimator!}'
         if self.is_iv and self.did_compute_var_covar():
             ret += f"\n\nIV residual_inclusion={self.residual_inclusion}"
             ret += '\n\n*** Note: IV is complicated in non-linear settings,' \
