@@ -120,13 +120,13 @@ def get_robust_glm_covariance(
     if cov_type == NONROBUST:
 
         bread = _get_XpX(exog, bread_diag, fit_intercept, first_column_constant)
-        if alpha > 0:
+        if np.any(alpha) > 0:
             bread += _get_l2_diagonal_for_cov(nobs, l2s, fit_intercept, first_column_constant, var_weights)
         if gam_penalty is not None:
             bread += gam_penalty.toarray()
         bread = get_matrix_inverse_internal(bread)
 
-        if alpha > 0:
+        if np.any(alpha) > 0:
             meat = _get_XpX(exog, bread_diag, fit_intercept, first_column_constant)
             var_covar = scale * bread.dot(meat).dot(bread)
         else:
