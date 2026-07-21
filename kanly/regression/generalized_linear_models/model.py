@@ -98,7 +98,8 @@ class SparseGeneralizedLinearModel(LinearModelBase):
     """
 
     def __init__(self, exog, endog, add_constant, has_intercept, has_implicit_constant, formula_design_info,
-                 gam_penalty, weights=None, instruments=None, endog_name=None, exog_names=None, weights_name=None,
+                 is_gam, L2_penalty_matrix, regularize_to_values=None, weights=None, instruments=None, endog_name=None,
+                 exog_names=None, weights_name=None,
                  instrument_names=None, specification_name=None, index=None, valid_obs_rows=None,
                  null_rows_info_dict=None, model_elapsed=None):
         """Initialize a sparse generalized linear model.
@@ -110,7 +111,7 @@ class SparseGeneralizedLinearModel(LinearModelBase):
             has_intercept: Whether the formula/design already includes an intercept.
             has_implicit_constant: Whether the design implicitly contains a constant.
             formula_design_info: Parsed formula metadata (terms, spline knots, etc.).
-            gam_penalty: Optional ``p × p`` penalty matrix added to ``X'WX`` in IRLS
+            L2_penalty_matrix: Optional ``p × p`` penalty matrix added to ``X'WX`` in IRLS
                 and to the covariance bread matrix. Set by GAM model construction
                 (:meth:`build_model_from_formula` on
                 :class:`~kanly.regression.generalized_linear_models.generalized_additive_models.model.SparseGeneralizedAdditiveModel`);
@@ -137,30 +138,40 @@ class SparseGeneralizedLinearModel(LinearModelBase):
             method='GLM', specification_name=specification_name, model_elapsed=model_elapsed,
             index=index, valid_obs_rows=valid_obs_rows, null_rows_info_dict=null_rows_info_dict,
         )
-        self.gam_penalty = None
-        self._set_gam_penalty(gam_penalty)
+        self.is_gam = is_gam
+        self.L2_penalty_matrix = None
+        self._set_L2_penalty_matrix(L2_penalty_matrix, regularize_to_values)
 
-    def _set_gam_penalty(self, gam_penalty):
+    def _set_L2_penalty_matrix(self, L2_penalty_matrix, regularize_to_values):
         """Store the GAM roughness matrix on the model (sparse or dense).
 
-        ``gam_penalty`` is passed through to :func:`~kanly.regression.generalized_linear_models.sparse_glm_internal.glm_internal`
+        ``L2_penalty_matrix`` is passed through to :func:`~kanly.regression.generalized_linear_models.sparse_glm_internal.glm_internal`
         and added to ``X'WX`` each IRLS iteration. Covariance computation adds the
         same matrix to the bread (see
         :func:`~kanly.regression.generalized_linear_models.sparse_glm_var_covar_internal.get_robust_glm_covariance`).
         """
-        if gam_penalty is None:
-            self.gam_penalty = None
+        if L2_penalty_matrix is None:
+            self.L2_penalty_matrix = None
         else:
             if self.is_sparse_model:
-                if not isspmatrix(gam_penalty):
-                    gam_penalty = csc_matrix(gam_penalty)
+                if not isspmatrix(L2_penalty_matrix):
+                    L2_penalty_matrix = csc_matrix(L2_penalty_matrix)
             else:
-                if isspmatrix(gam_penalty):
-                    gam_penalty = gam_penalty.toarray()
-            self.gam_penalty = gam_penalty
+                if isspmatrix(L2_penalty_matrix):
+                    L2_penalty_matrix = L2_penalty_matrix.toarray()
+            self.L2_penalty_matrix = L2_penalty_matrix
+
+        if regularize_to_values is None:
+            self.regularize_to_values = np.zeros((self.exog.shape[1],1))
+        else:
+            if isinstance(regularize_to_values, (float, int, np.integer)):
+                self.regularize_to_values = np.array([regularize_to_values] * self.exog[0].shape[1])
+            else:
+                self.regularize_to_values = np.array(regularize_to_values)
+            self.regularize_to_values = self.regularize_to_values.reshape((self.exog.shape[1], 1))
 
     def fit(self, family=DEFAULT_GLM_FAMILY, link=None, start_params=None, tol=DEFAULT_GLM_TOL, max_iter=DEFAULT_GLM_MAX_ITER,
-            alpha=0.0, l1_ratio=0.0, debug=False, normalize=True, penalize_scale=False, specification_name=None,
+            alpha=0.0, l1_ratio=0.0, regularize_to_values=None, debug=False, normalize=True, penalize_scale=False, specification_name=None,
             use_t=True, test_level=DEFAULT_GLM_TEST_LEVEL, compute_cov=True, store_convergence_path=False,
             residual_inclusion=DEFAULT_GLM_RESIDUAL_INCLUSION, cov_kwds=None, cov_type=DEFAULT_GLM_COV_TYPE,
             fit_intercept=True, keep_model=True, prompt_user_for_more_iters=DEFAULT_GLM_PROMPT_USER_FOR_MORE_ITERS,
@@ -204,7 +215,7 @@ class SparseGeneralizedLinearModel(LinearModelBase):
             ``SparseGLMRegressionResults`` containing estimates and diagnostics.
         """
 
-        opt_method = _get_opt_method(opt_method, alpha)
+        opt_method = _get_opt_method(opt_method, alpha, l1_ratio)
 
         start_params = dict_2_array(start_params, self.exog_names, ignore_extra_keys=True, default_value=0.0)
 
@@ -218,7 +229,8 @@ class SparseGeneralizedLinearModel(LinearModelBase):
         _check_penalties(alpha, l1_ratio)
 
         fit_object: GLMRawFitData = glm_internal(
-            self.endog, self.exog, gam_penalty=self.gam_penalty, var_weights=self.weights, instruments=self.instruments, start_params=start_params,
+            self.endog, self.exog, L2_penalty_matrix=self.L2_penalty_matrix, regularize_to_values=self.regularize_to_values, 
+            var_weights=self.weights, instruments=self.instruments, start_params=start_params,
             tol=tol, max_iter=max_iter, alpha=alpha, l1_ratio=l1_ratio, fit_intercept=fit_intercept, debug=debug,
             family=family, link=link, normalize=normalize, penalize_scale=penalize_scale,
             store_convergence_path=store_convergence_path, force_iv_projection=force_iv_projection,
@@ -232,7 +244,7 @@ class SparseGeneralizedLinearModel(LinearModelBase):
             var_covar, cov_time = get_robust_glm_covariance(
                 self.endog, fit_object.exog, fit_object.endog_predicted, self.weights, fit_object.irls_weights,
                 fit_object.family, fit_object.link, fit_object.scale, cov_type, fit_intercept, first_column_constant,
-                fit_object.alpha, fit_object.l2s, self.gam_penalty)
+                fit_object.alpha, fit_object.l2s, self.L2_penalty_matrix)
         else:
             var_covar = None
             cov_time = 0
@@ -267,7 +279,8 @@ class SparseGeneralizedLinearModel(LinearModelBase):
                 """
                 bootstrap_weights = get_bootstrap_weights2(bootstrap_weights, self.weights)
                 fit_object_temp = glm_internal(
-                    self.endog, self.exog, gam_penalty=self.gam_penalty, var_weights=bootstrap_weights,
+                    self.endog, self.exog, L2_penalty_matrix=self.L2_penalty_matrix, regularize_to_values=self.regularize_to_values,
+                    var_weights=bootstrap_weights,
                     instruments=self.instruments, start_params=fit_object.params, tol=tol, max_iter=max_iter,
                     alpha=alpha, l1_ratio=l1_ratio, fit_intercept=fit_intercept, debug=False, family=family, link=link,
                     normalize=normalize, penalize_scale=penalize_scale, store_convergence_path=store_convergence_path,
@@ -477,11 +490,11 @@ class SparseGeneralizedLinearModel(LinearModelBase):
         formula_design_info = result[FORMULA_DESIGN_INFO_KEY]
 
         model = SparseGeneralizedLinearModel(
-            exog, endog, False, fit_intercept, has_implicit_constant, formula_design_info, weights=var_weights,
+            exog, endog, False, fit_intercept, has_implicit_constant, formula_design_info, False, weights=var_weights,
             endog_name=endog_name, exog_names=exog_names, weights_name=var_weights_name, instruments=instruments,
             instrument_names=instrument_names, valid_obs_rows=valid_obs_rows, index=index,
             null_rows_info_dict=null_rows_info_dict, model_elapsed=time.time() - _t,
-            specification_name=specification_name, gam_penalty=None
+            specification_name=specification_name, L2_penalty_matrix=None
         )
 
         if debug:
@@ -490,7 +503,7 @@ class SparseGeneralizedLinearModel(LinearModelBase):
         return model
 
     @staticmethod
-    def GLM(endog, exog, gam_penalty=None, add_constant=False, instruments=None, start_params=None, tol=DEFAULT_GLM_TOL, max_iter=DEFAULT_GLM_MAX_ITER,
+    def GLM(endog, exog, L2_penalty_matrix=None, regularize_to_values=None, add_constant=False, instruments=None, start_params=None, tol=DEFAULT_GLM_TOL, max_iter=DEFAULT_GLM_MAX_ITER,
             var_weights=None, alpha=DEFAULT_GLM_ALPHA, l1_ratio=DEFAULT_GLM_L1_RATIO, debug=False,
             family=DEFAULT_GLM_FAMILY, link=None, exog_names=None,
             endog_name=None, fit_intercept=False, normalize=True, penalize_scale=False, use_t=DEFAULT_GLM_USE_T,
@@ -509,13 +522,13 @@ class SparseGeneralizedLinearModel(LinearModelBase):
 <<<<<<< HEAD
 <<<<<<< HEAD
 =======
-            gam_penalty: Optional ``p × p`` GAM roughness matrix (see
-                :meth:`_set_gam_penalty`). Use ``None`` unless fitting via the
+            L2_penalty_matrix: Optional ``p × p`` GAM roughness matrix (see
+                :meth:`_set_L2_penalty_matrix`). Use ``None`` unless fitting via the
                 array API with a pre-built penalty; formula GAMs use ``gam()``.
 >>>>>>> 41786cc1 (.)
 =======
-            gam_penalty: Optional ``p × p`` GAM roughness matrix (see
-                :meth:`_set_gam_penalty`). Use ``None`` unless fitting via the
+            L2_penalty_matrix: Optional ``p × p`` GAM roughness matrix (see
+                :meth:`_set_L2_penalty_matrix`). Use ``None`` unless fitting via the
                 array API with a pre-built penalty; formula GAMs use ``gam()``.
 >>>>>>> 52e55f7b (.)
             add_constant: Whether to add a constant in the base model.
@@ -581,8 +594,8 @@ class SparseGeneralizedLinearModel(LinearModelBase):
         :meth:`glm` : formula entry point taking a Patsy-style formula.
         """
         return SparseGeneralizedLinearModel(
-            exog, endog, add_constant, fit_intercept, has_implicit_constant=False, formula_design_info=None,
-            weights=var_weights, gam_penalty=gam_penalty,
+            exog, endog, add_constant, fit_intercept, has_implicit_constant=False, formula_design_info=None, is_gam=False,
+            weights=var_weights, L2_penalty_matrix=L2_penalty_matrix, regularize_to_values=regularize_to_values,
             endog_name=endog_name, exog_names=exog_names, weights_name=var_weights_name, instruments=instruments,
             instrument_names=instrument_names, valid_obs_rows=None, index=None,
             null_rows_info_dict=None, model_elapsed=0,
@@ -597,7 +610,8 @@ class SparseGeneralizedLinearModel(LinearModelBase):
 
     @staticmethod
     def glm(formula, data, start_params=None, tol=DEFAULT_GLM_TOL, max_iter=DEFAULT_GLM_MAX_ITER, alpha=0.0,
-            l1_ratio=0.0, debug=False, family=DEFAULT_GLM_FAMILY, link=None, normalize=True, penalize_scale=False,
+            l1_ratio=0.0,  regularize_to_values=None,
+            debug=False, family=DEFAULT_GLM_FAMILY, link=None, normalize=True, penalize_scale=False,
             use_t=True, test_level=DEFAULT_GLM_TEST_LEVEL, compute_cov=True, store_convergence_path=False,
             residual_inclusion=DEFAULT_GLM_RESIDUAL_INCLUSION, cov_kwds=None, cov_type=DEFAULT_GLM_COV_TYPE,
             line_search_fallback=True, pick_default_start=True, opt_method=None, index=None,
@@ -695,7 +709,7 @@ class SparseGeneralizedLinearModel(LinearModelBase):
         """
 
         cov_kwds = format_cov_kwds(cov_kwds)
-        opt_method = _get_opt_method(opt_method, alpha)
+        opt_method = _get_opt_method(opt_method, alpha, l1_ratio)
 
         cov_type = cov_type.upper()
         if cov_type not in GLM_COV_TYPES:
@@ -711,6 +725,7 @@ class SparseGeneralizedLinearModel(LinearModelBase):
             family=family, link=link,
             start_params=start_params, tol=tol, max_iter=max_iter,
             alpha=alpha, l1_ratio=l1_ratio, debug=debug,
+            regularize_to_values=regularize_to_values,
             normalize=normalize, penalize_scale=penalize_scale, use_t=use_t, test_level=test_level,
             compute_cov=compute_cov,
             store_convergence_path=store_convergence_path,
