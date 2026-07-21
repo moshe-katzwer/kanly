@@ -213,7 +213,7 @@ class SparseGeneralizedAdditiveModel(SparseGeneralizedLinearModel):
         # Placeholder; gam_penalty assembled below after we know p = len(exog_names)
         gam_penalty = None
         model = SparseGeneralizedAdditiveModel(
-            exog, endog, False, fit_intercept, has_implicit_constant, formula_design_info,
+            exog, endog, False, fit_intercept, has_implicit_constant, formula_design_info, True,
             gam_penalty, weights=None,
             endog_name=endog_name, exog_names=exog_names, weights_name=None, instruments=None,
             instrument_names=None, valid_obs_rows=valid_obs_rows, index=index,
@@ -230,7 +230,6 @@ class SparseGeneralizedAdditiveModel(SparseGeneralizedLinearModel):
             for v in t.state['numerical']:
                 v_orig = new_exog_2_orig_map.get(v, None)
                 if v_orig in penalty:
-                    print(t.state['numerical'][v]['bspline'])
                     knots = t.state['numerical'][v]['bspline']['knots']
                     # factor 2 aligns user penalty with quadratic form added to X'WX in IRLS
                     penalty_matrix = (penalty[v_orig] * 2) * bspline_penalty(knots, include_intercept=False)
