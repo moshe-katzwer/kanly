@@ -10,40 +10,46 @@ from kanly.api import glm, gam
 import matplotlib.pyplot as plt
 
 np.random.seed(0)
-n2 = 300
-x2 = np.random.randn(n2)
-x2.sort()
-y2 = np.exp(-4.5 + .5 * x2 + .05 * x2 ** 2 - .5 * np.sin(x2 * 4) + .4 * np.random.randn(n2))
-data2 = pd.DataFrame(dict(x2=x2, y2=y2))
+n = 300
+x = np.random.randn(n)
+x.sort()
+
+y = np.exp(-4.5 + .5 * x + .05 * x ** 2 - .5 * np.sin(x * 4) + .4 * np.random.randn(n))
+data = pd.DataFrame(dict(x=x, y=y))
 df_2 = 20
 
 fit_glm = gam(
-    'y2 ~ x2', data2,
-    df=dict(x2=df_2),
-    penalty=dict(x2=0.0),  # no penalization - just GLM
+    'y ~ x', data,
+    df=dict(x=df_2),
+    penalty=dict(x=0.0),  # no penalization - just GLM
     family='poisson')
 
 fit_gam1 = gam(
-    'y2 ~ x2', data2,
-    penalty=dict(x2=.0010),
-    df=dict(x2=df_2), family='poisson', cov_type='nonrobust')
+    'y ~ x', data,
+    penalty=dict(x=.0010),
+    df=dict(x=df_2), family='poisson')
 print(fit_gam1)
 
 fit_gam2 = gam(
-    'y2 ~ x2', data2,
-    penalty=dict(x2=.05),
-    df=dict(x2=df_2), family='poisson', cov_type='nonrobust')
+    'y ~ x', data,
+    penalty=dict(x=.05),
+    df=dict(x=df_2), family='poisson', cov_type='nonrobust')
 print(fit_gam2)
 
 plt.figure(dpi=150)
-plt.scatter(x2, y2, alpha=.3, c='y')
-plt.plot(x2, fit_glm.fittedvalues, lw=3, label=f'glm [edf={fit_glm.edf.sum():.1f}]')
-plt.plot(x2, fit_gam1.fittedvalues, lw=3,
+plt.scatter(x, y, alpha=.3, c='y')
+plt.plot(x, fit_glm.fittedvalues, lw=3, label=f'glm [edf={fit_glm.edf.sum():.1f}]')
+plt.plot(x, fit_gam1.fittedvalues, lw=3,
          label=f'gam(penalization={.0001:.1e}) [edf={fit_gam1.edf.sum():.1f}]')
-plt.plot(x2, fit_gam2.fittedvalues, lw=3,
+plt.plot(x, fit_gam2.fittedvalues, lw=3,
          label=f'gam(penalization={.05:.1e}) [edf={fit_gam2.edf.sum():.1f}]')
+
+data_sub = pd.DataFrame({'x': sorted(np.random.randn(50))})
+plt.plot(data_sub.x, fit_gam1.predict(data=data_sub), lw=2, ls='--',
+         label='gam(penalization={.0001:.1e}) [edf={fit_gam1.edf.sum():.1f}]\noos')
+
 plt.legend(loc='best')
-plt.title("Generalized Additive Model Example\nPoisson")
+plt.title('Generalized Additive Model Example\nPoisson')
 plt.yscale('log')
 plt.ylabel('log(y)')
 plt.show()
