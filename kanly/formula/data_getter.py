@@ -959,7 +959,7 @@ class SparseDataGetter(object):
         if len(endog_names) == 1:
             return get_numerical_control_data(
                 endog_names[0], data, invalid_row_func=numerical_invalid_row_func, name=ENDOG_KEY,
-                term_dict=term_dict, index=index)
+                term_dict=term_dict, index=index, return_type='dense' if return_dense else 'sparse')
         else:
             return SparseDataGetter._sparse_dmatrix_internal(
                 endog_names + ['-1'], data, do_absorb=do_absorb, debug=debug,
