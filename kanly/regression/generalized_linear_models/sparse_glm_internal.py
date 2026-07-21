@@ -477,11 +477,13 @@ def _update_irls_iter(var_weights, lin_pred, family, link, endog, exog, L2_penal
         Design matrix.
     L2_penalty_matrix : array-like or scipy.sparse matrix or None, optional
         Penalty matrix added to the IRLS normal equations each iteration:
-        ``X'WX + L2_penalty_matrix`` before inversion. Used for **generalized additive
-        models (GAM)**: a block-diagonal roughness penalty on B-spline coefficient
-        blocks (built by :class:`~kanly.regression.generalized_linear_models.generalized_additive_models.model.SparseGeneralizedAdditiveModel`).
-        ``None`` disables GAM penalization. Unlike ``alpha > 0`` elastic-net,
-        ``L2_penalty_matrix`` is compatible with the IRLS path (no coordinate descent).
+        ``X'WX + L2_penalty_matrix`` before inversion. It may be a general ridge
+        matrix or the block-diagonal roughness matrix built for a GAM. ``None``
+        disables matrix penalization.
+    regularize_to_values : numpy.ndarray or None, optional
+        Right-hand-side penalty contribution ``L2_penalty_matrix @ r``, where
+        ``r`` is the target coefficient vector. This low-level update expects
+        the product rather than the untransformed target.
 
     Returns
     -------
@@ -506,11 +508,11 @@ def _update_irls_iter(var_weights, lin_pred, family, link, endog, exog, L2_penal
     exog_w = csc_matrix_by_column_array_broadcast(exog, wts)
     XpX = exog.transpose().dot(exog_w)
 
-    # GAM: add roughness penalty to weighted normal equations (penalized WLS step).
+    # Add the general ridge/GAM matrix to the penalized WLS normal equations.
     if L2_penalty_matrix is not None:
-        XpX_plus_gam = XpX + L2_penalty_matrix
+        XpX_penalized = XpX + L2_penalty_matrix
     else:
-        XpX_plus_gam = XpX
+        XpX_penalized = XpX
 
     with warnings.catch_warnings():
         # scipy may warn about sparse formats or solve efficiency; the code
@@ -518,7 +520,7 @@ def _update_irls_iter(var_weights, lin_pred, family, link, endog, exog, L2_penal
         warnings.filterwarnings("ignore", message="splu requires CSC matrix format")
         warnings.filterwarnings("ignore", message="spsolve is more efficient when sparse b ")
         warnings.filterwarnings("ignore", category=SparseEfficiencyWarning)
-        ncp = get_matrix_inverse_internal(XpX_plus_gam.toarray())
+        ncp = get_matrix_inverse_internal(XpX_penalized.toarray())
         # ncp = csc_matrix(ncp.reshape((exog.shape[1], exog.shape[1])))
 
     # Weighted least-squares normal-equation update.
@@ -552,6 +554,9 @@ def _get_opt_method(method, alpha, l1_ratio):
         on whether regularization is active.
     alpha : float
         Regularization strength.
+    l1_ratio : float
+        Fraction of regularization assigned to the L1 penalty. A pure L2
+        penalty is compatible with either IRLS or coordinate descent.
 
     Returns
     -------
@@ -573,8 +578,8 @@ def _get_opt_method(method, alpha, l1_ratio):
     else:
         method = method.upper()
 
-    # Penalized models need coordinate descent because the IRLS solver below
-    # handles only unpenalized weighted least squares.
+    # An L1 component requires coordinate descent. Pure ridge is smooth and can
+    # instead be folded into the IRLS weighted least-squares normal equations.
     if np.any(alpha) > 0 and np.any(l1_ratio > 0) and method in [METHOD_IRLS, METHOD_COORD_DESCENT_1_ITER]:
         raise Exception("Cannot do method '%s' with non-ridge penalization, must do '%s" % (method, METHOD_COORD_DESC))
 
@@ -640,14 +645,22 @@ def glm_internal(
         Initial parameter values.
     L2_penalty_matrix : array-like or scipy.sparse matrix or None, optional
         Symmetric penalty matrix added to ``X'WX`` at each IRLS iteration (see
-        :func:`_update_irls_iter`). For GAM fits this is the assembled B-spline
-        roughness matrix; ``None`` for ordinary GLMs.
+        :func:`_update_irls_iter`). It can define a general ridge penalty or the
+        assembled B-spline roughness penalty for a GAM. The matrix is used only
+        by IRLS. If pure-ridge ``alpha`` is also nonzero, the diagonal matrix
+        derived from ``alpha`` replaces this matrix.
+    regularize_to_values : scalar or array-like or None, optional
+        Center ``r`` of the IRLS quadratic penalty. Internally the normal
+        equations use ``L2_penalty_matrix @ r`` on the right-hand side.
+        ``None`` centers the penalty at zero.
     tol : float, optional
         Absolute parameter-change tolerance used for convergence.
     max_iter : int, optional
         Maximum number of optimization iterations.
-    alpha : float, optional
-        Overall regularization strength. A value of zero disables penalization.
+    alpha : float or array-like, optional
+        Overall or per-parameter regularization strength. A value of zero
+        disables elastic-net penalization. Pure ridge can be optimized with
+        either coordinate descent or IRLS.
     l1_ratio : float, optional
         Fraction of regularization assigned to the L1 penalty. The remainder is
         assigned to the L2 penalty.
@@ -675,7 +688,8 @@ def glm_internal(
         instruments are supplied.
     opt_method : str, optional
         Optimization method. Supported values are IRLS, coordinate descent, and
-        one-iteration coordinate descent.
+        one-iteration coordinate descent. Any L1 component requires coordinate
+        descent; pure L2 penalization supports both main methods.
     first_column_constant : bool, optional
         Whether the first exogenous column is an explicit constant.
     force_iv_projection : bool, optional

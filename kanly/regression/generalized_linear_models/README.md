@@ -253,7 +253,8 @@ currently returns ``dydx`` effects with secant dummies.
 
 ## Regularization
 
-Set `alpha > 0` to use coordinate descent with elastic-net penalties:
+Set `alpha > 0` to fit an elastic-net penalized pseudo-MLE. The default solver
+is coordinate descent:
 
 ```python
 fit = glm(
@@ -274,6 +275,69 @@ Parameters:
 - `penalize_scale`: whether penalties are multiplied by estimated scale.
 
 Penalized estimates are biased; inference is intentionally limited in summaries.
+
+### Ridge pseudo-MLE: coordinate descent or IRLS
+
+When `l1_ratio=0`, the penalty is purely quadratic, so the same ridge
+pseudo-MLE can be computed by either coordinate descent or IRLS. With
+`normalize=False` and the default `penalize_scale=False`, these two calls use
+the same diagonal ridge penalty:
+
+```python
+from kanly.api import GLM
+
+common = dict(
+    family="binomial",
+    alpha=0.1,
+    l1_ratio=0,
+    normalize=False,
+    fit_intercept=True,
+    first_column_constant=True,  # X[:, 0] is the unpenalized intercept
+)
+
+fit_cd = GLM(y, X, opt_method="COORDINATE_DESCENT", **common)
+fit_irls = GLM(y, X, opt_method="IRLS", **common)
+```
+
+Coordinate descent is also required when `l1_ratio > 0`, because the L1 term
+is not differentiable. IRLS is useful for ridge because each iteration solves
+one penalized weighted least-squares system.
+
+The matrix-form `GLM` interface also accepts a general symmetric L2 matrix. If
+`P = L2_penalty_matrix` and `r = regularize_to_values`, the IRLS normal
+equations are
+
+```text
+(X' W X + P) beta = X' W z + P r,
+```
+
+which centers the quadratic penalty on `r`. This supports correlated or
+selective shrinkage as well as the spline roughness matrices used by GAMs:
+
+```python
+import numpy as np
+
+n, p = X.shape
+P = n * 0.1 * np.diag([0.0, 1.0, 1.0])
+target = np.array([0.0, 0.5, 0.0])
+
+fit_matrix = GLM(
+    y,
+    X,
+    family="binomial",
+    L2_penalty_matrix=P,
+    regularize_to_values=target,
+    opt_method="IRLS",
+    alpha=0,
+    fit_intercept=True,
+    first_column_constant=True,
+)
+```
+
+`L2_penalty_matrix` is inserted directly into the normal equations and is not
+automatically multiplied by the sample size. Set `alpha=0` when supplying it;
+otherwise a pure-ridge `alpha` fit constructs a diagonal penalty matrix and
+replaces the explicit matrix. `regularize_to_values=None` uses a zero target.
 
 ## Instrumental Variables and Residual Inclusion
 
@@ -397,10 +461,11 @@ print(fit.summary())  # fit.is_gam is True; Df Model uses effective d.f. (edf)
 ```
 
 For each key in ``penalty`` / ``df``, the corresponding formula column is
-expanded to a cubic B-spline basis before fit. The internal **``gam_penalty``**
-matrix (integrated squared second derivative on each spline block) is added to
-``X'WX`` at every IRLS iteration — the same mechanism documented in
-``sparse_glm_internal`` — rather than using coordinate descent.
+expanded to a cubic B-spline basis before fit. Its roughness matrix (integrated
+squared second derivative on each spline block) is stored as the model's
+**``L2_penalty_matrix``** and added to ``X'WX`` at every IRLS iteration — the
+same general matrix-penalty mechanism documented above and in
+``sparse_glm_internal``.
 
 - ``penalty[var]=0``: unpenalized GLM on the full spline expansion (flexible, can overfit).
 - Larger ``penalty[var]``: smoother fitted curves; summary reports **edf** (effective degrees of freedom) per coefficient.

@@ -40,8 +40,9 @@ DEFAULT_GLM_COV_TYPE = NONROBUST
 DEFAULT_GLM_RESIDUAL_INCLUSION = True
 DEFAULT_GLM_RESIDUAL_INCLUSION_ORDER = 1
 
-# Optimizer method labels. IRLS is the standard GLM routine; coordinate descent
-# is used for elastic-net penalties; the one-iteration variant warms up IRLS.
+# Optimizer method labels. IRLS is the standard GLM routine and supports smooth
+# L2 penalties; coordinate descent also supports ridge and is required for an
+# L1 component. The one-iteration variant warms up IRLS.
 METHOD_IRLS = 'IRLS'
 METHOD_COORD_DESC = 'COORDINATE_DESCENT'
 METHOD_COORD_DESCENT_1_ITER = 'COORDINATE_DESCENT_1_ITER'
@@ -54,4 +55,3 @@ DEFAULT_GLM_CHECK_CONSTANT_COLS = True
 
 # Long fits can optionally ask the user whether to continue after max_iter.
 DEFAULT_GLM_PROMPT_USER_FOR_MORE_ITERS = False
-

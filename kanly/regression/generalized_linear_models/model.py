@@ -111,11 +111,16 @@ class SparseGeneralizedLinearModel(LinearModelBase):
             has_intercept: Whether the formula/design already includes an intercept.
             has_implicit_constant: Whether the design implicitly contains a constant.
             formula_design_info: Parsed formula metadata (terms, spline knots, etc.).
-            L2_penalty_matrix: Optional ``p × p`` penalty matrix added to ``X'WX`` in IRLS
-                and to the covariance bread matrix. Set by GAM model construction
-                (:meth:`build_model_from_formula` on
-                :class:`~kanly.regression.generalized_linear_models.generalized_additive_models.model.SparseGeneralizedAdditiveModel`);
-                ``None`` for standard GLMs.
+            is_gam: Whether the model was constructed as a generalized additive
+                model.
+            L2_penalty_matrix: Optional symmetric ``p × p`` L2 penalty matrix
+                added to ``X'WX`` in IRLS and to the covariance bread matrix.
+                This may be a general ridge matrix supplied through :meth:`GLM`
+                or the roughness matrix constructed for a GAM. ``None`` disables
+                matrix penalization.
+            regularize_to_values: Optional scalar or length-``p`` ridge target.
+                The quadratic penalty is centered on these values; ``None``
+                centers it at zero.
             weights: Optional variance weights.
             instruments: Optional instrument matrix for IV-style GLM.
             endog_name: Optional response name.
@@ -143,12 +148,18 @@ class SparseGeneralizedLinearModel(LinearModelBase):
         self._set_L2_penalty_matrix(L2_penalty_matrix, regularize_to_values)
 
     def _set_L2_penalty_matrix(self, L2_penalty_matrix, regularize_to_values):
-        """Store the GAM roughness matrix on the model (sparse or dense).
+        """Store an IRLS L2 penalty matrix and its target values.
 
         ``L2_penalty_matrix`` is passed through to :func:`~kanly.regression.generalized_linear_models.sparse_glm_internal.glm_internal`
         and added to ``X'WX`` each IRLS iteration. Covariance computation adds the
         same matrix to the bread (see
         :func:`~kanly.regression.generalized_linear_models.sparse_glm_var_covar_internal.get_robust_glm_covariance`).
+
+        Args:
+            L2_penalty_matrix: Symmetric ``p × p`` ridge or GAM roughness
+                matrix, or ``None`` for no matrix penalty.
+            regularize_to_values: Scalar or length-``p`` vector giving the
+                center of the quadratic penalty. ``None`` uses zero.
         """
         if L2_penalty_matrix is None:
             self.L2_penalty_matrix = None
@@ -190,6 +201,9 @@ class SparseGeneralizedLinearModel(LinearModelBase):
             max_iter: Maximum optimizer iterations.
             alpha: Elastic-net regularization strength.
             l1_ratio: Fraction of regularization assigned to L1 penalty.
+            regularize_to_values: Optional scalar or length-``p`` center for a
+                pure ridge penalty fitted with IRLS. If supplied here, it
+                overrides the target stored when the model was constructed.
             debug: Whether to print optimizer diagnostics.
             normalize: Whether to normalize predictors for penalized fitting.
             penalize_scale: Whether penalties are multiplied by estimated scale.
@@ -214,6 +228,9 @@ class SparseGeneralizedLinearModel(LinearModelBase):
         Returns:
             ``SparseGLMRegressionResults`` containing estimates and diagnostics.
         """
+
+        if regularize_to_values is not None:
+            self._set_L2_penalty_matrix(self.L2_penalty_matrix, regularize_to_values)
 
         opt_method = _get_opt_method(opt_method, alpha, l1_ratio)
 
@@ -519,18 +536,15 @@ class SparseGeneralizedLinearModel(LinearModelBase):
         Args:
             endog: Response vector.
             exog: Design matrix.
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
-            L2_penalty_matrix: Optional ``p × p`` GAM roughness matrix (see
-                :meth:`_set_L2_penalty_matrix`). Use ``None`` unless fitting via the
-                array API with a pre-built penalty; formula GAMs use ``gam()``.
->>>>>>> 41786cc1 (.)
-=======
-            L2_penalty_matrix: Optional ``p × p`` GAM roughness matrix (see
-                :meth:`_set_L2_penalty_matrix`). Use ``None`` unless fitting via the
-                array API with a pre-built penalty; formula GAMs use ``gam()``.
->>>>>>> 52e55f7b (.)
+            L2_penalty_matrix: Optional symmetric ``p × p`` matrix defining a
+                quadratic penalty for IRLS. It is added directly to ``X'WX``,
+                so the caller controls its scaling. Use ``alpha=0`` when
+                supplying this matrix; a pure-ridge ``alpha`` fit builds and
+                uses its own diagonal matrix. GAMs use the same mechanism with
+                a spline roughness matrix.
+            regularize_to_values: Optional scalar or length-``p`` target vector
+                ``r`` for the matrix penalty, which is centered on ``r``.
+                ``None`` uses zero. This argument applies to IRLS ridge fitting.
             add_constant: Whether to add a constant in the base model.
             instruments: Optional instrument matrix.
             start_params: Optional starting coefficient vector.
@@ -538,7 +552,9 @@ class SparseGeneralizedLinearModel(LinearModelBase):
             max_iter: Maximum optimizer iterations.
             var_weights: Optional variance weights.
             alpha: Elastic-net regularization strength.
-            l1_ratio: L1 share of regularization.
+            l1_ratio: L1 share of regularization. With ``l1_ratio=0``, ridge
+                can be fitted by coordinate descent or by setting
+                ``opt_method='IRLS'``.
             debug: Whether to print optimizer diagnostics.
             family: GLM family name, class, or instance.
             link: Optional link name, class, or instance.
@@ -589,6 +605,12 @@ class SparseGeneralizedLinearModel(LinearModelBase):
         >>> fit_p = GLM(y_counts, X, family='poisson',                  # doctest: +SKIP
         ...             fit_intercept=False)
 
+        Ridge pseudo-MLE using the IRLS path:
+
+        >>> fit_ridge = GLM(y, X, family='binomial', alpha=0.1,         # doctest: +SKIP
+        ...                 l1_ratio=0, opt_method='IRLS',
+        ...                 fit_intercept=True, first_column_constant=True)
+
         See Also
         --------
         :meth:`glm` : formula entry point taking a Patsy-style formula.
@@ -629,7 +651,11 @@ class SparseGeneralizedLinearModel(LinearModelBase):
             tol: Convergence tolerance.
             max_iter: Maximum optimizer iterations.
             alpha: Elastic-net regularization strength.
-            l1_ratio: L1 share of regularization.
+            l1_ratio: L1 share of regularization. Pure ridge
+                (``l1_ratio=0``) may use coordinate descent or IRLS.
+            regularize_to_values: Optional scalar or length-``p`` target for a
+                pure ridge penalty fitted with ``opt_method='IRLS'``. ``None``
+                centers the penalty at zero.
             debug: Whether to print optimizer diagnostics.
             family: GLM family name, class, or instance.
             link: Optional link name, class, or instance.

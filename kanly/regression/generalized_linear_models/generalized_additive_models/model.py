@@ -10,14 +10,13 @@ Workflow
 1. User passes ``penalty`` and ``df`` dicts keyed by smooth covariate names.
 2. Each penalized column in the formula is rewritten to a cubic B-spline basis
    ``bs(x, degree=3, df=..., include_intercept=False)``.
-3. A block-diagonal **roughness penalty matrix** ``gam_penalty`` is assembled from
+3. A block-diagonal **roughness penalty matrix** is assembled from
    :func:`~kanly.nonparametric.bspline.bspline_penalty` (integrated squared second
-   derivative) and stored on the model.
-   derivative) and stored on the model.
+   derivative) and stored as the model's ``L2_penalty_matrix``.
 4. :meth:`~kanly.regression.generalized_linear_models.model.SparseGeneralizedLinearModel.fit`
    calls :func:`~kanly.regression.generalized_linear_models.sparse_glm_internal.glm_internal`,
-   which adds ``gam_penalty`` to the IRLS normal equations ``X'WX`` each iteration —
-   the same slot used for L2/elastic-net penalties, but without coordinate descent.
+   which adds ``L2_penalty_matrix`` to the IRLS normal equations ``X'WX`` each
+   iteration — the same general matrix-penalty path exposed by ``GLM``.
 
 Entry point: ``kanly.api.gam`` / ``GAM`` (alias of ``GLM`` on this class).
 """
@@ -43,7 +42,7 @@ from kanly.utils.util import dict_2_dataframe
 
 class SparseGeneralizedAdditiveModel(SparseGeneralizedLinearModel):
     """
-    Sparse GLM with optional smooth (B-spline) terms via ``gam_penalty``.
+    Sparse GLM with optional smooth (B-spline) terms via an L2 roughness matrix.
 
     Inherits all GLM families, links, IV, and covariance options from
     :class:`~kanly.regression.generalized_linear_models.model.SparseGeneralizedLinearModel`.
@@ -54,7 +53,7 @@ class SparseGeneralizedAdditiveModel(SparseGeneralizedLinearModel):
     --------
     gam : formula entry point.
     kanly.regression.generalized_linear_models.sparse_glm_internal.glm_internal :
-        IRLS core that adds ``gam_penalty`` to ``X'WX``.
+        IRLS core that adds ``L2_penalty_matrix`` to ``X'WX``.
     """
 
     GAM = SparseGeneralizedLinearModel.GLM
@@ -86,16 +85,16 @@ class SparseGeneralizedAdditiveModel(SparseGeneralizedLinearModel):
             Data source.
         penalty : dict
             Roughness weight per smooth variable, e.g. ``dict(x2=0.1)``. Values are
-            multiplied by 2 when building the internal ``gam_penalty`` matrix (to
-            match the quadratic-penalty convention used in IRLS). Use ``0`` for no
-            penalization on that smooth.
+            multiplied by 2 when building the internal ``L2_penalty_matrix`` (to
+            match the quadratic-penalty convention used in IRLS). Use ``0`` for
+            no penalization on that smooth.
         df : dict
             Spline degrees of freedom (basis dimension) per smooth variable, e.g.
             ``dict(x2=20)``. Keys must match ``penalty``.
         family, link, cov_type, cov_kwds, use_t, test_level, tol, max_iter, debug
             Same as :meth:`~kanly.regression.generalized_linear_models.model.SparseGeneralizedLinearModel.glm`.
         alpha, l1_ratio
-            Elastic-net on top of GAM is not combined with ``gam_penalty`` in the
+            Elastic-net on top of a GAM roughness matrix is not combined in the
             current IRLS path; leave at 0 for standard GAM fits.
 
         Returns
@@ -113,7 +112,8 @@ class SparseGeneralizedAdditiveModel(SparseGeneralizedLinearModel):
         See Also
         --------
         glm : unpenalized or elastic-net GLM without spline expansion.
-        build_model_from_formula : constructs ``gam_penalty`` from ``penalty`` / ``df``.
+        build_model_from_formula : constructs the L2 roughness matrix from
+            ``penalty`` / ``df``.
         """
         cov_kwds = format_cov_kwds(cov_kwds)
         opt_method = METHOD_IRLS
@@ -150,16 +150,18 @@ class SparseGeneralizedAdditiveModel(SparseGeneralizedLinearModel):
                                  drop_1_for_FE=True, cov_groups=None,
                                  df=None, penalty=None,
                                  check_constant_cols=DEFAULT_GLM_CHECK_CONSTANT_COLS):
-        """Build a sparse GAM model: spline expansion + ``gam_penalty`` matrix.
+        """Build a sparse GAM model: spline expansion plus an L2 roughness matrix.
 
         Steps:
         1. Parse the user formula and rewrite each ``penalty`` key ``c`` to
            ``bs(c, degree=3, df=df[c], include_intercept=False)``.
         2. Build the sparse design via :class:`~kanly.formula.data_getter.SparseDataGetter`.
-        3. For each penalized spline term, fill the block of ``gam_penalty`` with
+        3. For each penalized spline term, fill the corresponding block of the
+           L2 penalty matrix with
            ``(2 * penalty[c]) * bspline_penalty(knots)`` on the corresponding
            coefficient indices.
-        4. Attach ``gam_penalty`` to the model via :meth:`~kanly.regression.generalized_linear_models.model.SparseGeneralizedLinearModel._set_gam_penalty`.
+        4. Attach the matrix via
+           :meth:`~kanly.regression.generalized_linear_models.model.SparseGeneralizedLinearModel._set_L2_penalty_matrix`.
 
         Parameters
         ----------
@@ -178,7 +180,8 @@ class SparseGeneralizedAdditiveModel(SparseGeneralizedLinearModel):
         Returns
         -------
         SparseGeneralizedAdditiveModel
-            Model with ``gam_penalty`` set; call :meth:`fit` to run penalized IRLS.
+            Model with ``L2_penalty_matrix`` set; call :meth:`fit` to run
+            penalized IRLS.
         """
 
         _t = time.time()
@@ -210,11 +213,11 @@ class SparseGeneralizedAdditiveModel(SparseGeneralizedLinearModel):
         null_rows_info_dict = result[NULL_ROWS_INFO_DICT_KEY]
         formula_design_info = result[FORMULA_DESIGN_INFO_KEY]
 
-        # Placeholder; gam_penalty assembled below after we know p = len(exog_names)
-        gam_penalty = None
+        # Placeholder; the roughness matrix is assembled once p is known.
+        L2_penalty_matrix = None
         model = SparseGeneralizedAdditiveModel(
             exog, endog, False, fit_intercept, has_implicit_constant, formula_design_info, True,
-            gam_penalty, weights=None,
+            L2_penalty_matrix, weights=None,
             endog_name=endog_name, exog_names=exog_names, weights_name=None, instruments=None,
             instrument_names=None, valid_obs_rows=valid_obs_rows, index=index,
             null_rows_info_dict=null_rows_info_dict, model_elapsed=time.time() - _t,
@@ -222,7 +225,7 @@ class SparseGeneralizedAdditiveModel(SparseGeneralizedLinearModel):
         )
 
         p = len(model.exog_names)
-        gam_penalty = np.zeros((p,p))
+        L2_penalty_matrix = np.zeros((p,p))
 
         # Block-diagonal roughness penalties on each penalized spline coefficient block
         fdi = model.formula_design_info
@@ -234,9 +237,9 @@ class SparseGeneralizedAdditiveModel(SparseGeneralizedLinearModel):
                     # factor 2 aligns user penalty with quadratic form added to X'WX in IRLS
                     penalty_matrix = (penalty[v_orig] * 2) * bspline_penalty(knots, include_intercept=False)
                     idx = fdi.exog_var_2_col_indices[v]
-                    gam_penalty[np.ix_(idx, idx)] = penalty_matrix
+                    L2_penalty_matrix[np.ix_(idx, idx)] = penalty_matrix
 
-        model._set_gam_penalty(gam_penalty)
+        model._set_L2_penalty_matrix(L2_penalty_matrix, regularize_to_values=None)
 
         model.gam_penalty_arg = penalty
         model.gam_df_arg = df
@@ -295,4 +298,3 @@ class SparseGeneralizedAdditiveModel(SparseGeneralizedLinearModel):
 #     plt.plot(x2, fit_gamsm.fittedvalues, lw=3, ls='--')
 #     plt.yscale('log')
 #     plt.show()
-

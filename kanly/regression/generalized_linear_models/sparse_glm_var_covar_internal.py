@@ -77,12 +77,12 @@ def _get_XpX(exog_sparse, weights, fit_intercept, first_column_constant):
 
 def get_robust_glm_covariance(
         endog, exog, endog_predicted, var_weights, irls_weights, family, link, scale, cov_type,
-        fit_intercept, first_column_constant, alpha, l2s, gam_penalty, normalized_cov_params=None):
+        fit_intercept, first_column_constant, alpha, l2s, L2_penalty_matrix, normalized_cov_params=None):
     """Compute GLM covariance estimates from final fitted means and weights.
 
     Supports the model-based nonrobust covariance and an HC1-style sandwich
-    covariance.  Penalized fits add the L2 diagonal and/or ``gam_penalty`` to
-    the bread matrix before inversion.
+    covariance. Penalized fits add the L2 diagonal and/or
+    ``L2_penalty_matrix`` to the bread matrix before inversion.
 
     Args:
         endog: Observed response vector.
@@ -98,8 +98,10 @@ def get_robust_glm_covariance(
         first_column_constant: Whether the first design column is already a constant.
         alpha: Overall regularization strength.
         l2s: Per-parameter L2 penalties.
-        gam_penalty: Optional GAM roughness matrix (same as in IRLS); added to
-            the bread alongside elastic-net L2 when present.
+        L2_penalty_matrix: Optional general ridge or GAM roughness matrix used
+            by IRLS; added to the covariance bread when present.
+        normalized_cov_params: Optional precomputed normalized covariance
+            matrix. Reserved for API compatibility.
 
     Returns:
         Tuple ``(var_covar, cov_time)`` containing the covariance matrix and
@@ -122,8 +124,10 @@ def get_robust_glm_covariance(
         bread = _get_XpX(exog, bread_diag, fit_intercept, first_column_constant)
         if np.any(alpha) > 0:
             bread += _get_l2_diagonal_for_cov(nobs, l2s, fit_intercept, first_column_constant, var_weights)
-        if gam_penalty is not None:
-            bread += gam_penalty.toarray()
+        if L2_penalty_matrix is not None:
+            bread += (L2_penalty_matrix.toarray()
+                      if isspmatrix(L2_penalty_matrix)
+                      else np.asarray(L2_penalty_matrix))
         bread = get_matrix_inverse_internal(bread)
 
         if np.any(alpha) > 0:
@@ -149,8 +153,10 @@ def get_robust_glm_covariance(
         bread = _get_XpX(exog, bread_diag, fit_intercept, first_column_constant)
         if alpha > 0:
             bread += _get_l2_diagonal_for_cov(nobs, l2s, fit_intercept, first_column_constant, var_weights)
-        if gam_penalty is not None:
-            bread += gam_penalty.toarray()
+        if L2_penalty_matrix is not None:
+            bread += (L2_penalty_matrix.toarray()
+                      if isspmatrix(L2_penalty_matrix)
+                      else np.asarray(L2_penalty_matrix))
         bread = get_matrix_inverse_internal(bread)
 
         meat_weights = ((endog_predicted - endog) * link.deriv(endog_predicted) * final_irls_wts) ** 2
