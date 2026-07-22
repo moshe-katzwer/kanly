@@ -380,6 +380,9 @@ def bfgs_pqn(
         f0 = fun(x0)
 
         if ~np.isfinite(f0) or np.any(~np.isfinite(g0)):
+            if debug:
+                print(f'{f0=}')
+                print(f'{g0=}')
             raise Exception("Starting point `x0` must generate finite function and gradient value!")
 
         #if debug:

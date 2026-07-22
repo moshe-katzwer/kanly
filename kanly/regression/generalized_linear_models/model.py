@@ -182,7 +182,7 @@ class SparseGeneralizedLinearModel(LinearModelBase):
             self.regularize_to_values = self.regularize_to_values.reshape((self.exog.shape[1], 1))
 
     def fit(self, family=DEFAULT_GLM_FAMILY, link=None, start_params=None, tol=DEFAULT_GLM_TOL, max_iter=DEFAULT_GLM_MAX_ITER,
-            alpha=0.0, l1_ratio=0.0, regularize_to_values=None, debug=False, normalize=True, penalize_scale=False, specification_name=None,
+            alpha=0.0, l1_ratio=0.0, L2_penalty_matrix=None, regularize_to_values=None, debug=False, normalize=True, penalize_scale=False, specification_name=None,
             use_t=True, test_level=DEFAULT_GLM_TEST_LEVEL, compute_cov=True, store_convergence_path=False,
             residual_inclusion=DEFAULT_GLM_RESIDUAL_INCLUSION, cov_kwds=None, cov_type=DEFAULT_GLM_COV_TYPE,
             fit_intercept=True, keep_model=True, prompt_user_for_more_iters=DEFAULT_GLM_PROMPT_USER_FOR_MORE_ITERS,
@@ -245,8 +245,11 @@ class SparseGeneralizedLinearModel(LinearModelBase):
         check_cov_kwds(cov_type, cov_kwds)
         _check_penalties(alpha, l1_ratio)
 
+        if L2_penalty_matrix is None:
+            L2_penalty_matrix = self.L2_penalty_matrix
+
         fit_object: GLMRawFitData = glm_internal(
-            self.endog, self.exog, L2_penalty_matrix=self.L2_penalty_matrix, regularize_to_values=self.regularize_to_values, 
+            self.endog, self.exog, L2_penalty_matrix=L2_penalty_matrix, regularize_to_values=self.regularize_to_values, 
             var_weights=self.weights, instruments=self.instruments, start_params=start_params,
             tol=tol, max_iter=max_iter, alpha=alpha, l1_ratio=l1_ratio, fit_intercept=fit_intercept, debug=debug,
             family=family, link=link, normalize=normalize, penalize_scale=penalize_scale,
@@ -632,7 +635,7 @@ class SparseGeneralizedLinearModel(LinearModelBase):
 
     @staticmethod
     def glm(formula, data, start_params=None, tol=DEFAULT_GLM_TOL, max_iter=DEFAULT_GLM_MAX_ITER, alpha=0.0,
-            l1_ratio=0.0,  regularize_to_values=None,
+            l1_ratio=0.0, L2_penalty_matrix=None, regularize_to_values=None,
             debug=False, family=DEFAULT_GLM_FAMILY, link=None, normalize=True, penalize_scale=False,
             use_t=True, test_level=DEFAULT_GLM_TEST_LEVEL, compute_cov=True, store_convergence_path=False,
             residual_inclusion=DEFAULT_GLM_RESIDUAL_INCLUSION, cov_kwds=None, cov_type=DEFAULT_GLM_COV_TYPE,
@@ -750,7 +753,7 @@ class SparseGeneralizedLinearModel(LinearModelBase):
         fit = model.fit(
             family=family, link=link,
             start_params=start_params, tol=tol, max_iter=max_iter,
-            alpha=alpha, l1_ratio=l1_ratio, debug=debug,
+            alpha=alpha, l1_ratio=l1_ratio, L2_penalty_matrix=L2_penalty_matrix, debug=debug,
             regularize_to_values=regularize_to_values,
             normalize=normalize, penalize_scale=penalize_scale, use_t=use_t, test_level=test_level,
             compute_cov=compute_cov,
