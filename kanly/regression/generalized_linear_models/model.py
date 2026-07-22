@@ -176,7 +176,7 @@ class SparseGeneralizedLinearModel(LinearModelBase):
             self.regularize_to_values = np.zeros((self.exog.shape[1],1))
         else:
             if isinstance(regularize_to_values, (float, int, np.integer)):
-                self.regularize_to_values = np.array([regularize_to_values] * self.exog[0].shape[1])
+                self.regularize_to_values = np.array([regularize_to_values] * self.exog.shape[1])
             else:
                 self.regularize_to_values = np.array(regularize_to_values)
             self.regularize_to_values = self.regularize_to_values.reshape((self.exog.shape[1], 1))
