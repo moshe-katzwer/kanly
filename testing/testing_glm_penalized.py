@@ -115,7 +115,8 @@ for a in [0, .05, 1, 10]:
         # Optimize the explicit objective as a solver-independent reference.
         optim_res = bfgs(
             objective_function, [.1]*5, maximize=True, debug=False,
-            maxiter=1000, xtol=1e-6)
+            maxiter=1000, xtol=1e-6
+        )
 
         print()
         print((a, family))
