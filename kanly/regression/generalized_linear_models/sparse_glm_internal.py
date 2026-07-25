@@ -13,7 +13,7 @@ from kanly.regression.generalized_linear_models.constants import (
     DEFAULT_GLM_L1_RATIO, SHRINK_INTERCEPT, DEFAULT_GLM_FAMILY, DEFAULT_GLM_TOL, DEFAULT_GLM_ALPHA,
     DEFAULT_GLM_RESIDUAL_INCLUSION, DEFAULT_GLM_FORCE_IV_PROJECTION, LINE_SEARCH_SHRINK,
     DEFAULT_GLM_RESIDUAL_INCLUSION_ORDER, DEFAULT_GLM_PROMPT_USER_FOR_MORE_ITERS)
-from kanly.regression.generalized_linear_models.families import (Binomial, Poisson, _get_family_and_link, Gaussian,
+from kanly.regression.generalized_linear_models.families import (Binomial, Bernoulli, Poisson, _get_family_and_link, Gaussian,
                                                                  NegativeBinomial)
 from kanly.regression.linear_models.sparse_iv_first_stage2 import iv_first_stage2
 from kanly.utils.linalg_utils import get_matrix_inverse_internal, csc_matrix_by_column_array_broadcast
