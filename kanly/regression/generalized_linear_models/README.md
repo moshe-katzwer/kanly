@@ -4,13 +4,11 @@
 
 This package fits sparse generalized linear models (GLMs) with canonical or
 custom links, variance weights, optional instruments, robust covariance,
-elastic-net-style regularization, **marginal effects** on the fitted mean
+elastic-net style regularization, **marginal effects** on the fitted mean
 (see [Marginal effects](#marginal-effects)), and **generalized additive models (GAM)**
-via `gam` (penalized B-spline smooths—see the
-[GAM section](#generalized-additive-models-gam)).
+via ``gam`` (penalized B-spline smooths — see [GAM section](#generalized-additive-models-gam)).
 
-For a runnable tour that includes Poisson GLM versus GLM-IV with residual
-inclusion, see the repository-root notebook
+For a runnable tour that includes Poisson GLM vs GLM-IV (residual inclusion), see the repository-root notebook
 [`example_quick_start.ipynb`](../../../example_quick_start.ipynb).
 
 ## Mathematical Setup
@@ -32,42 +30,48 @@ Var(y_i | x_i) = phi_i * V(mu_i)
 ```
 
 Here `theta_i` is the canonical parameter, `b(theta)` is the cumulant
-function, `V(mu)` is the variance function, and `phi_i` is the scale/dispersion
-adjusted by variance weights when supplied.
+function, `V(mu)` is the family-specific variance function, and `phi_i` is
+the observation-level GLM scale.
+
+When variance weights `v_i` are supplied:
+
+```text
+phi_i = phi / v_i
+Var(y_i | x_i, v_i) = phi * V(mu_i) / v_i
+```
+
+The fitted global scale `phi` is returned as `fit.scale`. GLM scale,
+family-specific distribution parameters, and elastic-net regularization
+parameters are distinct; they should not all be called "dispersion."
 
 IRLS solves the local weighted least-squares problem implied by the current
-mean and link derivative. For non-canonical links, the working weights are:
+mean and link derivative. For non-canonical links, the effective working
+weights, including the supplied variance weights, are proportional to:
 
 ```text
-w_i = 1 / (g'(mu_i)^2 * V(mu_i))
+W_i = v_i / (g'(mu_i)^2 * V(mu_i))
 ```
 
-For canonical links, this expression simplifies because the link and family
-match. In the simplest case—`normalize=False`, `penalize_scale=False`, a zero
-penalty target, and scalar `alpha` and `l1_ratio`—the code minimizes
+For canonical links this simplifies because the link and family match.  The
+penalized objective used when `alpha > 0` adds an elastic-net term:
 
 ```text
-Q(beta) = -ell(beta) / n
-          + alpha * [l1_ratio * ||beta||_1
-                     + (1 - l1_ratio) / 2 * ||beta||_2^2],
+- mean(log L_i) + alpha * [l1_ratio * ||beta||_1
+                         + (1 - l1_ratio) / 2 * ||beta||_2^2]
 ```
 
-where `ell(beta) = sum_i log L_i(beta)`, with any observation weights absorbed
-into the likelihood contributions. The factor `1/2` belongs in front of the
-quadratic (L2) penalty; it is required by the implementation. See
-[Penalized objectives and pseudo-MLE interpretation](#penalized-objectives-and-pseudo-mle-interpretation)
-for the general objective, including predictor normalization and nonzero
-penalty targets.
+The `alpha` in this objective is the regularization strength, not a
+negative-binomial overdispersion parameter.
 
 ### IRLS and line search
 
-Each outer iteration is a **weighted least-squares (WLS) solve**—the expensive
-part of IRLS. After that update, kanly evaluates the penalized negative
-log-likelihood. If the objective did not improve, it **backs off** along the
+Each outer iteration is a **weighted least-squares (WLS) solve** — the expensive
+part of IRLS.  After that update, kanly evaluates the penalized negative
+log-likelihood.  If the objective did not improve, it **backs off** along the
 segment from the previous iterate toward the new coefficients (halving the step
-by default, up to 10 tries). Each backoff only recomputes the likelihood on
-interpolated `(params, intercept, linear predictor)`—**not** another WLS
-factorization—so the extra cost is usually small compared with a full IRLS step.
+by default, up to 10 tries).  Each backoff only recomputes the likelihood on
+interpolated `(params, intercept, linear predictor)` — **not** another WLS
+factorization — so the extra cost is usually small compared with a full IRLS step.
 
 That fallback line search is on by default (`line_search_fallback=True` on
 `glm` / `GLMModel.fit`) and can materially reduce the number of outer iterations
@@ -104,8 +108,9 @@ include:
 Families can be supplied by name, class, or instance. String names are
 case-insensitive and underscores are optional, so `"negative_binomial"` and
 `"negativebinomial"` both resolve to the same family. Negative binomial also
-supports an overdispersion parameter in the string form, for example
-`"negative_binomial(0.5)"`.
+supports a **fixed, user-specified** overdispersion parameter in the string
+form, for example `"negative_binomial(0.5)"`. This syntax specifies the
+parameter; it does not estimate it.
 
 ### Registered Families
 
@@ -113,19 +118,86 @@ The `Default link` is used when `link=None`. The `Canonical link` is the
 exponential-family canonical link. `Legal links` are the link classes returned by
 each family's `safe_links()` and accepted by the model validation layer.
 
-| Family | Response support / role | Dispersion | Default link | Canonical link | Legal links |
-|--------|--------------------------|------------|--------------|----------------|-------------|
-| `binomial` | Outcomes in `[0, 1]`; binary or fractional proportions | Fixed | `logit` | `logit` | `probit`, `logit`, `cloglog`, `identity`, `cauchy` |
-| `bernoulli` | Alias-style subclass of `binomial` for binary outcomes | Fixed | `logit` | `logit` | `probit`, `logit`, `cloglog`, `identity`, `cauchy` |
-| `poisson` | Non-negative counts | Fixed (`scale = 1`) | `log` | `log` | `log`, `sqrt`, `identity` |
-| `gaussian` | Real-valued continuous outcomes | Estimated | `identity` | `identity` | `log`, `identity` |
-| `gamma` | Strictly positive continuous outcomes | Estimated | `negative_inverse` | `negative_inverse` | `log`, `identity`, `inverse`, `negative_inverse` |
-| `inverse_gaussian` | Strictly positive continuous outcomes | Estimated | `negative_two_inverse_squared` | `negative_two_inverse_squared` | `inverse_squared`, `negative_two_inverse_squared`, `identity`, `log` |
-| `negative_binomial` | Overdispersed non-negative counts; accepts `alpha`, e.g. `"negative_binomial(0.5)"` | Estimated | `log` | `negative_binomial_canonical_link` | `log`, `sqrt`, `identity` |
+| Family | Response support / role | Variance function `V(mu)` | GLM scale `phi` | Additional distribution parameter | Default link | Canonical link | Legal links |
+|--------|--------------------------|---------------------------|-----------------|-----------------------------------|--------------|----------------|-------------|
+| `binomial` | Outcomes in `[0, 1]`; binary or fractional proportions | `mu * (1 - mu)` | Fixed at `1` | None | `logit` | `logit` | `probit`, `logit`, `cloglog`, `identity`, `cauchy` |
+| `bernoulli` | Alias-style subclass of `binomial` for binary outcomes | `mu * (1 - mu)` | Intended to be fixed at `1`; see caveat below | None | `logit` | `logit` | `probit`, `logit`, `cloglog`, `identity`, `cauchy` |
+| `poisson` | Non-negative counts | `mu` | Fixed at `1` | None | `log` | `log` | `log`, `sqrt`, `identity` |
+| `gaussian` | Real-valued continuous outcomes | `1` | Pearson-estimated | None | `identity` | `identity` | `log`, `identity` |
+| `gamma` | Strictly positive continuous outcomes | `mu**2` | Pearson-estimated | Implied shape `1 / phi`; not independently fitted | `negative_inverse` | `negative_inverse` | `log`, `identity`, `inverse`, `negative_inverse` |
+| `inverse_gaussian` | Strictly positive continuous outcomes | `mu**3` | Pearson-estimated | Implied shape `1 / phi`; not independently fitted | `negative_two_inverse_squared` | `negative_two_inverse_squared` | `inverse_squared`, `negative_two_inverse_squared`, `identity`, `log` |
+| `negative_binomial` | Overdispersed non-negative counts | `mu + alpha_nb * mu**2` | Fixed at `1` | Fixed `alpha_nb > 0`; default `1` | `log` | `negative_binomial_canonical_link` | `log`, `sqrt`, `identity` |
+
+For Gaussian, Gamma, and inverse-Gaussian families, the reported scale is the
+weighted Pearson moment estimate:
+
+```text
+phi_hat
+    = sum_i [
+          v_i * (y_i - mu_i)^2 / V(mu_i)
+      ] / df_resid
+```
+
+This is not joint maximum-likelihood estimation of a separate family shape
+parameter.
+
+**Bernoulli caveat:** Bernoulli is a one-trial binomial and is intended to be
+identical to `binomial` for binary outcomes. However, the current scale
+estimator checks specific family names and does not include the `Bernoulli`
+subclass. As a result, `family="bernoulli"` can incorrectly receive a
+Pearson-estimated scale instead of `1`. This is an implementation issue, not
+an intended statistical distinction. Use `family="binomial"` for binary
+outcomes until both aliases use the same fixed-scale path.
+
+For fractional responses, `binomial` supplies a binomial-style mean and
+variance model; a fractional response should not be represented as a literal
+one-trial Bernoulli draw.
 
 The negative-binomial canonical link is implemented for family internals, but it
 is **not** included in `NegativeBinomial.safe_links()`. In normal user-facing
 fits, use the default `log` link or another listed legal link.
+
+### Scale, negative-binomial shape, and regularization
+
+A negative-binomial GLM uses the NB2 variance function:
+
+```text
+V(mu) = mu + alpha_nb * mu**2
+```
+
+Its GLM scale is fixed at `1`. The family-specific `alpha_nb` is supplied by
+the user and is held fixed:
+
+```python
+fit = glm(
+    "y ~ x",
+    df,
+    family="negative_binomial(0.5)",
+    alpha=0.1,
+)
+
+fit.scale         # 1.0: GLM scale.
+fit.family.alpha  # 0.5: fixed NB2 overdispersion.
+fit.alpha         # 0.1: elastic-net penalty strength.
+```
+
+The default `family="negative_binomial"` sets `fit.family.alpha` to `1.0`.
+Kanly does not currently estimate NB2 overdispersion as part of `glm`.
+
+Bayesian bootstrap has another, unrelated `alpha`:
+
+```python
+cov_kwds = {
+    "method": "bayesian",
+    "alpha": 1.0,
+    "n_samples": 500,
+    "seed": 123,
+}
+```
+
+Here `cov_kwds["alpha"]` controls the Dirichlet concentration of the
+bootstrap weights. It is neither NB2 overdispersion nor regularization
+strength.
 
 ### Registered Link Names
 
@@ -143,7 +215,7 @@ fits, use the default `log` link or another listed legal link.
 | `negative_two_inverse_squared` | `-1 / (2 * mu**2)` | Canonical/default for `inverse_gaussian` |
 | `inverse_squared` | `1 / mu**2` | Legal for `inverse_gaussian` |
 | `exponential` | `exp(mu)` | Registered link name; not listed as safe for the registered families above |
-| `negative_binomial_canonical_link` | `log(alpha * mu / (1 + alpha * mu))` | Canonical negative-binomial link; implemented but not user-facing safe by default |
+| `negative_binomial_canonical_link` | `log(alpha_nb * mu / (1 + alpha_nb * mu))` | Canonical negative-binomial link; implemented but not user-facing safe by default |
 
 The `Power` link class exists in `links.py`, but it is not registered in
 `LINK_NAME_2_CLS` and is not listed as safe for any family.
@@ -151,7 +223,7 @@ The `Power` link class exists in `links.py`, but it is not registered in
 Common examples:
 
 ```python
-glm("y ~ x", df, family="binomial")   # binary-response model (logit by default)
+glm("y ~ x", df, family="binomial")   # logistic/probit-style binary models
 glm("y ~ x", df, family="poisson")    # count models
 glm("y ~ x", df, family="gaussian")   # linear Gaussian GLM
 glm("y ~ x", df, family="gamma")      # positive continuous outcomes
@@ -190,6 +262,26 @@ Pass variance weights through formula weights or the array API:
 fit = glm("y ~ x $ w", df, family="poisson")
 ```
 
+These are **variance weights**, not general frequency or row-replication
+weights. They adjust the observation-level scale as:
+
+```text
+phi_i = phi / w_i
+```
+
+A frequency-weighted likelihood instead multiplies the *complete*
+observation-level log-likelihood:
+
+```text
+log L_frequency = sum_i w_i * log p(y_i | mu_i, family_parameters)
+```
+
+The two constructions are not equivalent for every family. In particular,
+the current NB2 variance-weighted likelihood does not multiply every
+dispersion-dependent normalization term by `w_i`. Therefore, do not use
+`fit.llf` as a fully frequency-weighted NB2 likelihood for estimating or
+comparing different values of `fit.family.alpha`.
+
 Supported covariance types include:
 
 ```python
@@ -204,20 +296,35 @@ fit_boot = glm(
 )
 ```
 
-Bootstrap covariance refits the GLM on bootstrap-weighted samples and stores the
-resulting empirical covariance on the returned result object.
+Bootstrap covariance refits the GLM mean-model coefficients on
+bootstrap-weighted samples and stores their empirical covariance on the
+returned result object. The selected family and its user-specified
+distribution parameters are held fixed. In particular, negative-binomial
+bootstrap refits do not estimate, resample, or report uncertainty in
+`fit.family.alpha`.
+
+The current GLM bootstrap calls its resampling implementation with
+`groups=None`. Do not assume that specifying group information in
+`cov_kwds` provides a cluster or block bootstrap unless that implementation
+has first been updated and tested.
+
+Confidence intervals for the conditional mean are distinct from prediction
+intervals for future outcomes. A prediction interval must additionally
+include outcome-level realization uncertainty and, when applicable,
+uncertainty in estimated distribution parameters.
 
 ## Marginal Effects
 
-For nonlinear links, a coefficient `beta_k` is **not** the change in the fitted
-mean `mu = g^{-1}(X beta)` when `x_k` moves by one unit. After a GLM fit, call
-`fit.get_marginal_effects()` on the result object to obtain **response-scale**
-effects, in the spirit of statsmodels
+For nonlinear links, a coefficient ``beta_k`` is **not** the change in the fitted
+mean ``mu = g^{-1}(X beta)`` when ``x_k`` moves by one unit.  After a GLM fit,
+call :meth:`~kanly.regression.generalized_linear_models.regression_results.SparseGLMRegressionResults.get_marginal_effects`
+on the result object to obtain **response-scale** effects, in the spirit of
+statsmodels
 [`GLMResults.get_margeff`](https://www.statsmodels.org/stable/generated/statsmodels.genmod.generalized_linear_model.GLMResults.get_margeff.html).
 
 Implementation lives in
-[`marginal_effects.py`](marginal_effects.py). Standard errors use the
-**delta method**: `cov(me) = J @ cov(beta) @ J'`.
+[`marginal_effects.py`](marginal_effects.py).  Standard errors use the
+**delta method**: ``cov(me) = J @ cov(beta) @ J'``.
 
 ```python
 from kanly.api import glm
@@ -229,30 +336,33 @@ print(me.summary())           # formatted table (default __str__)
 print(me.summary_df())        # pandas DataFrame with dy/dx, SEs, z, p, CI
 ```
 
-The returned [`GLMMarginalEffects`](marginal_effects.py) object exposes
-`margeff`, `margeff_se`, `margeff_cov`, and related fields.
+The returned
+[`GLMMarginalEffects`](marginal_effects.py) object exposes ``margeff``,
+``margeff_se``, ``margeff_cov``, and related fields.
 
 ### Evaluation point (`at`)
 
 | Value | Meaning |
 |-------|---------|
-| `'overall'` (default) | Average of observation-level effects over the sample |
-| `'mean'` | Effect evaluated at the column means |
-| `'median'` | Effect evaluated at the column medians (unavailable with dummy detection) |
-| `'all'` | `(nobs, nparams)` matrix of per-observation effects; no SEs |
+| ``'overall'`` (default) | Average of observation-level effects over the sample |
+| ``'mean'`` | Effect at ``x* =`` column means |
+| ``'median'`` | Effect at ``x* =`` column medians (not with dummy detection) |
+| ``'all'`` | ``(nobs, nparams)`` matrix of per-observation effects; no SEs |
 
 ### Dummy (0/1) regressors
 
-With `dummy=True` (default), columns whose entries are all `0` or `1` are
+With ``dummy=True`` (default), columns whose entries are all ``0`` or ``1`` are
 treated as **discrete** indicators: the reported effect is the average change
-`E[g(eta | x_k=1) - g(eta | x_k=0)]` on the mean scale (secant), not the
-tangent `g'(eta) * beta_k`. Set `dummy=False` to force the continuous
+``E[g(eta | x_k=1) - g(eta | x_k=0)]`` on the mean scale (secant), not the
+tangent ``g'(eta) * beta_k``.  Set ``dummy=False`` to force the continuous
 formula for every column.
 
-The internal `_get_marginal_effects` helper also supports semi-elasticities and
-elasticities (`effect_type` in `{'dydx', 'eydx', 'eyex', 'dyex'}`) and
-`dummy_method` in `{'secant', 'tangent'}`. The public `get_marginal_effects`
-entry point currently returns `dydx` effects with secant dummies.
+The internal helper
+:func:`~kanly.regression.generalized_linear_models.marginal_effects._get_marginal_effects`
+also supports semi-elasticities and elasticities (``effect_type`` in
+``{'dydx', 'eydx', 'eyex', 'dyex'}``) and ``dummy_method`` in
+``{'secant', 'tangent'}``; the public ``get_marginal_effects`` entry point
+currently returns ``dydx`` effects with secant dummies.
 
 > **Note:** Marginal-effect inference assumes the coefficient covariance from
 > the GLM fit is appropriate (unpenalized fits with a computed ``cov_params``).
@@ -260,8 +370,7 @@ entry point currently returns `dydx` effects with secant dummies.
 
 ## Regularization
 
-Set `alpha > 0` to fit an elastic-net penalized pseudo-MLE. The default solver
-is coordinate descent:
+Set `alpha > 0` to use coordinate descent with elastic-net penalties:
 
 ```python
 fit = glm(
@@ -276,128 +385,13 @@ fit = glm(
 
 Parameters:
 
-- `alpha`: overall penalty strength.
+- `alpha`: overall penalty strength, returned as `fit.alpha`; not the
+  negative-binomial family parameter `fit.family.alpha`.
 - `l1_ratio`: L1 share of the elastic-net penalty.
-- `regularize_to_values`: scalar or coefficient-wise penalty target; the
-  default target is zero.
-- `normalize`: whether to adjust penalty weights for predictor scale.
-- `penalize_scale`: whether coordinate-descent penalties are multiplied by the
-  estimated dispersion. The IRLS matrix-penalty path does not rescale its
-  supplied matrix.
+- `normalize`: whether to scale penalties by predictor standard deviation.
+- `penalize_scale`: whether penalties are multiplied by estimated scale.
 
 Penalized estimates are biased; inference is intentionally limited in summaries.
-
-### Penalized objectives and pseudo-MLE interpretation
-
-Let `ell(beta)` denote the (possibly variance-weighted) sample log-likelihood,
-`r_j` the target in `regularize_to_values`, `alpha_j` the penalty strength, and
-`rho_j` the `l1_ratio` for coefficient `j`. Define
-
-```text
-d_j = beta_j - r_j
-s_j = weighted standard deviation of X_j,  if normalize=True
-      1,                                   if normalize=False.
-```
-
-Coordinate descent minimizes the following average-loss form:
-
-```text
-Q_EN(beta) = -ell(beta) / n
-             + c_phi * sum_j alpha_j * [rho_j * s_j * |d_j|
-                 + (1 - rho_j) * s_j^2 * d_j^2 / 2],
-```
-
-where `c_phi = 1` by default. With `penalize_scale=True`, coordinate descent
-uses the current dispersion estimate for `c_phi`. The code evaluates the
-equivalent total objective, `n * Q_EN(beta)`, so its reported likelihood and
-penalty are on the summed rather than averaged scale. When the first design
-column is identified as an explicit intercept, its L1 and L2 weights are set to
-zero.
-
-This estimator is described as a **penalized pseudo-maximum-likelihood
-estimator (pseudo-MLE)** because it maximizes the log-likelihood minus a penalty,
-not the response model's log-likelihood alone. The penalty is an estimation
-device that changes the score equations and generally biases the coefficient
-estimates; consequently, ordinary maximum-likelihood inference does not carry
-over unchanged. A ridge penalty can be associated with a Gaussian prior and a
-lasso penalty with a Laplace prior, making the optimizer resemble a posterior
-mode, but kanly does not perform Bayesian posterior inference here.
-
-For the general matrix form, let `P = L2_penalty_matrix` and
-`r = regularize_to_values`. IRLS minimizes the total objective
-
-```text
-Q_P(beta) = -ell(beta) + 1/2 * (beta - r)' P (beta - r).
-```
-
-The `1/2` is important: the derivative of the quadratic penalty is then
-`P(beta - r)`, which yields the implemented penalized normal equations
-
-```text
-(X' W X + P) beta = X' W z + P r.
-```
-
-Equivalently, on the average-loss scale the matrix penalty is
-`(beta - r)' P (beta - r) / (2n)`. For pure ridge specified through `alpha`,
-IRLS constructs the diagonal matrix needed to match `Q_EN`; with
-`normalize=False` and scalar `alpha`, each penalized diagonal entry is
-`n * alpha` (and an excluded intercept has a zero entry).
-
-### Ridge pseudo-MLE: coordinate descent or IRLS
-
-When `l1_ratio=0`, the penalty is purely quadratic, so the same ridge
-pseudo-MLE can be computed by either coordinate descent or IRLS. With
-`normalize=False` and the default `penalize_scale=False`, these two calls use
-the same diagonal ridge penalty:
-
-```python
-from kanly.api import GLM
-
-common = dict(
-    family="binomial",
-    alpha=0.1,
-    l1_ratio=0,
-    normalize=False,
-    fit_intercept=True,
-    first_column_constant=True,  # X[:, 0] is the unpenalized intercept
-)
-
-fit_cd = GLM(y, X, opt_method="COORDINATE_DESCENT", **common)
-fit_irls = GLM(y, X, opt_method="IRLS", **common)
-```
-
-Coordinate descent is also required when `l1_ratio > 0`, because the L1 term
-is not differentiable. IRLS is useful for ridge because each iteration solves
-one penalized weighted least-squares system.
-
-The matrix-form `GLM` interface also accepts a general symmetric L2 matrix.
-This supports correlated or selective shrinkage, as well as the spline
-roughness matrices used by GAMs:
-
-```python
-import numpy as np
-
-n, p = X.shape
-P = n * 0.1 * np.diag([0.0, 1.0, 1.0])
-target = np.array([0.0, 0.5, 0.0])
-
-fit_matrix = GLM(
-    y,
-    X,
-    family="binomial",
-    L2_penalty_matrix=P,
-    regularize_to_values=target,
-    opt_method="IRLS",
-    alpha=0,
-    fit_intercept=True,
-    first_column_constant=True,
-)
-```
-
-`L2_penalty_matrix` is inserted directly into the normal equations and is not
-automatically multiplied by the sample size. Set `alpha=0` when supplying it;
-otherwise, a pure-ridge `alpha` fit constructs a diagonal penalty matrix and
-replaces the explicit matrix. `regularize_to_values=None` uses a zero target.
 
 ## Instrumental Variables and Residual Inclusion
 
@@ -496,7 +490,7 @@ print(compare_results(
 ))
 ```
 
-See [`examples/regression/generalized_linear_models/example_poisson_regression_instrumental_variables.py`](../../../examples/regression/generalized_linear_models/example_poisson_regression_instrumental_variables.py)
+See [`examples/regression/generalized_linear_models/example_poisson_regression_instrumental_variables.py`](../../../../examples/regression/generalized_linear_models/example_poisson_regression_instrumental_variables.py)
 for a complete worked example with captured output showing the bias of each
 specification.
 
@@ -521,11 +515,10 @@ print(fit.summary())  # fit.is_gam is True; Df Model uses effective d.f. (edf)
 ```
 
 For each key in ``penalty`` / ``df``, the corresponding formula column is
-expanded to a cubic B-spline basis before fit. Its roughness matrix (integrated
-squared second derivative on each spline block) is stored as the model's
-**``L2_penalty_matrix``** and added to ``X'WX`` at every IRLS iteration — the
-same general matrix-penalty mechanism documented above and in
-``sparse_glm_internal``.
+expanded to a cubic B-spline basis before fit. The internal **``gam_penalty``**
+matrix (integrated squared second derivative on each spline block) is added to
+``X'WX`` at every IRLS iteration — the same mechanism documented in
+``sparse_glm_internal`` — rather than using coordinate descent.
 
 - ``penalty[var]=0``: unpenalized GLM on the full spline expansion (flexible, can overfit).
 - Larger ``penalty[var]``: smoother fitted curves; summary reports **edf** (effective degrees of freedom) per coefficient.
@@ -534,7 +527,7 @@ Linear terms and GLM options (family, link, ``cov_type``, IV syntax where suppor
 behave as in ``glm``. Do not combine GAM with ``alpha > 0`` elastic-net in the
 current implementation.
 
-See [`examples/regression/generalized_linear_models/example_gam_regression.py`](../../../examples/regression/generalized_linear_models/example_gam_regression.py)
+See [`examples/regression/generalized_linear_models/example_gam_regression.py`](../../../../examples/regression/generalized_linear_models/example_gam_regression.py)
 for Poisson GAM fits at several penalty strengths with a plot of fitted curves.
 
 ## Large-Scale Models
@@ -553,6 +546,23 @@ fit = glm(
 
 Use `debug=True` to print parsing and optimization progress, and consider
 categorical terms through `C(...)` to keep design construction sparse.
+
+## Current Distributional Limitations
+
+- `bernoulli` and `binomial` should be equivalent for binary outcomes, but
+  the current scale estimator does not recognize the `Bernoulli` subclass.
+  Use `family="binomial"` until the implementation is corrected.
+- Negative-binomial overdispersion is user-specified and fixed. It is not
+  estimated, profiled, or re-estimated by the GLM bootstrap.
+- Zero counts are valid for Poisson and negative-binomial models. However,
+  the current negative-binomial deviance computes `y * log(y / mu)` directly,
+  which can return `nan` when `y = 0`. A zero-safe implementation should use
+  `scipy.special.xlogy` or explicitly handle zero counts.
+- Generalized Poisson is not a registered family.
+- The current GLM bootstrap does not perform group- or cluster-level
+  resampling.
+- Confidence intervals for fitted means do not automatically provide
+  prediction intervals for future outcome realizations.
 
 ## External References
 
