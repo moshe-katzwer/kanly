@@ -1259,7 +1259,7 @@ def _estimate_scale(endog, endog_predicted, var_weights, family, df_resid, use_c
     float
         Estimated scale parameter.
     """
-    if family.name in [Poisson.name, Binomial.name, NegativeBinomial.name]:
+    if family.name in [Poisson.name, Binomial.name, NegativeBinomial.name, Bernoulli.name]:
         return 1.0
     scale = _estimate_x2_scale(
         endog, endog_predicted, family.variance, var_weights, df_resid, use_correction=use_correction)
