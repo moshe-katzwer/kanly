@@ -1,8 +1,0 @@
-venv/
-projects/
-__projects/
-kanly.egg-info/
-**/__pycache__*/
-.vscode/
-__pycache__/
-**/__pycache__/
