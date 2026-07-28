@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 from scipy.special import gammaln
+from kanly.api import bfgs_pqn
 
 
 class CountModel(ABC):
@@ -42,6 +43,9 @@ class CountModel(ABC):
             g[i] = (fi - f0) / h
         return g
 
+    def fit(self, start_params):
+        return bfgs_pqn(nb2.loglike, [1., 1, 1], maximize=True)
+
 
 class NegativeBinomial2(CountModel):
 
@@ -70,8 +74,4 @@ if __name__ == '__main__':
     X = np.vstack([np.ones(n), np.log(x)]).T
 
     nb2 = NegativeBinomial2(y, X)
-
-    from kanly.api import bfgs
-
-    fit = bfgs(nb2.loglike, [1., 1, 1], maximize=True)
-    print(fit)
+    print(nb2.fit())
