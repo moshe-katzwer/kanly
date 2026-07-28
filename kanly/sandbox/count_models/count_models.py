@@ -34,32 +34,87 @@ class CountModel(ABC):
     def loglike(self, params, *args, **kwargs):
         return self._weighted_sum(self.loglike_obs(params, *args, **kwargs))
 
-    def score_obs(self, params, dx=1e-6, *args, **kwargs):
+    def score_obs(self, params, dx=None, *args, **kwargs):
+        if dx is None:
+            dx = np.cbrt(np.finfo(float).eps)
+
         f0 = self.loglike_obs(params, *args, **kwargs)
         k = len(params)
         n = len(f0)
         g = np.zeros((n, k))
         for i in range(k):
+            step = dx * max(1.0, abs(params[i]))
             paramsi = params.copy()
-            paramsi[i] += dx
+            paramsi[i] += step
             fi = self.loglike_obs(paramsi, *args, **kwargs)
-            g[:, i] = (fi - f0) / dx
+            g[:, i] = (fi - f0) / step
         return g
 
-    def score(self, params, dx=1e-6, *args, **kwargs):
+    def score(self, params, dx=None, *args, **kwargs):
+        if dx is None:
+            dx = np.cbrt(np.finfo(float).eps)
+
         f0 = self.loglike(params, *args, **kwargs)
         k = len(params)
         g = np.zeros(k)
         for i in range(k):
+            step = dx * max(1.0, abs(params[i]))
             paramsi = params.copy()
-            paramsi[i] += dx
+            paramsi[i] += step
             fi = self.loglike(paramsi, *args, **kwargs)
-            g[i] = (fi - f0) / dx
+            g[i] = (fi - f0) / step
         return g
 
+    def hessian(self, params, dx=None, *args, **kwargs):
+        params = np.asarray(params, dtype=float)
+        if dx is None:
+            dx = np.cbrt(np.finfo(float).eps)
+
+        k = len(params)
+        hess = np.empty((k, k))
+        for i in range(k):
+            step = dx * max(1.0, abs(params[i]))
+            params_lo = params.copy()
+            params_hi = params.copy()
+            params_lo[i] -= step
+            params_hi[i] += step
+            hess[:, i] = (
+                    self.score(params_hi, *args, **kwargs)
+                    - self.score(params_lo, *args, **kwargs)
+            ) / (2.0 * step)
+
+        return (hess + hess.T) / 2.0
+
     def fit(self, start_params, debug=False):
-        return bfgs_pqn(self.loglike, start_params, maximize=True, debug=debug,
-                        gradient_callable=self.score)
+        result = bfgs_pqn(
+            self.loglike, start_params, maximize=True, debug=debug,
+            gradient_callable=self.score,
+        )
+
+        score_obs = self.score_obs(result.x)
+        if self.is_weighted:
+            score_obs = score_obs * np.asarray(self.weights)[:, None]
+        meat = score_obs.T @ score_obs
+
+        hess = self.hessian(result.x)
+        information = -hess
+        try:
+            bread = np.linalg.inv(information)
+        except np.linalg.LinAlgError:
+            bread = np.linalg.pinv(information)
+
+        cov_params = bread @ meat @ bread.T
+        cov_params = (cov_params + cov_params.T) / 2.0
+
+        result.params = result.x.copy()
+        result.information = information
+        result.bread = bread
+        result.meat = meat
+        result.cov_params = cov_params
+        result.bse = np.sqrt(np.clip(np.diag(cov_params), 0.0, np.inf))
+        result.standard_errors = result.bse
+        result.cov_type = 'SANDWICH'
+        return result
 
 
 class Poisson(CountModel):
