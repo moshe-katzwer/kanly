@@ -43,8 +43,8 @@ class CountModel(ABC):
             g[i] = (fi - f0) / h
         return g
 
-    def fit(self, start_params):
-        return bfgs_pqn(nb2.loglike, [1., 1, 1], maximize=True)
+    def fit(self, start_params, debug=False):
+        return bfgs_pqn(self.loglike, start_params, maximize=True, debug=debug)
 
 
 class NegativeBinomial2(CountModel):
@@ -74,4 +74,4 @@ if __name__ == '__main__':
     X = np.vstack([np.ones(n), np.log(x)]).T
 
     nb2 = NegativeBinomial2(y, X)
-    print(nb2.fit())
+    print(nb2.fit([.1]*3))
