@@ -85,16 +85,17 @@ class CountModel(ABC):
 
         return (hess + hess.T) / 2.0
 
-    def fit(self, start_params, debug=False):
+    def fit(self, start_params, debug=False, cov_type='SANDWICH'):
+        cov_type = str(cov_type).upper()
+        if cov_type not in {'SANDWICH', 'NONROBUST'}:
+            raise ValueError(
+                "cov_type must be either 'SANDWICH' or 'NONROBUST'"
+            )
+
         result = bfgs_pqn(
             self.loglike, start_params, maximize=True, debug=debug,
             gradient_callable=self.score,
         )
-
-        score_obs = self.score_obs(result.x)
-        if self.is_weighted:
-            score_obs = score_obs * np.asarray(self.weights)[:, None]
-        meat = score_obs.T @ score_obs
 
         hess = self.hessian(result.x)
         information = -hess
@@ -102,9 +103,18 @@ class CountModel(ABC):
             bread = np.linalg.inv(information)
         except np.linalg.LinAlgError:
             bread = np.linalg.pinv(information)
+        bread = (bread + bread.T) / 2.0
 
-        cov_params = bread @ meat @ bread.T
-        cov_params = (cov_params + cov_params.T) / 2.0
+        if cov_type == 'SANDWICH':
+            score_obs = self.score_obs(result.x)
+            if self.is_weighted:
+                score_obs = score_obs * np.asarray(self.weights)[:, None]
+            meat = score_obs.T @ score_obs
+            cov_params = bread @ meat @ bread.T
+            cov_params = (cov_params + cov_params.T) / 2.0
+        else:
+            meat = None
+            cov_params = bread.copy()
 
         result.params = result.x.copy()
         result.information = information
@@ -113,7 +123,7 @@ class CountModel(ABC):
         result.cov_params = cov_params
         result.bse = np.sqrt(np.clip(np.diag(cov_params), 0.0, np.inf))
         result.standard_errors = result.bse
-        result.cov_type = 'SANDWICH'
+        result.cov_type = cov_type
         return result
 
 
@@ -238,12 +248,14 @@ if __name__ == '__main__':
     np.random.seed(0)
     n = 40
     from kanly.api import GLM
+    import pandas as pd
     x = np.exp(np.random.randn(n))
     y = (np.exp(.2) * x ** .8) * np.exp(.3 * np.random.randn(n))
     X = np.vstack([np.ones(n), np.log(x)]).T
     w = np.exp(np.random.randn(n))
 
     poisson = Poisson(y, X, weights=w)
-    print(poisson.fit([.1] * X.shape[1]))
+    fit = poisson.fit([.1] * X.shape[1], cov_type='nonrobust')
+    print(pd.DataFrame({'coef': fit.params, 'bse': fit.bse}))
 
-    print(GLM(y, X, var_weights=w, family='poisson'))
+    print(GLM(y, X, var_weights=w, family='poisson', cov_type='nonrobust'))
