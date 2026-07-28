@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 from scipy.special import digamma, expit, gammaln
+from scipy.stats import norm
 from kanly.api import bfgs_pqn
 from kanly.formula.data_getter import SparseDataGetter
 from kanly.formula.keys import (
@@ -35,6 +36,7 @@ class CountModel(ABC):
         self.null_rows_info_dict = {}
         self.index = None
         self.model_elapsed = 0.0
+        self.param_names = self.get_param_names()
 
     @classmethod
     def build_model_from_formula(
@@ -110,6 +112,16 @@ class CountModel(ABC):
         if self.is_weighted:
             return np.dot(self.weights, values)
         return values.sum()
+
+    def _get_regression_param_names(self):
+        if self.exog_names is None:
+            return [f'x{i}' for i in range(self.exog.shape[1])]
+        return [str(name) for name in self.exog_names]
+
+    @abstractmethod
+    def get_param_names(self):
+        """Return names for every parameter in estimation order."""
+        raise NotImplementedError()
 
     @abstractmethod
     def loglike_obs(self, params, *args, **kwargs):
@@ -202,7 +214,9 @@ class CountModel(ABC):
             meat = None
             cov_params = bread.copy()
 
+        result.model = self
         result.params = result.x.copy()
+        result.param_names = self.get_param_names()
         result.information = information
         result.bread = bread
         result.meat = meat
@@ -210,10 +224,24 @@ class CountModel(ABC):
         result.bse = np.sqrt(np.clip(np.diag(cov_params), 0.0, np.inf))
         result.standard_errors = result.bse
         result.cov_type = cov_type
+
+        result.summary_df = pd.DataFrame(
+            {
+                'coef': result.params,
+                'std err': result.bse,
+                'z': result.params / result.bse,
+                'p>|z|': 2*norm.sf(np.abs(result.params) / result.bse),
+            }, 
+            index=self.param_names
+        )
+
         return result
 
 
 class Poisson(CountModel):
+
+    def get_param_names(self):
+        return self._get_regression_param_names()
 
     def _loglike_obs(self, params):
         eta = self.exog @ params
@@ -236,6 +264,9 @@ class Poisson(CountModel):
 
 
 class NegativeBinomial1(CountModel):
+
+    def get_param_names(self):
+        return self._get_regression_param_names() + ['log_alpha']
 
     def _loglike_obs(self, params):
         log_alpha = params[-1]
@@ -285,6 +316,9 @@ class NegativeBinomial1(CountModel):
 
 
 class NegativeBinomial2(CountModel):
+
+    def get_param_names(self):
+        return self._get_regression_param_names() + ['log_alpha']
 
     def _loglike_obs(self, params):
         log_alpha = params[-1]
@@ -342,6 +376,6 @@ if __name__ == '__main__':
 
     poisson = Poisson.build_model_from_formula('y ~ np.log(x) $ w', dict(x=x,y=y,w=w))
     fit = poisson.fit([.1] * X.shape[1], cov_type='nonrobust')
-    print(pd.DataFrame({'coef': fit.params, 'bse': fit.bse}))
+    print(fit.summary_df)
 
     print(GLM(y, X, var_weights=w, family='poisson', cov_type='nonrobust'))
