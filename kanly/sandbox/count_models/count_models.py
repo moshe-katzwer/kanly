@@ -2,6 +2,7 @@ from __future__ import absolute_import, print_function
 
 from abc import ABC, abstractmethod
 import numpy as np
+import pandas as pd
 
 from scipy.special import digamma, expit, gammaln
 from scipy.stats import norm
@@ -43,7 +44,7 @@ class CountModel(ABC):
             cls, formula, data, index=None, debug=False,
             check_constant_cols=False, fail_on_missing=False,
             cache_intermediate=True, sum_to_n=False,
-            test_formula_on_dummy=True, drop_1_for_FE=True):
+            test_formula_on_dummy=True, drop_1_for_FE=True, **model_kwargs):
         """Build an unfitted count model from Kanly formula syntax.
 
         The ``$`` formula extension supplies optional likelihood weights.
@@ -84,7 +85,7 @@ class CountModel(ABC):
                 weights = weights.toarray()
             weights = np.asarray(weights).reshape(-1)
 
-        model = cls(endog, exog, weights=weights)
+        model = cls(endog, exog, weights=weights, **model_kwargs)
         model.formula_design_info = result[FORMULA_DESIGN_INFO_KEY]
         model.formula = model.formula_design_info.formula
         model.from_formula = True
@@ -101,6 +102,9 @@ class CountModel(ABC):
         model.null_rows_info_dict = result[NULL_ROWS_INFO_DICT_KEY]
         model.index = result[INDEX_KEY]
         model.model_elapsed = result[TIME_ELAPSED_KEY]
+
+        model.param_names = model.get_param_names()
+
         return model
 
     def _apply_weights(self, values):
@@ -263,6 +267,84 @@ class Poisson(CountModel):
         return self._loglike_obs(params)
 
 
+class GeneralizedPoisson(CountModel):
+    """Generalized-Poisson regression with raw dispersion ``alpha``.
+
+    ``p=1`` gives GP-1 with variance ``mu * (1 + alpha) ** 2``;
+    ``p=2`` gives GP-2 with variance ``mu * (1 + alpha * mu) ** 2``.
+    Positive alpha permits overdispersion, valid negative alpha permits
+    underdispersion, and ``alpha=0`` recovers Poisson.
+    """
+
+    def __init__(self, endog, exog, weights=None, p=1):
+        super().__init__(endog, exog, weights=weights)
+        if not np.isscalar(p) or not np.isfinite(p) or p <= 0:
+            raise ValueError("p must be a finite positive scalar")
+        self.p = p
+        self.parameterization = p - 1.0
+
+    def get_param_names(self):
+        return self._get_regression_param_names() + ['alpha']
+
+    def _distribution_terms(self, params):
+        eta = self.exog @ params[:-1]
+        mu = np.exp(eta)
+        mu_p = np.exp(self.parameterization * eta)
+        alpha = params[-1]
+        a1 = 1.0 + alpha * mu_p
+        a2 = mu + alpha * mu_p * self.endog
+        return eta, mu, mu_p, alpha, a1, a2
+
+    def _loglike_obs(self, params):
+        eta, _, _, _, a1, a2 = self._distribution_terms(params)
+        valid = (a1 > 0.0) & (a2 > 0.0)
+        safe_a1 = np.where(valid, a1, 1.0)
+        safe_a2 = np.where(valid, a2, 1.0)
+        llf_obs = (
+                eta
+                + (self.endog - 1.0) * np.log(safe_a2)
+                - self.endog * np.log(safe_a1)
+                - gammaln(self.endog + 1.0)
+                - safe_a2 / safe_a1
+        )
+        return np.where(valid, llf_obs, -np.inf)
+
+    def _score_factors(self, params):
+        _, mu, mu_p, alpha, a1, a2 = self._distribution_terms(params)
+        valid = (a1 > 0.0) & (a2 > 0.0)
+        a1 = np.where(valid, a1, np.nan)
+        a2 = np.where(valid, a2, np.nan)
+        a3 = alpha * self.parameterization * mu_p / mu
+        a4 = a3 * self.endog
+
+        d_eta = 1.0 + mu * (
+                -a4 / a1
+                + a3 * a2 / a1 ** 2
+                + (1.0 + a4) * ((self.endog - 1.0) / a2 - 1.0 / a1)
+        )
+        d_alpha = mu_p * (
+                self.endog * ((self.endog - 1.0) / a2 - 2.0 / a1)
+                + a2 / a1 ** 2
+        )
+        return d_eta, d_alpha
+
+    def loglike(self, params, *args, **kwargs):
+        return self._weighted_sum(self._loglike_obs(params))
+
+    def score(self, params, *args, **kwargs):
+        d_eta, d_alpha = self._score_factors(params)
+        self._apply_weights(d_eta)
+        self._apply_weights(d_alpha)
+        return np.append(self.exog.T @ d_eta, d_alpha.sum())
+
+    def score_obs(self, params, *args, **kwargs):
+        d_eta, d_alpha = self._score_factors(params)
+        return np.column_stack((self.exog * d_eta[:, None], d_alpha))
+
+    def loglike_obs(self, params, *args, **kwargs):
+        return self._loglike_obs(params)
+
+
 class NegativeBinomial1(CountModel):
 
     def get_param_names(self):
@@ -366,7 +448,7 @@ class NegativeBinomial2(CountModel):
 
 if __name__ == '__main__':
     np.random.seed(0)
-    n = 405
+    n = 40500
     from kanly.api import GLM
     import pandas as pd
     x = np.exp(np.random.randn(n))
@@ -376,6 +458,10 @@ if __name__ == '__main__':
 
     poisson = Poisson.build_model_from_formula('y ~ np.log(x) $ w', dict(x=x,y=y,w=w))
     fit = poisson.fit([.1] * X.shape[1], cov_type='nonrobust')
+    print(fit.summary_df)
+
+    poisson = GeneralizedPoisson.build_model_from_formula('y ~ np.log(x) $ w', dict(x=x,y=y,w=w))
+    fit = poisson.fit([.1] * 3, cov_type='nonrobust')
     print(fit.summary_df)
 
     print(GLM(y, X, var_weights=w, family='poisson', cov_type='nonrobust'))
