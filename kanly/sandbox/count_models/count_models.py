@@ -5,6 +5,12 @@ import numpy as np
 
 from scipy.special import digamma, expit, gammaln
 from kanly.api import bfgs_pqn
+from kanly.formula.data_getter import SparseDataGetter
+from kanly.formula.keys import (
+    ENDOG_KEY, EXOG_KEY, FORMULA_DESIGN_INFO_KEY, HAS_IMPLICIT_CONSTANT_KEY,
+    HAS_INTERCEPT_KEY, INDEX_KEY, NULL_ROWS_INFO_DICT_KEY, TIME_ELAPSED_KEY,
+    VALID_OBS_ROWS_KEY, WEIGHTS_KEY,
+)
 
 
 class CountModel(ABC):
@@ -14,6 +20,86 @@ class CountModel(ABC):
         self.weights = weights
         self.is_weighted = self.weights is not None
         self.nobs = len(self.endog)
+
+        self.formula_design_info = None
+        self.formula = None
+        self.from_formula = False
+        self.endog_name = None
+        self.exog_names = None
+        self.weights_name = None
+        self.exog_term_names = None
+        self.exog_term_to_indices = None
+        self.has_intercept = False
+        self.has_implicit_constant = False
+        self.valid_obs_rows = np.arange(self.nobs)
+        self.null_rows_info_dict = {}
+        self.index = None
+        self.model_elapsed = 0.0
+
+    @classmethod
+    def build_model_from_formula(
+            cls, formula, data, index=None, debug=False,
+            check_constant_cols=False, fail_on_missing=False,
+            cache_intermediate=True, sum_to_n=False,
+            test_formula_on_dummy=True, drop_1_for_FE=True):
+        """Build an unfitted count model from Kanly formula syntax.
+
+        The ``$`` formula extension supplies optional likelihood weights.
+        Instrumental-variable and absorbed-effect formulas are not supported.
+        Missing rows are aligned and removed by ``SparseDataGetter``.
+        """
+        result = SparseDataGetter.get_data(
+            data=data, formula=formula, index=index, debug=debug,
+            check_constant_cols=check_constant_cols,
+            fail_on_missing=fail_on_missing,
+            cache_intermediate=cache_intermediate, sum_to_n=sum_to_n,
+            test_formula_on_dummy=test_formula_on_dummy,
+            drop_1_for_FE=drop_1_for_FE, fail_on_iv=True,
+            fail_on_absorb=True,
+        )
+
+        endog_obj = result[ENDOG_KEY]
+        exog_obj = result[EXOG_KEY]
+        weights_obj = result[WEIGHTS_KEY]
+
+        endog = endog_obj.values
+        exog = exog_obj.values
+        if hasattr(endog, 'toarray'):
+            endog = endog.toarray()
+        if hasattr(exog, 'toarray'):
+            exog = exog.toarray()
+        endog = np.asarray(endog)
+        exog = np.asarray(exog)
+        if endog.ndim != 2 or endog.shape[1] != 1:
+            raise ValueError("Count models require exactly one outcome column")
+        endog = endog.reshape(-1)
+
+        if weights_obj is None:
+            weights = None
+        else:
+            weights = weights_obj.values
+            if hasattr(weights, 'toarray'):
+                weights = weights.toarray()
+            weights = np.asarray(weights).reshape(-1)
+
+        model = cls(endog, exog, weights=weights)
+        model.formula_design_info = result[FORMULA_DESIGN_INFO_KEY]
+        model.formula = model.formula_design_info.formula
+        model.from_formula = True
+        model.endog_name = endog_obj.column_names[0]
+        model.exog_names = list(exog_obj.column_names)
+        model.weights_name = (
+            None if weights_obj is None else weights_obj.column_names[0]
+        )
+        model.exog_term_names = exog_obj.term_names
+        model.exog_term_to_indices = exog_obj.var_2_col_indices
+        model.has_intercept = result[HAS_INTERCEPT_KEY]
+        model.has_implicit_constant = result[HAS_IMPLICIT_CONSTANT_KEY]
+        model.valid_obs_rows = result[VALID_OBS_ROWS_KEY]
+        model.null_rows_info_dict = result[NULL_ROWS_INFO_DICT_KEY]
+        model.index = result[INDEX_KEY]
+        model.model_elapsed = result[TIME_ELAPSED_KEY]
+        return model
 
     def _apply_weights(self, values):
         if self.is_weighted:
@@ -246,7 +332,7 @@ class NegativeBinomial2(CountModel):
 
 if __name__ == '__main__':
     np.random.seed(0)
-    n = 40
+    n = 405
     from kanly.api import GLM
     import pandas as pd
     x = np.exp(np.random.randn(n))
@@ -254,7 +340,7 @@ if __name__ == '__main__':
     X = np.vstack([np.ones(n), np.log(x)]).T
     w = np.exp(np.random.randn(n))
 
-    poisson = Poisson(y, X, weights=w)
+    poisson = Poisson.build_model_from_formula('y ~ np.log(x) $ w', dict(x=x,y=y,w=w))
     fit = poisson.fit([.1] * X.shape[1], cov_type='nonrobust')
     print(pd.DataFrame({'coef': fit.params, 'bse': fit.bse}))
 
