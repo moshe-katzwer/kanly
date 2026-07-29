@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from scipy.special import expit
 
-from kanly.sandbox.count_models.count_models import ZeroInflatedPoisson
+from kanly.count_models.count_models import ZeroInflatedPoisson
 
 
 def main():

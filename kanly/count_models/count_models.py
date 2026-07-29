@@ -535,67 +535,6 @@ class _ZeroInflatedModel(CountModel):
         self.k_inflate = exog_infl.shape[1]
         super().__init__(endog, exog, weights=weights)
 
-    def _get_inflation_param_names(self):
-        """Return prefixed parameter names for the inflation equation."""
-        if self.exog_infl_names is not None:
-            return [f'inflate_{name}' for name in self.exog_infl_names]
-        if (self.k_inflate == 1
-                and np.allclose(self.exog_infl[:, 0], 1.0)):
-            return ['inflate_const']
-        return [f'inflate_x{i}' for i in range(self.k_inflate)]
-
-    def _mixture_terms(self, inflation_params, count_loglike,
-                       count_loglike_zero):
-        """Combine a count distribution with a structural-zero process.
-
-        Args:
-            inflation_params: Coefficients of the structural-zero logit.
-            count_loglike: Count-component log likelihood at observed outcomes.
-            count_loglike_zero: Count-component log probability at zero.
-
-        Returns:
-            Tuple containing mixture log-likelihood contributions, posterior
-            count-component probabilities, and derivatives with respect to
-            each inflation linear predictor.
-        """
-        inflation_eta = self.exog_infl @ inflation_params
-        log_inflation_prob = -np.logaddexp(0.0, -inflation_eta)
-        log_count_prob = -np.logaddexp(0.0, inflation_eta)
-        zero_loglike = np.logaddexp(
-            log_inflation_prob, log_count_prob + count_loglike_zero
-        )
-        is_zero = self.endog == 0.0
-        loglike_obs = np.where(
-            is_zero, zero_loglike, log_count_prob + count_loglike
-        )
-
-        with np.errstate(over='ignore', invalid='ignore', under='ignore'):
-            posterior_count_zero = np.exp(
-                log_count_prob + count_loglike_zero - zero_loglike
-            )
-            inflation_prob = np.exp(log_inflation_prob)
-        posterior_count = np.where(is_zero, posterior_count_zero, 1.0)
-        posterior_structural_zero = np.where(
-            is_zero, 1.0 - posterior_count_zero, 0.0
-        )
-        d_inflation_eta = posterior_structural_zero - inflation_prob
-
-        valid = np.isfinite(inflation_eta)
-        return (
-            np.where(valid, loglike_obs, -np.inf),
-            np.where(valid, posterior_count, np.nan),
-            np.where(valid, d_inflation_eta, np.nan),
-        )
-
-
-class ZeroInflatedPoisson(_ZeroInflatedModel):
-    """Zero-inflated Poisson regression with separate mean and zero logits.
-
-    The count mean is ``mu = exp(exog @ beta)`` and the structural-zero
-    probability is ``expit(exog_infl @ gamma)``.  Parameter order is ``beta``
-    followed by ``gamma``.  ``exog_infl`` defaults to an intercept-only model.
-    """
-
     @classmethod
     def build_model_from_formula(
             cls, formula, data, index=None, exog_infl=None, debug=False,
@@ -622,7 +561,7 @@ class ZeroInflatedPoisson(_ZeroInflatedModel):
             **model_kwargs: Additional constructor arguments.
 
         Returns:
-            An unfitted :class:`ZeroInflatedPoisson` with aligned count,
+            An unfitted zero-inflated model of type ``cls`` with aligned count,
             inflation, response, and weight arrays.
         """
         if exog_infl is not None and not isinstance(exog_infl, str):
@@ -717,6 +656,67 @@ class ZeroInflatedPoisson(_ZeroInflatedModel):
 
         model.param_names = model.get_param_names()
         return model
+
+    def _get_inflation_param_names(self):
+        """Return prefixed parameter names for the inflation equation."""
+        if self.exog_infl_names is not None:
+            return [f'inflate_{name}' for name in self.exog_infl_names]
+        if (self.k_inflate == 1
+                and np.allclose(self.exog_infl[:, 0], 1.0)):
+            return ['inflate_const']
+        return [f'inflate_x{i}' for i in range(self.k_inflate)]
+
+    def _mixture_terms(self, inflation_params, count_loglike,
+                       count_loglike_zero):
+        """Combine a count distribution with a structural-zero process.
+
+        Args:
+            inflation_params: Coefficients of the structural-zero logit.
+            count_loglike: Count-component log likelihood at observed outcomes.
+            count_loglike_zero: Count-component log probability at zero.
+
+        Returns:
+            Tuple containing mixture log-likelihood contributions, posterior
+            count-component probabilities, and derivatives with respect to
+            each inflation linear predictor.
+        """
+        inflation_eta = self.exog_infl @ inflation_params
+        log_inflation_prob = -np.logaddexp(0.0, -inflation_eta)
+        log_count_prob = -np.logaddexp(0.0, inflation_eta)
+        zero_loglike = np.logaddexp(
+            log_inflation_prob, log_count_prob + count_loglike_zero
+        )
+        is_zero = self.endog == 0.0
+        loglike_obs = np.where(
+            is_zero, zero_loglike, log_count_prob + count_loglike
+        )
+
+        with np.errstate(over='ignore', invalid='ignore', under='ignore'):
+            posterior_count_zero = np.exp(
+                log_count_prob + count_loglike_zero - zero_loglike
+            )
+            inflation_prob = np.exp(log_inflation_prob)
+        posterior_count = np.where(is_zero, posterior_count_zero, 1.0)
+        posterior_structural_zero = np.where(
+            is_zero, 1.0 - posterior_count_zero, 0.0
+        )
+        d_inflation_eta = posterior_structural_zero - inflation_prob
+
+        valid = np.isfinite(inflation_eta)
+        return (
+            np.where(valid, loglike_obs, -np.inf),
+            np.where(valid, posterior_count, np.nan),
+            np.where(valid, d_inflation_eta, np.nan),
+        )
+
+
+class ZeroInflatedPoisson(_ZeroInflatedModel):
+    """Zero-inflated Poisson regression with separate mean and zero logits.
+
+    The count mean is ``mu = exp(exog @ beta)`` and the structural-zero
+    probability is ``expit(exog_infl @ gamma)``.  Parameter order is ``beta``
+    followed by ``gamma``.  ``exog_infl`` defaults to an intercept-only model.
+    """
 
     def get_param_names(self):
         """Return count coefficient names followed by inflation names."""
