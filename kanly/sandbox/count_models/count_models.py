@@ -21,11 +21,13 @@ from kanly.bootstrap.bootstrap import (
     get_bayesian_bootstrap_weights, get_bootstrap_weights2,
 )
 from kanly.formula.data_getter import SparseDataGetter
+from kanly.formula.exceptions import MissingDataException
 from kanly.formula.keys import (
     ENDOG_KEY, EXOG_KEY, FORMULA_DESIGN_INFO_KEY, HAS_IMPLICIT_CONSTANT_KEY,
     HAS_INTERCEPT_KEY, INDEX_KEY, NULL_ROWS_INFO_DICT_KEY, TIME_ELAPSED_KEY,
     VALID_OBS_ROWS_KEY, WEIGHTS_KEY,
 )
+from kanly.utils.util import dict_2_dataframe
 
 
 class CountModel(ABC):
@@ -593,6 +595,128 @@ class ZeroInflatedPoisson(_ZeroInflatedModel):
     probability is ``expit(exog_infl @ gamma)``.  Parameter order is ``beta``
     followed by ``gamma``.  ``exog_infl`` defaults to an intercept-only model.
     """
+
+    @classmethod
+    def build_model_from_formula(
+            cls, formula, data, index=None, exog_infl=None, debug=False,
+            check_constant_cols=False, fail_on_missing=False,
+            cache_intermediate=True, sum_to_n=False,
+            test_formula_on_dummy=True, drop_1_for_FE=True, **model_kwargs):
+        """Build count and inflation equations from Patsy-style formulas.
+
+        Args:
+            formula: Full count-model formula, including the outcome and
+                optional ``$`` likelihood-weight expression.
+            data: DataFrame or dict-like object containing formula variables.
+            index: Optional boolean or integer row selector.
+            exog_infl: Patsy-style right-hand-side formula for the
+                structural-zero logit, such as ``'z1 + C(group)'``.  ``None``
+                creates a single constant column.
+            debug: Whether to print formula-construction diagnostics.
+            check_constant_cols: Whether to remove redundant constant columns.
+            fail_on_missing: Raise instead of dropping rows with missing data.
+            cache_intermediate: Formula-term cache configuration.
+            sum_to_n: Normalize likelihood weights to sum to retained rows.
+            test_formula_on_dummy: Validate the count formula on dummy data.
+            drop_1_for_FE: Apply the formula engine's drop-one categorical rule.
+            **model_kwargs: Additional constructor arguments.
+
+        Returns:
+            An unfitted :class:`ZeroInflatedPoisson` with aligned count,
+            inflation, response, and weight arrays.
+        """
+        if exog_infl is not None and not isinstance(exog_infl, str):
+            raise TypeError(
+                "exog_infl must be a Patsy-style string or None when using "
+                "build_model_from_formula"
+            )
+
+        # Formula-derived names replace any matrix-API names.  Removing the
+        # keyword before the initial intercept-only construction also avoids a
+        # temporary name-count mismatch.
+        if exog_infl is not None:
+            model_kwargs.pop('exog_infl_names', None)
+
+        model = super().build_model_from_formula(
+            formula=formula,
+            data=data,
+            index=index,
+            debug=debug,
+            check_constant_cols=check_constant_cols,
+            fail_on_missing=fail_on_missing,
+            cache_intermediate=cache_intermediate,
+            # Normalize only after inflation-specific missing rows are removed;
+            # the final retained sample size is the appropriate target.
+            sum_to_n=False,
+            test_formula_on_dummy=test_formula_on_dummy,
+            drop_1_for_FE=drop_1_for_FE,
+            **model_kwargs,
+        )
+        model.exog_infl_formula = exog_infl
+        model.exog_infl_term_names = ['Intercept']
+        model.exog_infl_term_to_indices = {'Intercept': np.array([0])}
+
+        if exog_infl is None:
+            return model
+
+        data_frame = dict_2_dataframe(data)
+        inflation_obj = SparseDataGetter.sparse_dmatrix(
+            exog_infl,
+            data_frame,
+            debug=debug,
+            check_constant_cols=check_constant_cols,
+            cache_intermediate=cache_intermediate,
+            drop_1_for_FE=drop_1_for_FE,
+            name='EXOG_INFL',
+            index=index,
+        )
+        inflation_null_rows = inflation_obj.null_rows.copy()
+        if fail_on_missing and inflation_null_rows:
+            missing_rows = sorted(int(row) for row in inflation_null_rows)
+            raise MissingDataException(
+                "Inflation exog has missing data in rows "
+                f"{missing_rows}!"
+            )
+
+        main_valid_rows = np.asarray(model.valid_obs_rows, dtype=int)
+        keep_main_rows = ~np.isin(main_valid_rows, list(inflation_null_rows))
+        final_valid_rows = main_valid_rows[keep_main_rows]
+        if len(final_valid_rows) == 0:
+            raise ValueError(
+                "No valid observations remain after aligning exog_infl"
+            )
+
+        # The count formula has already removed its own invalid rows.  Apply
+        # only the additional inflation exclusions to those aligned arrays.
+        model.endog = np.asarray(model.endog)[keep_main_rows]
+        model.exog = np.asarray(model.exog)[keep_main_rows]
+        if model.weights is not None:
+            model.weights = np.asarray(model.weights)[keep_main_rows]
+
+        # Inflation values still refer to the original selected-row space, so
+        # slice them using the union-aligned row positions.  The helper also
+        # removes sparse columns that become empty after row alignment.
+        inflation_obj.slice_null_rows(final_valid_rows)
+        exog_infl_values = inflation_obj.values
+        if hasattr(exog_infl_values, 'toarray'):
+            exog_infl_values = exog_infl_values.toarray()
+        model.exog_infl = np.asarray(exog_infl_values, dtype=float)
+        if model.exog_infl.ndim == 1:
+            model.exog_infl = model.exog_infl[:, None]
+
+        model.exog_infl_names = list(inflation_obj.column_names)
+        model.exog_infl_term_names = list(inflation_obj.term_names)
+        model.exog_infl_term_to_indices = inflation_obj.var_2_col_indices
+        model.k_inflate = model.exog_infl.shape[1]
+        model.nobs = len(model.endog)
+        model.valid_obs_rows = final_valid_rows
+        model.null_rows_info_dict['EXOG_INFL'] = inflation_null_rows
+
+        if sum_to_n and model.weights is not None:
+            model.weights *= model.nobs / model.weights.sum()
+
+        model.param_names = model.get_param_names()
+        return model
 
     def get_param_names(self):
         """Return count coefficient names followed by inflation names."""
@@ -1192,7 +1316,7 @@ class NegativeBinomial2(CountModel):
 
 if __name__ == '__main__':
     np.random.seed(0)
-    n = 40500
+    n = 405
     from kanly.api import GLM
     import pandas as pd
     x = np.exp(np.random.randn(n))
@@ -1202,7 +1326,7 @@ if __name__ == '__main__':
     w = np.exp(np.random.randn(n))
 
     poisson = Poisson.build_model_from_formula('y ~ np.log(x) $ w', dict(x=x,y=y,w=w))
-    fit = poisson.fit([.1] * X.shape[1], cov_type='bootstrap')
+    fit = poisson.fit([.1] * X.shape[1], cov_type='sandwich')
     print(fit.summary_df)
 
     poisson = GeneralizedPoisson.build_model_from_formula('y ~ np.log(x) $ w', dict(x=x,y=y,w=w))
