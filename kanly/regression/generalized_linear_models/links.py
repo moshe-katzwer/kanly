@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
+from scipy.special import lambertw
 from scipy.stats import norm, cauchy
 
 LOGIT = 'LOGIT'
@@ -31,6 +32,92 @@ SQRT = 'SQRT'
 CAUCHY = 'CAUCHY'
 POWER = 'POWER'
 NEGATIVE_BINOMIAL_CANONICAL_LINK = 'NEGATIVE_BINOMIAL_CANONICAL_LINK'
+ZERO_TRUNCATED_POISSON_LINK = 'ZERO_TRUNCATED_POISSON_LINK'
+
+
+def _ztp_mean_from_rate(rate):
+    """Return the zero-truncated Poisson mean for an underlying rate.
+
+    The direct expression ``rate / (1 - exp(-rate))`` loses precision near
+    zero.  Its Bernoulli-number expansion is used for small rates, including
+    rates that underflow to exactly zero after exponentiating a very negative
+    linear predictor.
+    """
+    rate = np.asarray(rate, dtype=float)
+    small = rate < 1e-5
+    safe_rate = np.where(small, 1.0, rate)
+    mean = safe_rate / (-np.expm1(-safe_rate))
+    rate2 = rate * rate
+    mean_small = (
+        1.0 + rate / 2.0 + rate2 / 12.0
+        - rate2 * rate2 / 720.0
+        + rate2 * rate2 * rate2 / 30240.0
+    )
+    return np.where(small, mean_small, mean)
+
+
+def _ztp_variance_from_rate(rate):
+    """Return the zero-truncated Poisson variance for an underlying rate."""
+    rate = np.asarray(rate, dtype=float)
+    small = rate < 1e-5
+    mean = _ztp_mean_from_rate(rate)
+    variance = mean * (1.0 + rate - mean)
+    rate2 = rate * rate
+    variance_small = (
+        rate / 2.0 + rate2 / 6.0
+        - rate2 * rate2 / 180.0
+        + rate2 * rate2 * rate2 / 5040.0
+    )
+    return np.where(small, variance_small, variance)
+
+
+def _ztp_deriv2_mean_from_rate(rate):
+    """Return the second derivative of the truncated mean with respect to eta."""
+    rate = np.asarray(rate, dtype=float)
+    small = rate < 1e-5
+    q = -np.expm1(-rate)
+    exp_neg_rate = np.exp(-rate)
+    a = q - rate * exp_neg_rate
+    safe_q = np.where(small, 1.0, q)
+    deriv2 = rate * (
+        a / safe_q ** 2
+        + rate ** 2 * exp_neg_rate / safe_q ** 2
+        - 2.0 * rate * a * exp_neg_rate / safe_q ** 3
+    )
+    rate2 = rate * rate
+    deriv2_small = (
+        rate / 2.0 + rate2 / 3.0
+        - rate2 * rate2 / 45.0
+        + rate2 * rate2 * rate2 / 840.0
+    )
+    return np.where(small, deriv2_small, deriv2)
+
+
+def _ztp_rate_from_mean(mu):
+    """Recover the underlying Poisson rate from a truncated mean.
+
+    For ``mu > 1``, the positive solution is
+    ``lambda = mu + W_0(-mu * exp(-mu))``.  A local series avoids cancellation
+    at the branch point when the truncated mean is close to one.  The boundary
+    value ``mu == 1`` maps to the limiting rate zero for numerical stability.
+    """
+    mu = np.asarray(mu, dtype=float)
+    delta = mu - 1.0
+    valid = np.isfinite(mu) & (mu >= 1.0)
+    small = valid & (delta < 1e-4)
+
+    safe_mu = np.where(valid & ~small, mu, 2.0)
+    rate = safe_mu + np.real(
+        lambertw(-safe_mu * np.exp(-safe_mu), k=0)
+    )
+    rate_small = (
+        2.0 * delta
+        - (2.0 / 3.0) * delta ** 2
+        + (4.0 / 9.0) * delta ** 3
+        - (44.0 / 135.0) * delta ** 4
+    )
+    rate = np.where(small, rate_small, rate)
+    return np.where(valid, rate, np.nan)
 
 
 class Link(ABC):
@@ -167,6 +254,63 @@ class Log(Link):
     def name(cls):
         """Return the canonical uppercase name for this link or family."""
         return LOG
+
+
+class ZeroTruncatedPoissonLink(Link):
+    """Canonical link for the zero-truncated Poisson conditional mean.
+
+    The linear predictor is the log of the underlying, untruncated Poisson
+    rate ``lambda``.  The response-scale mean is conditional on positivity,
+    ``mu = lambda / (1 - exp(-lambda))``, and therefore lies in ``(1, inf)``.
+    """
+
+    def link(self, mu):
+        """Map a truncated mean to the log underlying Poisson rate."""
+        return np.log(_ztp_rate_from_mean(mu))
+
+    def inverse_link(self, eta):
+        """Map a log rate to the zero-truncated conditional mean."""
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            rate = np.exp(eta)
+        return _ztp_mean_from_rate(rate)
+
+    def deriv_inverse_link(self, eta):
+        """Return ``d mu / d eta``, equal to the truncated variance."""
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            rate = np.exp(eta)
+        return _ztp_variance_from_rate(rate)
+
+    def deriv2_inverse_link(self, eta):
+        """Return the second derivative of the conditional mean."""
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            rate = np.exp(eta)
+        return _ztp_deriv2_mean_from_rate(rate)
+
+    def deriv(self, mu):
+        """Return the derivative of the canonical link with respect to mu."""
+        rate = _ztp_rate_from_mean(mu)
+        return 1.0 / _ztp_variance_from_rate(rate)
+
+    def deriv2(self, mu):
+        """Return the second derivative of the canonical link."""
+        rate = _ztp_rate_from_mean(mu)
+        variance = _ztp_variance_from_rate(rate)
+        return -_ztp_deriv2_mean_from_rate(rate) / variance ** 3
+
+    @classmethod
+    def function_str(cls):
+        """Return a short mathematical description of the link function."""
+        return "g(mu) = log(lambda(mu)), mu = lambda/(1-exp(-lambda))"
+
+    @classmethod
+    def mean_function_str(cls):
+        """Return a description of the inverse-link conditional mean."""
+        return "E[y|y>0,x;b] = exp(x'b)/(1-exp(-exp(x'b)))"
+
+    @classmethod
+    def name(cls):
+        """Return the registered uppercase link name."""
+        return ZERO_TRUNCATED_POISSON_LINK
 
 
 class Identity(Link):
@@ -776,7 +920,8 @@ class Sqrt(Link):
 
 LINK_NAME_2_CLS = {
     l.name(): l for l in [Logit, Probit, Identity, Log, Exponential, NegativeInverse, NegativeTwoInverseSquared,
-                          Inverse, InverseSquared, CLogLog, Sqrt, Cauchy, NegativeBinomialCanonicalLink]
+                          Inverse, InverseSquared, CLogLog, Sqrt, Cauchy, NegativeBinomialCanonicalLink,
+                          ZeroTruncatedPoissonLink]
 }
 
 LINK_NO_UNDERSCORE_TO_UNDERSCORE = {f.replace('_', ''): f for f in LINK_NAME_2_CLS.keys()}

@@ -2,9 +2,10 @@
 
 **See also:** [kanly README](../../../README.md) · [regression overview](../README.md) · [formula](../../formula/README.md)
 
-This package fits sparse generalized linear models (GLMs) with canonical or
-custom links, variance weights, optional instruments, robust covariance,
-elastic-net style regularization, **marginal effects** on the fitted mean
+This package fits sparse generalized linear models (GLMs), including ordinary
+and zero-truncated count models, with canonical or custom links, variance
+weights, optional instruments, robust covariance, elastic-net style
+regularization, **marginal effects** on the fitted mean
 (see [Marginal effects](#marginal-effects)), and **generalized additive models (GAM)**
 via ``gam`` (penalized B-spline smooths — see [GAM section](#generalized-additive-models-gam)).
 
@@ -40,9 +41,13 @@ phi_i = phi / v_i
 Var(y_i | x_i, v_i) = phi * V(mu_i) / v_i
 ```
 
-The fitted global scale `phi` is returned as `fit.scale`. GLM scale,
-family-specific distribution parameters, and elastic-net regularization
-parameters are distinct; they should not all be called "dispersion."
+The global scale value used by the fit is returned as `fit.scale`, but it is
+not always estimated. For families declaring a fixed GLM scale it is exactly
+`1`. For Gaussian, Gamma, and inverse-Gaussian families it is a Pearson moment
+estimate.
+GLM scale, family-specific distribution parameters, and elastic-net
+regularization parameters are distinct quantities; see
+[Scale and dispersion terminology](#scale-and-dispersion-terminology).
 
 IRLS solves the local weighted least-squares problem implied by the current
 mean and link derivative. For non-canonical links, the effective working
@@ -103,6 +108,61 @@ include:
 - `C(group)` for categorical/fixed-effect expansions.
 - `y ~ x | z` for instrumental-variable style formulas.
 
+## Zero-Truncated Poisson
+
+Use `zero_truncated_poisson` when the response is a count observed conditional
+on being positive, as in the positive-count component of a hurdle model:
+
+```python
+from kanly.api import glm
+
+fit = glm(
+    "positive_count ~ x + z",
+    data=df,
+    family="zero_truncated_poisson",
+)
+```
+
+The regression models the underlying, untruncated Poisson rate rather than the
+conditional mean directly:
+
+```text
+eta_i = x_i' beta = log(lambda_i)
+mu_i = E[Y_i | Y_i > 0, x_i]
+     = lambda_i / (1 - exp(-lambda_i))
+```
+
+Consequently, `exp(x_i' beta)` is `lambda_i`, while fitted values are the
+zero-truncated conditional means `mu_i > 1`. An observed count may still equal
+one. The conditional probability mass function is:
+
+```text
+P(Y_i = y | Y_i > 0, x_i)
+    = exp(-lambda_i) * lambda_i**y
+      / (y! * (1 - exp(-lambda_i))),  y = 1, 2, ...
+```
+
+Important behavior:
+
+- Outcomes must be finite positive integers. Zero, negative, fractional, and
+  non-finite values raise `ValueError` before fitting.
+- The family has fixed GLM scale: `fit.scale == 1.0`. It has no estimated
+  dispersion parameter.
+- `lambda_i` varies with the regressors and is the modeled Poisson rate; it is
+  not a scale or dispersion parameter.
+- Fitting ordinary Poisson after deleting zero observations is not equivalent,
+  because ordinary Poisson omits the truncation normalizer.
+- The only registered safe/default link is
+  `zero_truncated_poisson_link`, its canonical log-rate link.
+
+A complete simulation and parameter-recovery example is available in
+[`example_zero_truncated_poisson.py`](../../../examples/regression/generalized_linear_models/example_zero_truncated_poisson.py).
+
+No separate zero-truncated Gamma family is needed. Gamma already has support
+on `(0, inf)` and assigns probability zero to an exact zero; the shared support
+validation rejects zero-valued Gamma outcomes. A continuous hurdle model should
+fit ordinary `gamma` to its positive observations, typically with `link="log"`.
+
 ## Families and Links
 
 Families can be supplied by name, class, or instance. String names are
@@ -121,11 +181,12 @@ each family's `safe_links()` and accepted by the model validation layer.
 | Family | Response support / role | Variance function `V(mu)` | GLM scale `phi` | Additional distribution parameter | Default link | Canonical link | Legal links |
 |--------|--------------------------|---------------------------|-----------------|-----------------------------------|--------------|----------------|-------------|
 | `binomial` | Outcomes in `[0, 1]`; binary or fractional proportions | `mu * (1 - mu)` | Fixed at `1` | None | `logit` | `logit` | `probit`, `logit`, `cloglog`, `identity`, `cauchy` |
-| `bernoulli` | Alias-style subclass of `binomial` for binary outcomes | `mu * (1 - mu)` | Intended to be fixed at `1`; see caveat below | None | `logit` | `logit` | `probit`, `logit`, `cloglog`, `identity`, `cauchy` |
+| `bernoulli` | Alias-style subclass of `binomial` for binary outcomes | `mu * (1 - mu)` | Fixed at `1` | None | `logit` | `logit` | `probit`, `logit`, `cloglog`, `identity`, `cauchy` |
 | `poisson` | Non-negative counts | `mu` | Fixed at `1` | None | `log` | `log` | `log`, `sqrt`, `identity` |
+| `zero_truncated_poisson` | Positive integer counts `{1, 2, ...}` | `mu * (1 + lambda - mu)`, where `mu=lambda/(1-exp(-lambda))` | Fixed at `1` | None; modeled rate `lambda_i=exp(x_i' beta)` is not dispersion | `zero_truncated_poisson_link` | `zero_truncated_poisson_link` | `zero_truncated_poisson_link` |
 | `gaussian` | Real-valued continuous outcomes | `1` | Pearson-estimated | None | `identity` | `identity` | `log`, `identity` |
-| `gamma` | Strictly positive continuous outcomes | `mu**2` | Pearson-estimated | Implied shape `1 / phi`; not independently fitted | `negative_inverse` | `negative_inverse` | `log`, `identity`, `inverse`, `negative_inverse` |
-| `inverse_gaussian` | Strictly positive continuous outcomes | `mu**3` | Pearson-estimated | Implied shape `1 / phi`; not independently fitted | `negative_two_inverse_squared` | `negative_two_inverse_squared` | `inverse_squared`, `negative_two_inverse_squared`, `identity`, `log` |
+| `gamma` | Strictly positive continuous outcomes | `mu**2` | Pearson-estimated | Shape implied by effective scale: `1 / phi_i`; not independently fitted | `negative_inverse` | `negative_inverse` | `log`, `identity`, `inverse`, `negative_inverse` |
+| `inverse_gaussian` | Strictly positive continuous outcomes | `mu**3` | Pearson-estimated | Shape implied by effective scale: `1 / phi_i`; not independently fitted | `negative_two_inverse_squared` | `negative_two_inverse_squared` | `inverse_squared`, `negative_two_inverse_squared`, `identity`, `log` |
 | `negative_binomial` | Overdispersed non-negative counts | `mu + alpha_nb * mu**2` | Fixed at `1` | Fixed `alpha_nb > 0`; default `1` | `log` | `negative_binomial_canonical_link` | `log`, `sqrt`, `identity` |
 
 For Gaussian, Gamma, and inverse-Gaussian families, the reported scale is the
@@ -138,16 +199,17 @@ phi_hat
       ] / df_resid
 ```
 
-This is not joint maximum-likelihood estimation of a separate family shape
-parameter.
+This is not, in general, joint maximum-likelihood estimation of a separate
+scale or shape parameter. For Gamma and inverse Gaussian, the implied
+observation-level shape is `1 / phi_i`. It is `1 / fit.scale` without variance
+weights and `v_i / fit.scale` when observation `i` has variance weight `v_i`.
+These shapes are implied by the Pearson scale estimate and weights rather than
+independently optimized parameters.
 
-**Bernoulli caveat:** Bernoulli is a one-trial binomial and is intended to be
-identical to `binomial` for binary outcomes. However, the current scale
-estimator checks specific family names and does not include the `Bernoulli`
-subclass. As a result, `family="bernoulli"` can incorrectly receive a
-Pearson-estimated scale instead of `1`. This is an implementation issue, not
-an intended statistical distinction. Use `family="binomial"` for binary
-outcomes until both aliases use the same fixed-scale path.
+Fixed versus estimated scale is selected through each family's
+`is_fixed_dispersion()` method. This keeps aliases such as `bernoulli` and new
+fixed-dispersion families consistent without maintaining a separate list in
+the optimizer.
 
 For fractional responses, `binomial` supplies a binomial-style mean and
 variance model; a fractional response should not be represented as a literal
@@ -157,7 +219,29 @@ The negative-binomial canonical link is implemented for family internals, but it
 is **not** included in `NegativeBinomial.safe_links()`. In normal user-facing
 fits, use the default `log` link or another listed legal link.
 
-### Scale, negative-binomial shape, and regularization
+### Scale and dispersion terminology
+
+Kanly uses `fit.scale` for the GLM scale `phi`:
+
+- `binomial`, `bernoulli`, `poisson`, `zero_truncated_poisson`, and
+  `negative_binomial` declare a fixed GLM scale, so `fit.scale` is exactly `1`.
+- `gaussian`, `gamma`, and `inverse_gaussian` declare a non-fixed GLM scale, so
+  `fit.scale` is estimated by the weighted Pearson formula shown above.
+- `family.is_fixed_dispersion()` controls this behavior in the optimizer; it
+  is not maintained through a separate hard-coded family list.
+
+Several unrelated API values are sometimes also called "dispersion" or
+`alpha`, but they must not be conflated:
+
+- `fit.scale` is the GLM scale `phi`.
+- `fit.family.alpha` is the fixed NB2 overdispersion parameter when using
+  `negative_binomial`.
+- `fit.alpha` is the elastic-net regularization strength.
+- `cov_kwds["alpha"]` is the Bayesian-bootstrap Dirichlet concentration.
+- Zero-Truncated Poisson has no free dispersion parameter; its observation-
+  specific `lambda_i` is determined by the regression coefficients.
+
+#### Fixed negative-binomial overdispersion
 
 A negative-binomial GLM uses the NB2 variance function:
 
@@ -183,6 +267,9 @@ fit.alpha         # 0.1: elastic-net penalty strength.
 
 The default `family="negative_binomial"` sets `fit.family.alpha` to `1.0`.
 Kanly does not currently estimate NB2 overdispersion as part of `glm`.
+"Fixed GLM scale" refers specifically to `fit.scale == 1`; independently,
+this implementation also requires `alpha_nb` to be supplied and held fixed.
+Neither statement means NB2 is equidispersed like Poisson.
 
 Bayesian bootstrap has another, unrelated `alpha`:
 
@@ -209,6 +296,7 @@ strength.
 | `cauchy` | Cauchy inverse-CDF link | Alternative binary-response link |
 | `identity` | `mu` | Canonical/default for `gaussian`; legal for several families |
 | `log` | `log(mu)` | Canonical/default for `poisson`; default for `negative_binomial`; legal for positive-mean families |
+| `zero_truncated_poisson_link` | `log(lambda(mu))`, where `mu=lambda/(1-exp(-lambda))` | Canonical/default for `zero_truncated_poisson` |
 | `sqrt` | `sqrt(mu)` | Legal for `poisson` and `negative_binomial` |
 | `negative_inverse` | `-1 / mu` | Canonical/default for `gamma` |
 | `inverse` | `1 / mu` | Legal for `gamma` |
@@ -225,6 +313,7 @@ Common examples:
 ```python
 glm("y ~ x", df, family="binomial")   # logistic/probit-style binary models
 glm("y ~ x", df, family="poisson")    # count models
+glm("y ~ x", df, family="zero_truncated_poisson")  # positive counts only
 glm("y ~ x", df, family="gaussian")   # linear Gaussian GLM
 glm("y ~ x", df, family="gamma")      # positive continuous outcomes
 ```
@@ -389,7 +478,8 @@ Parameters:
   negative-binomial family parameter `fit.family.alpha`.
 - `l1_ratio`: L1 share of the elastic-net penalty.
 - `normalize`: whether to scale penalties by predictor standard deviation.
-- `penalize_scale`: whether penalties are multiplied by estimated scale.
+- `penalize_scale`: whether penalties are multiplied by the current GLM scale;
+  this has no numerical effect when the family fixes `fit.scale` at `1`.
 
 Penalized estimates are biased; inference is intentionally limited in summaries.
 
@@ -549,9 +639,6 @@ categorical terms through `C(...)` to keep design construction sparse.
 
 ## Current Distributional Limitations
 
-- `bernoulli` and `binomial` should be equivalent for binary outcomes, but
-  the current scale estimator does not recognize the `Bernoulli` subclass.
-  Use `family="binomial"` until the implementation is corrected.
 - Negative-binomial overdispersion is user-specified and fixed. It is not
   estimated, profiled, or re-estimated by the GLM bootstrap.
 - Zero counts are valid for Poisson and negative-binomial models. However,
@@ -596,5 +683,7 @@ See also `examples/regression/generalized_linear_models/`:
 - `example_logistic_regression_large_scale.py`: large sparse design with categorical terms.
 - `example_logistic_regression_instrumental_variables.py`: binary GLM with instruments and residual inclusion.
 - `example_poisson_regression.py`: Poisson regression with log link.
+- `example_zero_truncated_poisson.py`: positive-count simulation and
+  Zero-Truncated Poisson parameter recovery.
 - `example_poisson_regression_instrumental_variables.py`: Poisson IV GLM with bootstrap covariance and result comparison.
 - `example_gam_regression.py`: Poisson GAM with B-spline smooths and penalty tuning.

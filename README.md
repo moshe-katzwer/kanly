@@ -941,11 +941,11 @@ pred = fit.predict(df)
 
 #### Families (string names)
 
-- `binomial` / `bernoulli`, `poisson`, `gaussian`, `gamma`, `inverse_gaussian`, `negative_binomial` (optional dispersion in string, e.g. `"negative_binomial(0.5)"`).
+- `binomial` / `bernoulli`, `poisson`, `zero_truncated_poisson`, `gaussian`, `gamma`, `inverse_gaussian`, `negative_binomial` (optional dispersion in string, e.g. `"negative_binomial(0.5)"`).
 
 #### Links (examples)
 
-`logit`, `probit`, `identity`, `log`, `cloglog`, `sqrt`, `negative_inverse`, `inverse_squared`, etc. Each family restricts allowed links via `safe_links()`.
+`logit`, `probit`, `identity`, `log`, `zero_truncated_poisson_link`, `cloglog`, `sqrt`, `negative_inverse`, `inverse_squared`, etc. Each family restricts allowed links via `safe_links()`.
 
 #### Weights and covariance
 

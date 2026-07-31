@@ -134,9 +134,12 @@ from kanly.count_models.count_models import ZeroInflatedNegativeBinomial
 model = ZeroInflatedNegativeBinomial(
     endog=y,
     exog=X,
+    endog_name="claims",
+    exog_names=["constant", "exposure"],
     exog_infl=Z,
     exog_infl_names=["constant", "prior_zero"],
     weights=w,
+    weights_name="frequency_weight",
 )
 
 fit = model.fit(
@@ -148,6 +151,12 @@ fit = model.fit(
 For the array API, `exog_infl` is a numeric matrix. If omitted, the model
 creates a column of ones. In formula construction, by contrast, `exog_infl`
 must be a formula string or `None`.
+
+Names are constructor inputs rather than attributes that need to be patched
+after construction. Every model builds `param_names` immediately from
+`exog_names` plus its distribution-specific parameters. Zero-inflated models
+also append the prefixed `exog_infl_names`. When regression names are omitted,
+the fallback names are `x0`, `x1`, and so on.
 
 ## Parameter Order and Starting Values
 
@@ -330,4 +339,3 @@ Important differences include:
 | Weights | Complete likelihood weights | Variance weights |
 | Zero inflation | ZIP and ZINB | Not a registered GLM family |
 | Instruments | Rejected | Supported for selected workflows |
-

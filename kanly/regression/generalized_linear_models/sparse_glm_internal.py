@@ -13,8 +13,9 @@ from kanly.regression.generalized_linear_models.constants import (
     DEFAULT_GLM_L1_RATIO, SHRINK_INTERCEPT, DEFAULT_GLM_FAMILY, DEFAULT_GLM_TOL, DEFAULT_GLM_ALPHA,
     DEFAULT_GLM_RESIDUAL_INCLUSION, DEFAULT_GLM_FORCE_IV_PROJECTION, LINE_SEARCH_SHRINK,
     DEFAULT_GLM_RESIDUAL_INCLUSION_ORDER, DEFAULT_GLM_PROMPT_USER_FOR_MORE_ITERS)
-from kanly.regression.generalized_linear_models.families import (Binomial, Bernoulli, Poisson, _get_family_and_link, Gaussian,
-                                                                 NegativeBinomial)
+from kanly.regression.generalized_linear_models.families import (
+    Gaussian, _get_family_and_link,
+)
 from kanly.regression.linear_models.sparse_iv_first_stage2 import iv_first_stage2
 from kanly.utils.linalg_utils import get_matrix_inverse_internal, csc_matrix_by_column_array_broadcast
 from kanly.utils.user_prompt_for_more_iters import user_prompt_for_more_iters_method
@@ -175,6 +176,30 @@ def wtd_std(x, weights=None):
         return np.sqrt((weights * (x - wtd_mean) ** 2).sum() / weights.sum())
     else:
         return np.std(x)
+
+
+def _validate_endog_for_family(endog, family):
+    """Raise a clear error when outcomes fall outside a family's support."""
+    endog = np.asarray(endog)
+    valid = np.asarray(family.check_valid_range(endog), dtype=bool)
+    if valid.shape != endog.shape:
+        raise ValueError(
+            f"{family.name()} check_valid_range returned shape {valid.shape}; "
+            f"expected {endog.shape}."
+        )
+    valid &= np.isfinite(endog)
+    if np.all(valid):
+        return
+
+    invalid_positions = np.flatnonzero(~valid)
+    shown_positions = invalid_positions[:10]
+    shown_values = endog.reshape(-1)[shown_positions]
+    suffix = ' ...' if len(invalid_positions) > len(shown_positions) else ''
+    raise ValueError(
+        f"Outcomes are outside the support of family {family.name()}; "
+        f"invalid positions {shown_positions.tolist()} have values "
+        f"{shown_values.tolist()}{suffix}."
+    )
 
 
 @njit(cache=True)
@@ -795,6 +820,8 @@ def glm_internal(
     """
     _time = time.time()
     opt_method = _get_opt_method(opt_method, alpha, l1_ratio)
+    family, link = _get_family_and_link(family, link)
+    _validate_endog_for_family(endog, family)
 
     # The IRLS path expects the intercept to already be present as a constant
     # column if an intercept is fit.
@@ -839,8 +866,6 @@ def glm_internal(
         regularize_to_values, k_exog, original_k_exog=original_k_exog)
     df_resid = nobs - (k_exog + (fit_intercept and not first_column_constant))
     df_model = exog.shape[1]
-
-    family, link = _get_family_and_link(family, link)
 
     is_weighted = var_weights is not None
     if not is_weighted:
@@ -1166,7 +1191,8 @@ def glm_internal(
     resid = endog - endog_predicted
 
     # Null model log-likelihood uses an intercept-only mean.
-    beta0_null = family.b_deriv_inv(np.average(endog, weights=var_weights))
+    null_mean = family.clip(np.average(endog, weights=var_weights))
+    beta0_null = family.b_deriv_inv(null_mean)
     llnull = family.log_likelihood(
         endog, beta0_null, scale=scale * (1 + 0 * df_resid / nobs
                                           if family.name in (Gaussian.name,)
@@ -1235,8 +1261,8 @@ def _estimate_scale(endog, endog_predicted, var_weights, family, df_resid, use_c
     """
     Estimate the GLM scale parameter.
 
-    Discrete count/binomial-like families use a fixed scale of one. Other
-    families use a Pearson chi-squared style scale estimate.
+    Families declaring fixed dispersion use a scale of one. Other families
+    use a Pearson chi-squared style scale estimate.
 
     Parameters
     ----------
@@ -1259,7 +1285,7 @@ def _estimate_scale(endog, endog_predicted, var_weights, family, df_resid, use_c
     float
         Estimated scale parameter.
     """
-    if family.name in [Poisson.name, Binomial.name, NegativeBinomial.name, Bernoulli.name]:
+    if family.is_fixed_dispersion():
         return 1.0
     scale = _estimate_x2_scale(
         endog, endog_predicted, family.variance, var_weights, df_resid, use_correction=use_correction)

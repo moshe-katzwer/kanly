@@ -23,7 +23,9 @@ from numba import vectorize, float64
 from kanly.regression.generalized_linear_models.links import (
     Link, Identity, Logit, NegativeInverse, Log,
     NegativeTwoInverseSquared, Sqrt, Probit, CLogLog, Inverse, InverseSquared, Cauchy,
-    NegativeBinomialCanonicalLink,
+    NegativeBinomialCanonicalLink, ZeroTruncatedPoissonLink,
+    _ztp_mean_from_rate, _ztp_rate_from_mean, _ztp_variance_from_rate,
+    _ztp_deriv2_mean_from_rate,
     _get_link as _get_link_from_link_class)
 
 BINOMIAL = 'BINOMIAL'
@@ -33,6 +35,7 @@ GAUSSIAN = 'GAUSSIAN'
 GAMMA = 'GAMMA'
 INVERSE_GAUSSIAN = 'INVERSE_GAUSSIAN'
 NEGATIVE_BINOMIAL = 'NEGATIVE_BINOMIAL'
+ZERO_TRUNCATED_POISSON = 'ZERO_TRUNCATED_POISSON'
 
 
 @vectorize([float64(float64)], cache=True)
@@ -388,8 +391,8 @@ class NegativeBinomial(Family):
 
     @classmethod
     def is_fixed_dispersion(cls):
-        """Return whether the family dispersion parameter is fixed."""
-        return False
+        """Return ``True`` because ``alpha`` is fixed by the family instance."""
+        return True
 
     @classmethod
     def name(cls):
@@ -543,6 +546,137 @@ class Poisson(Family):
     def clip(cls, y, tol=1e-6):
         """Clip response-scale means to the valid range of the family."""
         return positive_clip(y, tol)
+
+
+class ZeroTruncatedPoisson(Family):
+    """Poisson family conditional on observing a strictly positive count.
+
+    If ``lambda`` is the underlying Poisson rate, the fitted response mean is
+    ``mu = lambda / (1 - exp(-lambda))`` and the canonical parameter is
+    ``theta = log(lambda)``.  Consequently, fitted means lie in ``(1, inf)``
+    even though observed counts may equal one.
+    """
+
+    @classmethod
+    def is_fixed_dispersion(cls):
+        """Return ``True`` because the truncated Poisson scale is fixed at one."""
+        return True
+
+    @classmethod
+    def name(cls):
+        """Return the registered uppercase family name."""
+        return ZERO_TRUNCATED_POISSON
+
+    @classmethod
+    def safe_links(cls):
+        """Return links whose inverse always respects the mean range ``(1, inf)``."""
+        return [ZeroTruncatedPoissonLink]
+
+    def canonical_link(self):
+        """Return the canonical log-underlying-rate link."""
+        return ZeroTruncatedPoissonLink()
+
+    def default_link(self):
+        """Return the canonical link as the default link."""
+        return ZeroTruncatedPoissonLink()
+
+    def variance(self, mu):
+        """Evaluate the conditional variance as a function of truncated mean."""
+        rate = _ztp_rate_from_mean(mu)
+        return _ztp_variance_from_rate(rate)
+
+    def d_variance(self, mu):
+        """Evaluate the derivative of the variance function with respect to mu."""
+        rate = _ztp_rate_from_mean(mu)
+        variance = _ztp_variance_from_rate(rate)
+        return _ztp_deriv2_mean_from_rate(rate) / variance
+
+    def b(self, theta):
+        """Evaluate ``log(exp(exp(theta)) - 1)`` stably."""
+        theta = np.asarray(theta, dtype=float)
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            rate = np.exp(theta)
+            b_regular = rate + np.log(-np.expm1(-rate))
+            rate2 = rate * rate
+            b_small = theta + np.log1p(
+                rate / 2.0 + rate2 / 6.0
+                + rate2 * rate / 24.0 + rate2 * rate2 / 120.0
+            )
+        return np.where(rate < 1e-5, b_small, b_regular)
+
+    def b_deriv(self, theta):
+        """Map the canonical parameter to the positive-count conditional mean."""
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            rate = np.exp(theta)
+        return _ztp_mean_from_rate(rate)
+
+    def b_deriv_inv(self, mu):
+        """Map the conditional mean to the canonical log rate."""
+        return np.log(_ztp_rate_from_mean(mu))
+
+    @staticmethod
+    def c(y, scale):
+        """Evaluate the Poisson factorial base-measure term."""
+        return -_log_gamma_vectorized(1.0 + y) / scale
+
+    @staticmethod
+    def param_transformation(theta, scale):
+        """Return the underlying rate and its zero-truncated conditional mean."""
+        del scale
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            rate = np.exp(theta)
+        return {
+            'lambda': rate,
+            'truncated_mean': _ztp_mean_from_rate(rate),
+        }
+
+    @staticmethod
+    def check_valid_range(y):
+        """Return validity for finite positive integer outcomes."""
+        y = np.asarray(y)
+        return np.isfinite(y) & (y > 0) & (y == np.floor(y))
+
+    def get_starting_intercept(self, endog, var_weights=None, link=None):
+        """Return a finite intercept based on the weighted positive-count mean."""
+        if link is None:
+            link = self.default_link()
+        mean = np.average(endog, weights=var_weights)
+        return link.link(max(float(mean), 1.0 + 1e-6))
+
+    @staticmethod
+    def starting_mu(y):
+        """Return initial conditional means strictly above one."""
+        y = np.asarray(y, dtype=float)
+        return np.maximum(0.5 * (y + y.mean()), 1.0 + 1e-6)
+
+    def deviance(self, endog, endog_predicted, var_weights=1):
+        """Compute twice the saturated-minus-fitted truncated log likelihood."""
+        endog = np.asarray(endog, dtype=float)
+        mu = np.asarray(endog_predicted, dtype=float)
+        theta = self.b_deriv_inv(mu)
+        fitted_core = endog * theta - self.b(theta)
+
+        saturated_core = np.zeros_like(endog)
+        above_one = endog > 1.0
+        if np.any(above_one):
+            theta_saturated = self.b_deriv_inv(endog[above_one])
+            saturated_core[above_one] = (
+                endog[above_one] * theta_saturated
+                - self.b(theta_saturated)
+            )
+        return np.sum(
+            2.0 * np.asarray(var_weights) * (saturated_core - fitted_core)
+        )
+
+    @classmethod
+    def is_positive_range(cls):
+        """Return ``True`` because all outcomes are strictly positive."""
+        return True
+
+    @classmethod
+    def clip(cls, y, tol=1e-6):
+        """Clip response-scale means to the valid range above one."""
+        return np.clip(y, 1.0 + tol, np.inf)
 
 
 class Gaussian(Family):
@@ -778,7 +912,10 @@ class InverseGaussian(Family):
         return positive_clip(y, tol)
 
 
-FAMILIES = [Gamma, Gaussian, Binomial, InverseGaussian, Poisson, Bernoulli, NegativeBinomial]
+FAMILIES = [
+    Gamma, Gaussian, Binomial, InverseGaussian, Poisson,
+    ZeroTruncatedPoisson, Bernoulli, NegativeBinomial,
+]
 
 FAMILY_NAME_2_CLS = {
     f.name(): f for f in FAMILIES

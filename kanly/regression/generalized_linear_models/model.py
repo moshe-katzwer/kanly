@@ -728,9 +728,10 @@ class SparseGeneralizedLinearModel(LinearModelBase):
         >>> # fit_iv = glm('y ~ x | z1 + z2', df, family='binomial',
         >>> #              residual_inclusion=True)
 
-        Supported families include ``'binomial'``, ``'poisson'``, ``'gaussian'``,
-        ``'gamma'``, ``'inversegaussian'``, ``'negativebinomial'`` (case
-        insensitive); links default to each family's canonical link.
+        Supported families include ``'binomial'``, ``'poisson'``,
+        ``'zero_truncated_poisson'``, ``'gaussian'``, ``'gamma'``,
+        ``'inversegaussian'``, and ``'negativebinomial'`` (case insensitive);
+        links default to each family's configured default link.
 
         See Also
         --------

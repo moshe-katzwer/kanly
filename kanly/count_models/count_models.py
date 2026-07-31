@@ -44,41 +44,108 @@ class CountModel(ABC):
         weights: Optional non-negative likelihood weights of length ``nobs``.
     """
 
-    def __init__(self, endog, exog, weights=None):
-        """Initialize response data, design data, weights, and model metadata."""
+    def __init__(
+            self, endog, exog, weights=None, endog_name=None,
+            exog_names=None, weights_name=None, formula_design_info=None,
+            formula=None, from_formula=False, exog_term_names=None,
+            exog_term_to_indices=None, has_intercept=False,
+            has_implicit_constant=False, valid_obs_rows=None,
+            null_rows_info_dict=None, index=None, model_elapsed=0.0):
+        """Initialize model data, names, formula metadata, and parameters.
+
+        Args:
+            endog: One-dimensional response data.
+            exog: Two-dimensional regression design matrix.
+            weights: Optional non-negative likelihood weights.
+            endog_name: Optional response name.
+            exog_names: Optional coefficient names matching the columns of
+                ``exog``. Generated names are used when omitted.
+            weights_name: Optional name of the likelihood-weight variable.
+            formula_design_info: Formula engine metadata, when applicable.
+            formula: Original formula string, when applicable.
+            from_formula: Whether the model was constructed from a formula.
+            exog_term_names: Formula terms represented by ``exog``.
+            exog_term_to_indices: Mapping from formula terms to exog columns.
+            has_intercept: Whether ``exog`` has an explicit intercept.
+            has_implicit_constant: Whether its span contains a constant.
+            valid_obs_rows: Retained row positions after missing-data handling.
+            null_rows_info_dict: Missing-row diagnostics by formula block.
+            index: Original row selector supplied to formula construction.
+            model_elapsed: Formula/model construction time in seconds.
+        """
+        endog = np.asarray(endog, dtype=float)
+        if endog.ndim == 2 and endog.shape[1] == 1:
+            endog = endog.reshape(-1)
+        if endog.ndim != 1:
+            raise ValueError("endog must be one-dimensional")
+
+        exog = np.asarray(exog, dtype=float)
+        if exog.ndim == 1:
+            exog = exog[:, None]
+        if exog.ndim != 2:
+            raise ValueError("exog must be two-dimensional")
+        if exog.shape[0] != len(endog):
+            raise ValueError("endog and exog must contain the same number of rows")
+
+        if weights is not None:
+            weights = np.asarray(weights, dtype=float).reshape(-1)
+            if len(weights) != len(endog):
+                raise ValueError("weights must have one value per observation")
+            if np.any(~np.isfinite(weights)) or np.any(weights < 0.0):
+                raise ValueError("weights must be finite and non-negative")
+
+        if exog_names is not None:
+            exog_names = [str(name) for name in exog_names]
+            if len(exog_names) != exog.shape[1]:
+                raise ValueError("exog_names must match the columns of exog")
+
         self.endog = endog
         self.exog = exog
         self.weights = weights
         self.is_weighted = self.weights is not None
         self.nobs = len(self.endog)
 
-        self.formula_design_info = None
-        self.formula = None
-        self.from_formula = False
-        self.endog_name = None
-        self.exog_names = None
-        self.weights_name = None
-        self.exog_term_names = None
-        self.exog_term_to_indices = None
-        self.has_intercept = False
-        self.has_implicit_constant = False
-        self.valid_obs_rows = np.arange(self.nobs)
-        self.null_rows_info_dict = {}
-        self.index = None
-        self.model_elapsed = 0.0
+        self.formula_design_info = formula_design_info
+        self.formula = formula
+        self.from_formula = bool(from_formula)
+        self.endog_name = None if endog_name is None else str(endog_name)
+        self.exog_names = exog_names
+        self.weights_name = (
+            None if weights_name is None else str(weights_name)
+        )
+        self.exog_term_names = (
+            None if exog_term_names is None else list(exog_term_names)
+        )
+        self.exog_term_to_indices = exog_term_to_indices
+        self.has_intercept = bool(has_intercept)
+        self.has_implicit_constant = bool(has_implicit_constant)
+        self.valid_obs_rows = (
+            np.arange(self.nobs)
+            if valid_obs_rows is None
+            else np.asarray(valid_obs_rows, dtype=int).copy()
+        )
+        self.null_rows_info_dict = (
+            {} if null_rows_info_dict is None else null_rows_info_dict.copy()
+        )
+        self.index = index
+        self.model_elapsed = float(model_elapsed)
         self.param_names = self.get_param_names()
 
     @classmethod
-    def build_model_from_formula(
+    def _get_formula_constructor_kwargs(
             cls, formula, data, index=None, debug=False,
             check_constant_cols=False, fail_on_missing=False,
             cache_intermediate=True, sum_to_n=False,
-            test_formula_on_dummy=True, drop_1_for_FE=True, **model_kwargs):
-        """Build an unfitted count model from Kanly formula syntax.
+            test_formula_on_dummy=True, drop_1_for_FE=True):
+        """Build aligned formula arrays and return constructor keywords.
 
         The ``$`` formula extension supplies optional likelihood weights.
         Instrumental-variable and absorbed-effect formulas are not supported.
         Missing rows are aligned and removed by ``SparseDataGetter``.
+
+        Returns:
+            Dictionary containing model data, names, and formula metadata that
+            can be passed directly to a count-model constructor.
         """
         result = SparseDataGetter.get_data(
             data=data, formula=formula, index=index, debug=debug,
@@ -114,27 +181,67 @@ class CountModel(ABC):
                 weights = weights.toarray()
             weights = np.asarray(weights).reshape(-1)
 
-        model = cls(endog, exog, weights=weights, **model_kwargs)
-        model.formula_design_info = result[FORMULA_DESIGN_INFO_KEY]
-        model.formula = model.formula_design_info.formula
-        model.from_formula = True
-        model.endog_name = endog_obj.column_names[0]
-        model.exog_names = list(exog_obj.column_names)
-        model.weights_name = (
-            None if weights_obj is None else weights_obj.column_names[0]
+        formula_design_info = result[FORMULA_DESIGN_INFO_KEY]
+        return {
+            'endog': endog,
+            'exog': exog,
+            'weights': weights,
+            'endog_name': endog_obj.column_names[0],
+            'exog_names': list(exog_obj.column_names),
+            'weights_name': (
+                None if weights_obj is None else weights_obj.column_names[0]
+            ),
+            'formula_design_info': formula_design_info,
+            'formula': formula_design_info.formula,
+            'from_formula': True,
+            'exog_term_names': exog_obj.term_names,
+            'exog_term_to_indices': exog_obj.var_2_col_indices,
+            'has_intercept': result[HAS_INTERCEPT_KEY],
+            'has_implicit_constant': result[HAS_IMPLICIT_CONSTANT_KEY],
+            'valid_obs_rows': result[VALID_OBS_ROWS_KEY],
+            'null_rows_info_dict': result[NULL_ROWS_INFO_DICT_KEY],
+            'index': result[INDEX_KEY],
+            'model_elapsed': result[TIME_ELAPSED_KEY],
+        }
+
+    @classmethod
+    def build_model_from_formula(
+            cls, formula, data, index=None, debug=False,
+            check_constant_cols=False, fail_on_missing=False,
+            cache_intermediate=True, sum_to_n=False,
+            test_formula_on_dummy=True, drop_1_for_FE=True, **model_kwargs):
+        """Build an unfitted model with constructor-owned formula metadata."""
+        constructor_kwargs = cls._get_formula_constructor_kwargs(
+            formula=formula,
+            data=data,
+            index=index,
+            debug=debug,
+            check_constant_cols=check_constant_cols,
+            fail_on_missing=fail_on_missing,
+            cache_intermediate=cache_intermediate,
+            # Normalize after all formula rows have been aligned.
+            sum_to_n=False,
+            test_formula_on_dummy=test_formula_on_dummy,
+            drop_1_for_FE=drop_1_for_FE,
         )
-        model.exog_term_names = exog_obj.term_names
-        model.exog_term_to_indices = exog_obj.var_2_col_indices
-        model.has_intercept = result[HAS_INTERCEPT_KEY]
-        model.has_implicit_constant = result[HAS_IMPLICIT_CONSTANT_KEY]
-        model.valid_obs_rows = result[VALID_OBS_ROWS_KEY]
-        model.null_rows_info_dict = result[NULL_ROWS_INFO_DICT_KEY]
-        model.index = result[INDEX_KEY]
-        model.model_elapsed = result[TIME_ELAPSED_KEY]
+        if sum_to_n and constructor_kwargs['weights'] is not None:
+            weights = constructor_kwargs['weights']
+            weights_sum = weights.sum()
+            if weights_sum <= 0.0:
+                raise ValueError(
+                    "weights must have a positive sum when sum_to_n=True"
+                )
+            constructor_kwargs['weights'] = (
+                weights * len(constructor_kwargs['endog']) / weights_sum
+            )
+        duplicate_kwargs = set(constructor_kwargs).intersection(model_kwargs)
+        if duplicate_kwargs:
+            duplicates = ', '.join(sorted(duplicate_kwargs))
+            raise TypeError(
+                f'Formula construction supplies these arguments: {duplicates}'
+            )
 
-        model.param_names = model.get_param_names()
-
-        return model
+        return cls(**constructor_kwargs, **model_kwargs)
 
     def _apply_weights(self, values):
         """Multiply an observation array by stored weights in place.
@@ -488,8 +595,12 @@ class _ZeroInflatedModel(CountModel):
     intercept column is used.
     """
 
-    def __init__(self, endog, exog, weights=None, exog_infl=None,
-                 exog_infl_names=None):
+    def __init__(
+            self, endog, exog, weights=None, exog_infl=None,
+            exog_infl_names=None, endog_name=None, exog_names=None,
+            weights_name=None, exog_infl_formula=None,
+            exog_infl_term_names=None, exog_infl_term_to_indices=None,
+            **model_metadata):
         """Initialize and validate count and zero-inflation design data.
 
         Args:
@@ -499,6 +610,14 @@ class _ZeroInflatedModel(CountModel):
             exog_infl: Optional design matrix for the structural-zero logit.
                 Defaults to an intercept-only matrix.
             exog_infl_names: Optional names for columns of ``exog_infl``.
+            endog_name: Optional response name.
+            exog_names: Optional names for count-equation columns.
+            weights_name: Optional likelihood-weight variable name.
+            exog_infl_formula: Formula used to build the inflation matrix.
+            exog_infl_term_names: Terms represented by ``exog_infl``.
+            exog_infl_term_to_indices: Mapping from inflation terms to columns.
+            **model_metadata: Remaining metadata accepted by
+                :class:`CountModel`.
         """
         endog = np.asarray(endog, dtype=float)
         if endog.ndim != 1:
@@ -510,7 +629,8 @@ class _ZeroInflatedModel(CountModel):
                 "Zero-inflated outcomes must be finite and non-negative"
             )
 
-        if exog_infl is None:
+        has_default_inflation = exog_infl is None
+        if has_default_inflation:
             exog_infl = np.ones((len(endog), 1), dtype=float)
         else:
             exog_infl = np.asarray(exog_infl, dtype=float)
@@ -533,7 +653,30 @@ class _ZeroInflatedModel(CountModel):
         self.exog_infl = exog_infl
         self.exog_infl_names = exog_infl_names
         self.k_inflate = exog_infl.shape[1]
-        super().__init__(endog, exog, weights=weights)
+        self.exog_infl_formula = exog_infl_formula
+        self.exog_infl_term_names = (
+            ['Intercept']
+            if exog_infl_term_names is None and has_default_inflation
+            else (
+                None
+                if exog_infl_term_names is None
+                else list(exog_infl_term_names)
+            )
+        )
+        self.exog_infl_term_to_indices = (
+            {'Intercept': np.array([0])}
+            if exog_infl_term_to_indices is None and has_default_inflation
+            else exog_infl_term_to_indices
+        )
+        super().__init__(
+            endog,
+            exog,
+            weights=weights,
+            endog_name=endog_name,
+            exog_names=exog_names,
+            weights_name=weights_name,
+            **model_metadata,
+        )
 
     @classmethod
     def build_model_from_formula(
@@ -570,13 +713,11 @@ class _ZeroInflatedModel(CountModel):
                 "build_model_from_formula"
             )
 
-        # Formula-derived names replace any matrix-API names.  Removing the
-        # keyword before the initial intercept-only construction also avoids a
-        # temporary name-count mismatch.
+        # Formula-derived inflation names replace matrix-API names.
         if exog_infl is not None:
             model_kwargs.pop('exog_infl_names', None)
 
-        model = super().build_model_from_formula(
+        constructor_kwargs = super()._get_formula_constructor_kwargs(
             formula=formula,
             data=data,
             index=index,
@@ -589,73 +730,97 @@ class _ZeroInflatedModel(CountModel):
             sum_to_n=False,
             test_formula_on_dummy=test_formula_on_dummy,
             drop_1_for_FE=drop_1_for_FE,
-            **model_kwargs,
         )
-        model.exog_infl_formula = exog_infl
-        model.exog_infl_term_names = ['Intercept']
-        model.exog_infl_term_to_indices = {'Intercept': np.array([0])}
+        inflation_kwargs = {}
 
-        if exog_infl is None:
-            return model
+        if exog_infl is not None:
+            data_frame = dict_2_dataframe(data)
+            inflation_obj = SparseDataGetter.sparse_dmatrix(
+                exog_infl,
+                data_frame,
+                debug=debug,
+                check_constant_cols=check_constant_cols,
+                cache_intermediate=cache_intermediate,
+                drop_1_for_FE=drop_1_for_FE,
+                name='EXOG_INFL',
+                index=index,
+            )
+            inflation_null_rows = inflation_obj.null_rows.copy()
+            if fail_on_missing and inflation_null_rows:
+                missing_rows = sorted(int(row) for row in inflation_null_rows)
+                raise MissingDataException(
+                    "Inflation exog has missing data in rows "
+                    f"{missing_rows}!"
+                )
 
-        data_frame = dict_2_dataframe(data)
-        inflation_obj = SparseDataGetter.sparse_dmatrix(
-            exog_infl,
-            data_frame,
-            debug=debug,
-            check_constant_cols=check_constant_cols,
-            cache_intermediate=cache_intermediate,
-            drop_1_for_FE=drop_1_for_FE,
-            name='EXOG_INFL',
-            index=index,
-        )
-        inflation_null_rows = inflation_obj.null_rows.copy()
-        if fail_on_missing and inflation_null_rows:
-            missing_rows = sorted(int(row) for row in inflation_null_rows)
-            raise MissingDataException(
-                "Inflation exog has missing data in rows "
-                f"{missing_rows}!"
+            main_valid_rows = np.asarray(
+                constructor_kwargs['valid_obs_rows'], dtype=int
+            )
+            keep_main_rows = ~np.isin(
+                main_valid_rows, list(inflation_null_rows)
+            )
+            final_valid_rows = main_valid_rows[keep_main_rows]
+            if len(final_valid_rows) == 0:
+                raise ValueError(
+                    "No valid observations remain after aligning exog_infl"
+                )
+
+            constructor_kwargs['endog'] = (
+                constructor_kwargs['endog'][keep_main_rows]
+            )
+            constructor_kwargs['exog'] = (
+                constructor_kwargs['exog'][keep_main_rows]
+            )
+            if constructor_kwargs['weights'] is not None:
+                constructor_kwargs['weights'] = (
+                    constructor_kwargs['weights'][keep_main_rows]
+                )
+
+            # Inflation values still refer to the original selected-row space.
+            inflation_obj.slice_null_rows(final_valid_rows)
+            exog_infl_values = inflation_obj.values
+            if hasattr(exog_infl_values, 'toarray'):
+                exog_infl_values = exog_infl_values.toarray()
+            exog_infl_values = np.asarray(exog_infl_values, dtype=float)
+            if exog_infl_values.ndim == 1:
+                exog_infl_values = exog_infl_values[:, None]
+
+            null_rows_info = constructor_kwargs['null_rows_info_dict'].copy()
+            null_rows_info['EXOG_INFL'] = inflation_null_rows
+            constructor_kwargs['null_rows_info_dict'] = null_rows_info
+            constructor_kwargs['valid_obs_rows'] = final_valid_rows
+            inflation_kwargs = {
+                'exog_infl': exog_infl_values,
+                'exog_infl_names': list(inflation_obj.column_names),
+                'exog_infl_formula': exog_infl,
+                'exog_infl_term_names': list(inflation_obj.term_names),
+                'exog_infl_term_to_indices': (
+                    inflation_obj.var_2_col_indices
+                ),
+            }
+
+        if sum_to_n and constructor_kwargs['weights'] is not None:
+            weights = constructor_kwargs['weights']
+            weights_sum = weights.sum()
+            if weights_sum <= 0.0:
+                raise ValueError(
+                    "weights must have a positive sum when sum_to_n=True"
+                )
+            constructor_kwargs['weights'] = (
+                weights * len(constructor_kwargs['endog']) / weights_sum
             )
 
-        main_valid_rows = np.asarray(model.valid_obs_rows, dtype=int)
-        keep_main_rows = ~np.isin(main_valid_rows, list(inflation_null_rows))
-        final_valid_rows = main_valid_rows[keep_main_rows]
-        if len(final_valid_rows) == 0:
-            raise ValueError(
-                "No valid observations remain after aligning exog_infl"
+        supplied_kwargs = set(constructor_kwargs) | set(inflation_kwargs)
+        duplicate_kwargs = supplied_kwargs.intersection(model_kwargs)
+        if duplicate_kwargs:
+            duplicates = ', '.join(sorted(duplicate_kwargs))
+            raise TypeError(
+                f'Formula construction supplies these arguments: {duplicates}'
             )
 
-        # The count formula has already removed its own invalid rows.  Apply
-        # only the additional inflation exclusions to those aligned arrays.
-        model.endog = np.asarray(model.endog)[keep_main_rows]
-        model.exog = np.asarray(model.exog)[keep_main_rows]
-        if model.weights is not None:
-            model.weights = np.asarray(model.weights)[keep_main_rows]
-
-        # Inflation values still refer to the original selected-row space, so
-        # slice them using the union-aligned row positions.  The helper also
-        # removes sparse columns that become empty after row alignment.
-        inflation_obj.slice_null_rows(final_valid_rows)
-        exog_infl_values = inflation_obj.values
-        if hasattr(exog_infl_values, 'toarray'):
-            exog_infl_values = exog_infl_values.toarray()
-        model.exog_infl = np.asarray(exog_infl_values, dtype=float)
-        if model.exog_infl.ndim == 1:
-            model.exog_infl = model.exog_infl[:, None]
-
-        model.exog_infl_names = list(inflation_obj.column_names)
-        model.exog_infl_term_names = list(inflation_obj.term_names)
-        model.exog_infl_term_to_indices = inflation_obj.var_2_col_indices
-        model.k_inflate = model.exog_infl.shape[1]
-        model.nobs = len(model.endog)
-        model.valid_obs_rows = final_valid_rows
-        model.null_rows_info_dict['EXOG_INFL'] = inflation_null_rows
-
-        if sum_to_n and model.weights is not None:
-            model.weights *= model.nobs / model.weights.sum()
-
-        model.param_names = model.get_param_names()
-        return model
+        return cls(
+            **constructor_kwargs, **inflation_kwargs, **model_kwargs
+        )
 
     def _get_inflation_param_names(self):
         """Return prefixed parameter names for the inflation equation."""
@@ -954,14 +1119,24 @@ class Gamma(CountModel):
     although the Gamma response is continuous rather than a count.
     """
 
-    def __init__(self, endog, exog, weights=None):
-        """Initialize a Gamma regression and validate its positive support."""
+    def __init__(
+            self, endog, exog, weights=None, endog_name=None,
+            exog_names=None, weights_name=None, **model_metadata):
+        """Initialize Gamma data, names, metadata, and positive support."""
         endog = np.asarray(endog, dtype=float)
         if endog.ndim != 1:
             raise ValueError("Gamma outcomes must be one-dimensional")
         if np.any(~np.isfinite(endog)) or np.any(endog <= 0.0):
             raise ValueError("Gamma outcomes must be finite and strictly positive")
-        super().__init__(endog, exog, weights=weights)
+        super().__init__(
+            endog,
+            exog,
+            weights=weights,
+            endog_name=endog_name,
+            exog_names=exog_names,
+            weights_name=weights_name,
+            **model_metadata,
+        )
         self._log_endog = np.log(self.endog)
 
     def get_param_names(self):
@@ -1055,7 +1230,9 @@ class GeneralizedPoisson(CountModel):
     underdispersion, and ``alpha=0`` recovers Poisson.
     """
 
-    def __init__(self, endog, exog, weights=None, p=1):
+    def __init__(
+            self, endog, exog, weights=None, p=1, endog_name=None,
+            exog_names=None, weights_name=None, **model_metadata):
         """Initialize the model and select its variance parameterization.
 
         Args:
@@ -1064,12 +1241,25 @@ class GeneralizedPoisson(CountModel):
             weights: Optional observation likelihood weights.
             p: Positive parameterization index.  Common choices are ``1`` for
                 GP-1 and ``2`` for GP-2.
+            endog_name: Optional response name.
+            exog_names: Optional regression coefficient names.
+            weights_name: Optional likelihood-weight variable name.
+            **model_metadata: Remaining metadata accepted by
+                :class:`CountModel`.
         """
-        super().__init__(endog, exog, weights=weights)
         if not np.isscalar(p) or not np.isfinite(p) or p <= 0:
             raise ValueError("p must be a finite positive scalar")
         self.p = p
         self.parameterization = p - 1.0
+        super().__init__(
+            endog,
+            exog,
+            weights=weights,
+            endog_name=endog_name,
+            exog_names=exog_names,
+            weights_name=weights_name,
+            **model_metadata,
+        )
 
     def get_param_names(self):
         """Return coefficient names followed by the raw ``alpha`` parameter."""
@@ -1316,7 +1506,7 @@ class NegativeBinomial2(CountModel):
 
 if __name__ == '__main__':
     np.random.seed(0)
-    n = 405
+    n = 40
     from kanly.api import GLM
     import pandas as pd
     x = np.exp(np.random.randn(n))
@@ -1326,11 +1516,11 @@ if __name__ == '__main__':
     w = np.exp(np.random.randn(n))
 
     poisson = Poisson.build_model_from_formula('y ~ np.log(x) $ w', dict(x=x,y=y,w=w))
-    fit = poisson.fit([.1] * X.shape[1], cov_type='sandwich')
+    fit = poisson.fit([.1] * X.shape[1], cov_type='bootstrap')
     print(fit.summary_df)
 
     poisson = GeneralizedPoisson.build_model_from_formula('y ~ np.log(x) $ w', dict(x=x,y=y,w=w))
-    fit = poisson.fit([.1] * 3, cov_type='bootstrap', cov_kwds={'n_samples': 250})
+    fit = poisson.fit([.1] * 3, cov_type='bootstrap', cov_kwds={'n_samples': 1000})
     print(fit.summary_df)
 
     #print(GLM(y, X, var_weights=w, family='poisson', cov_type='hc1'))
