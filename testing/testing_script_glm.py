@@ -1,5 +1,7 @@
 import pandas as pd
 import numpy as np
+from scipy.optimize import minimize
+from scipy.special import gammaln
 from kanly.api import glm, GLM, lm
 from kanly.regression.generalized_linear_models.sparse_glm_internal import METHOD_IRLS, METHOD_COORD_DESC
 
@@ -16,7 +18,10 @@ upper_to_sm_link_dict['INVERSE'] = inverse_power
 upper_to_sm_link_dict['NEGATIVEINVERSE'] = inverse_power
 upper_to_sm_link_dict['NEGATIVETWOINVERSESQUARED'] = inverse_squared
 
-from kanly.regression.generalized_linear_models.families import FAMILIES, Poisson, Gaussian, Binomial, Gamma, InverseGaussian, NegativeBinomial
+from kanly.regression.generalized_linear_models.families import (
+    FAMILIES, Poisson, Gaussian, Binomial, Gamma, InverseGaussian,
+    NegativeBinomial, ZeroTruncatedPoisson,
+)
 from statsmodels.formula.api import glm as glm_sm
 from statsmodels.api import families as families_sm
 from numpy.testing import assert_array_almost_equal
@@ -53,6 +58,71 @@ print([("\t", f.__name__, {l.__name__: l for l in f.links}) for f in families_sm
 
 results = dict()
 
+
+def sample_zero_truncated_poisson(rate):
+    """Draw Poisson observations conditional on each count being positive."""
+    counts = np.random.poisson(rate)
+    is_zero = counts == 0
+    while np.any(is_zero):
+        counts[is_zero] = np.random.poisson(rate[is_zero])
+        is_zero = counts == 0
+    return counts
+
+
+def zero_truncated_poisson_mean(rate):
+    """Compute the conditional mean independently of Kanly's link code."""
+    rate = np.asarray(rate, dtype=float)
+    small = rate < 1e-5
+    safe_rate = np.where(small, 1.0, rate)
+    mean = safe_rate / (-np.expm1(-safe_rate))
+    rate2 = rate * rate
+    mean_small = 1.0 + rate / 2.0 + rate2 / 12.0 - rate2 ** 2 / 720.0
+    return np.where(small, mean_small, mean)
+
+
+def fit_zero_truncated_poisson_reference(endog, exog, var_weights=None):
+    """Fit a ZTP log-rate regression by direct maximum likelihood.
+
+    Statsmodels does not provide a zero-truncated Poisson GLM family, so this
+    independent SciPy optimization is the reference used by the parity sweep.
+    """
+    endog = np.asarray(endog, dtype=float)
+    exog = np.asarray(exog, dtype=float)
+    weights = (
+        np.ones_like(endog)
+        if var_weights is None
+        else np.asarray(var_weights, dtype=float)
+    )
+
+    def objective(params):
+        eta = exog @ params
+        rate = np.exp(eta)
+        loglike_obs = (
+            endog * eta - rate - gammaln(endog + 1.0)
+            - np.log(-np.expm1(-rate))
+        )
+        return -np.dot(weights, loglike_obs)
+
+    def gradient(params):
+        eta = exog @ params
+        rate = np.exp(eta)
+        score_eta = endog - zero_truncated_poisson_mean(rate)
+        return -(exog.T @ (weights * score_eta))
+
+    result = minimize(
+        objective,
+        np.zeros(exog.shape[1]),
+        jac=gradient,
+        method='BFGS',
+        options={'gtol': 1e-10, 'maxiter': 2000},
+    )
+    # BFGS can report precision loss after reaching the optimum.  Treat a
+    # negligible analytical score as convergence in that case.
+    result.success = bool(
+        result.success or np.max(np.abs(gradient(result.x))) < 1e-5
+    )
+    return result
+
 for opt_method in [
     METHOD_IRLS,
     METHOD_COORD_DESC
@@ -64,6 +134,7 @@ for opt_method in [
                     Poisson, Gaussian, Gamma,
                     InverseGaussian,
                     Binomial,
+                    ZeroTruncatedPoisson,
                     # NegativeBinomial(alpha=.5),
                 ]:
 
@@ -98,12 +169,14 @@ for opt_method in [
                         # print('b, ', links_sm[kanly_to_sm_links[link.name()]])
                         # print('c, ', links_sm[kanly_to_sm_links[link.name()]]())
                         # f_sm = f_sm_cls(links_sm[kanly_to_sm_links[link.name()]]())
-                        link_sm = upper_to_sm_link_dict[link.__class__.__name__.upper().replace('_', '')]
-                        if not isinstance(link_sm, Link):
-                            link_sm = link_sm()
-                        f_sm = upper_to_sm_family_dict[family.__name__.upper().replace('_', '')](
-                            link_sm
-                        )
+                        is_ztp = family.name() == 'ZERO_TRUNCATED_POISSON'
+                        if not is_ztp:
+                            link_sm = upper_to_sm_link_dict[link.__class__.__name__.upper().replace('_', '')]
+                            if not isinstance(link_sm, Link):
+                                link_sm = link_sm()
+                            f_sm = upper_to_sm_family_dict[family.__name__.upper().replace('_', '')](
+                                link_sm
+                            )
 
                         if family.name() == 'BINOMIAL':
                             if link.name() == 'IDENTITY':
@@ -113,6 +186,12 @@ for opt_method in [
                                 df['y'] = np.exp(-5 + 1.5 * df.x + df['e'])
                                 df['y'] /= (1.0 + df['y'])
                                 df['y'] = (np.random.rand(n) < df['y']).astype(float)
+                        elif is_ztp:
+                            # The ZTP link models log(lambda), while its inverse
+                            # returns E[Y | Y > 0], so simulate from lambda
+                            # explicitly rather than treating the mean as a rate.
+                            lin_pred = -0.5 + 0.35 * df.x + df['e']
+                            df['y'] = sample_zero_truncated_poisson(np.exp(lin_pred))
                         else:
 
                             lin_pred = 3 + 1.5 * df.x + df['e']
@@ -138,9 +217,28 @@ for opt_method in [
                         if do_weighted:
                             formula_kanly += ' $ wtsvar'
 
-                        fit_sm = glm_sm(formula, df, family=f_sm, var_weights=df['wtsvar'] if do_weighted else None
-                                        ).fit(tol=1e-12, max_iter=1000)
-                        print(fit_sm.summary())
+                        if is_ztp:
+                            reference_predictors = ['x_pred' if do_iv else 'x']
+                            if do_iv and residual_inclusion:
+                                reference_predictors.append('x_ri')
+                            exog_reference = np.column_stack(
+                                [np.ones(n)]
+                                + [df[name].values for name in reference_predictors]
+                            )
+                            fit_reference = fit_zero_truncated_poisson_reference(
+                                df.y.values,
+                                exog_reference,
+                                df.wtsvar.values if do_weighted else None,
+                            )
+                            print(fit_reference)
+                        else:
+                            fit_sm = glm_sm(
+                                formula,
+                                df,
+                                family=f_sm,
+                                var_weights=df['wtsvar'] if do_weighted else None,
+                            ).fit(tol=1e-12, max_iter=1000)
+                            print(fit_sm.summary())
 
                         fit_kanly = glm(formula_kanly, df, family=family, link=link, cov_type='HC1', tol=1e-12,
                                         max_iter=5000, opt_method=opt_method,
@@ -159,8 +257,11 @@ for opt_method in [
                                 * (2.0 if link.name() == 'NEGATIVE_TWO_INVERSE_SQUARED' else 1.0)
                         )
 
+                        reference_params = (
+                            fit_reference.x if is_ztp else fit_sm.params.values
+                        )
                         tbl = pd.DataFrame(
-                            {'sm': fit_sm.params.values,
+                            {'reference': reference_params,
                              'kanly': param_kanly.values},
                             index=fit_kanly.params.index
                         )
@@ -168,18 +269,25 @@ for opt_method in [
 
                         try:
                             assert_array_almost_equal(
-                                tbl.sm,
+                                tbl.reference,
                                 tbl.kanly,
                                 decimal=5
                             )
                             assert fit_kanly.converged
+                            if is_ztp:
+                                assert fit_reference.success
                         except Exception as e:
                             failed.append(
                                 (
                                     [(do_iv, do_weighted, residual_inclusion, opt_method, family.name(),
                                       link.name())],
                                     [tbl, ],
-                                    [pd.Series({'sm llf': fit_sm.llf, 'fit_kn llf': fit_kanly.llf})]
+                                    [pd.Series({
+                                        'reference llf': (
+                                            -fit_reference.fun if is_ztp else fit_sm.llf
+                                        ),
+                                        'fit_kn llf': fit_kanly.llf,
+                                    })]
                                 )
                             )
                             print(failed[-1])
@@ -208,4 +316,3 @@ print("\n" * 5, "=" * 100, "\n" * 5)
 print(f"Num Failed {len(failed)}")
 for f in failed:
     print(f[0])
-

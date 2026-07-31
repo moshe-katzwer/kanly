@@ -41,6 +41,9 @@ def main():
         cov_type='nonrobust',
     )
 
+    print(fit)
+    print('\n'*2)
+
     comparison = pd.DataFrame(
         {
             'true': true_params,
