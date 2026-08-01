@@ -16,11 +16,10 @@ from __future__ import absolute_import, print_function
 from abc import abstractmethod
 
 import numpy as np
-import pandas as pd
 from scipy.special import expit
-from scipy.stats import norm
 
-from kanly.count_models.count_models import _ZeroInflatedModel
+from kanly.distributional_models.count_models import _ZeroInflatedModel
+from kanly.distributional_models.results import DistributionalModelResults
 from kanly.regression.generalized_linear_models.families import (
     Bernoulli,
     Gamma as GammaFamily,
@@ -33,144 +32,8 @@ from kanly.regression.generalized_linear_models.model import (
 )
 
 
-class HurdleModelResults:
-    """Combined results from the positive and zero-hurdle GLM fits.
-
-    The covariance matrix is block diagonal, with the positive-response block
-    first and the Bernoulli/logit hurdle block second.  The original component
-    results remain available as ``positive_fit`` and ``hurdle_fit``.
-    """
-
-    def __init__(
-            self, model, positive_fit, hurdle_fit, cov_params, cov_type,
-            component_cov_type, cov_kwds):
-        """Merge component estimates and construct count-model-style output."""
-        self.model = model
-        self.positive_fit = positive_fit
-        self.hurdle_fit = hurdle_fit
-        self.zero_fit = hurdle_fit
-
-        self.params = np.concatenate((
-            np.asarray(positive_fit.params, dtype=float),
-            np.asarray(hurdle_fit.params, dtype=float),
-        ))
-        self.x = self.params.copy()
-        self.param_names = model.get_param_names()
-        self.cov_params = cov_params
-        self.cov_type = cov_type
-        self.component_cov_type = component_cov_type
-        self.cov_kwds = cov_kwds
-        self.converged = bool(
-            positive_fit.converged and hurdle_fit.converged
-        )
-        self.message = (
-            'Both component GLMs converged.'
-            if self.converged
-            else 'At least one component GLM did not converge.'
-        )
-        self.positive_scale = float(positive_fit.scale)
-        self.scale = self.positive_scale
-        self.llf = float(
-            model.loglike(
-                self.params, positive_scale=self.positive_scale
-            )
-        )
-        self.fun = self.llf
-        self.nobs = model.nobs
-        self.nobs_positive = model.nobs_positive
-        self.nobs_zero = model.nobs_zero
-        self.fittedvalues = model.predict(self.params, which='mean')
-        self.endog_predicted = self.fittedvalues
-        self.zero_probability = model.predict(
-            self.params, which='zero_probability'
-        )
-        self.positive_probability = 1.0 - self.zero_probability
-        self.positive_mean = model.predict(
-            self.params, which='positive_mean'
-        )
-        self.resid = model.endog - self.fittedvalues
-
-        if cov_params is None:
-            self.bse = np.full(len(self.params), np.nan)
-        else:
-            self.bse = np.sqrt(
-                np.clip(np.diag(cov_params), 0.0, np.inf)
-            )
-        self.standard_errors = self.bse
-        with np.errstate(divide='ignore', invalid='ignore'):
-            z_values = self.params / self.bse
-        self.summary_df = pd.DataFrame(
-            {
-                'coef': self.params,
-                'std err': self.bse,
-                'z': z_values,
-                'p>|z|': 2.0 * norm.sf(np.abs(z_values)),
-            },
-            index=self.param_names,
-        )
-
-        # Component bootstraps are intentionally kept separate: combining
-        # their draws would imply cross-block covariance, contrary to the
-        # explicitly block-diagonal hurdle covariance contract.
-        self.positive_bootstrapped_params = getattr(
-            positive_fit, 'bootstrapped_params', None
-        )
-        self.hurdle_bootstrapped_params = getattr(
-            hurdle_fit, 'bootstrapped_params', None
-        )
-        self.bootstrapped_params = None
-
-    def predict(self, *args, **kwargs):
-        """Delegate hurdle predictions to the fitted model."""
-        kwargs.setdefault('params', self.params)
-        return self.model.predict(*args, **kwargs)
-
-    def loglike(self, params=None, **kwargs):
-        """Evaluate the combined log likelihood at supplied or fitted values."""
-        if params is None:
-            params = self.params
-        kwargs.setdefault('positive_scale', self.positive_scale)
-        return self.model.loglike(params, **kwargs)
-
-    def loglike_obs(self, params=None, **kwargs):
-        """Evaluate combined observation log-likelihood contributions."""
-        if params is None:
-            params = self.params
-        kwargs.setdefault('positive_scale', self.positive_scale)
-        return self.model.loglike_obs(params, **kwargs)
-
-    def score(self, params=None, **kwargs):
-        """Evaluate the combined score at supplied or fitted values."""
-        if params is None:
-            params = self.params
-        kwargs.setdefault('positive_scale', self.positive_scale)
-        return self.model.score(params, **kwargs)
-
-    def score_obs(self, params=None, **kwargs):
-        """Evaluate combined observation scores."""
-        if params is None:
-            params = self.params
-        kwargs.setdefault('positive_scale', self.positive_scale)
-        return self.model.score_obs(params, **kwargs)
-
-    def summary(self):
-        """Return a compact text summary of the combined hurdle estimates."""
-        header = (
-            f'{self.model.__class__.__name__} Results\n'
-            f'Nobs: {self.nobs}  Positive: {self.nobs_positive}  '
-            f'Zero: {self.nobs_zero}\n'
-            f'Covariance: {self.cov_type} (component GLM: '
-            f'{self.component_cov_type})  Converged: {self.converged}\n'
-        )
-        return header + self.summary_df.to_string()
-
-    def __str__(self):
-        """Return the compact hurdle-model summary."""
-        return self.summary()
-
-    def __repr__(self):
-        """Return the compact hurdle-model summary."""
-        return self.summary()
+# Hurdle fits use the shared distributional-model result implementation.
+HurdleModelResults = DistributionalModelResults
 
 
 class HurdleModel(_ZeroInflatedModel):
@@ -184,7 +47,7 @@ class HurdleModel(_ZeroInflatedModel):
 
     Subclasses specify the positive GLM family and link.  The inherited
     formula builder accepts ``exog_infl`` as a Patsy-style right-hand-side
-    formula and rejects instruments through the count-model formula parser.
+    formula and rejects instruments through the distributional-model parser.
     """
 
     def __init__(self, *args, **kwargs):
@@ -281,7 +144,7 @@ class HurdleModel(_ZeroInflatedModel):
         For a zero response this is the Bernoulli log probability of zero.
         For a positive response it is the Bernoulli log probability of
         crossing the hurdle plus the positive-family log likelihood.  As with
-        other count models, estimation weights are applied only by
+        other distributional models, estimation weights are applied only by
         :meth:`loglike`, not to this observation-level return value.
         """
         del args, kwargs
@@ -366,7 +229,7 @@ class HurdleModel(_ZeroInflatedModel):
 
     @staticmethod
     def _normalize_cov_type(cov_type):
-        """Map count-model covariance terminology to GLM terminology."""
+        """Map distributional covariance terminology to GLM terminology."""
         cov_type = str(cov_type).upper()
         if cov_type == 'SANDWICH':
             return cov_type, 'HC1'
@@ -417,8 +280,8 @@ class HurdleModel(_ZeroInflatedModel):
             **glm_fit_kwargs: Additional options shared by both GLM fits.
 
         Returns:
-            :class:`HurdleModelResults` containing the two component fits and
-            their combined parameters and covariance.
+            :class:`DistributionalModelResults` containing the two component
+            fits and their combined parameters and covariance.
         """
         display_cov_type, component_cov_type = self._normalize_cov_type(
             cov_type
@@ -523,14 +386,45 @@ class HurdleModel(_ZeroInflatedModel):
             self._component_covariance(positive_fit),
             self._component_covariance(hurdle_fit),
         )
-        return HurdleModelResults(
+        params = np.concatenate((
+            np.asarray(positive_fit.params, dtype=float),
+            np.asarray(hurdle_fit.params, dtype=float),
+        ))
+        converged = bool(positive_fit.converged and hurdle_fit.converged)
+        message = (
+            'Both component GLMs converged.'
+            if converged
+            else 'At least one component GLM did not converge.'
+        )
+        positive_scale = float(positive_fit.scale)
+        return DistributionalModelResults(
             model=self,
+            params=params,
+            llf=self.loglike(params, positive_scale=positive_scale),
+            converged=converged,
+            message=message,
+            method='SEPARATE GLMS',
             positive_fit=positive_fit,
             hurdle_fit=hurdle_fit,
             cov_params=covariance,
             cov_type=display_cov_type,
             component_cov_type=component_cov_type,
             cov_kwds=cov_kwds,
+            fittedvalues=self.predict(params, which='mean'),
+            fit_elapsed=(
+                float(positive_fit.fit_elapsed)
+                + float(hurdle_fit.fit_elapsed)
+            ),
+            cov_elapsed=(
+                float(positive_fit.cov_elapsed)
+                + float(hurdle_fit.cov_elapsed)
+            ),
+            iterations=(positive_fit.num_iter, hurdle_fit.num_iter),
+            score_at_params=self.score(
+                params, positive_scale=positive_scale
+            ),
+            scale=positive_scale,
+            loglike_kwargs={'positive_scale': positive_scale},
         )
 
     def predict(

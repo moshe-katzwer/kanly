@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from scipy.special import expit
 
-from kanly.count_models.count_models import ZeroInflatedPoisson
+from kanly.distributional_models import ZeroInflatedPoisson
 
 
 def main():
@@ -64,7 +64,7 @@ def main():
     print(f'Observed zero fraction: {np.mean(y == 0):.3f}')
     print(f'Mean structural-zero probability: {inflation_probability.mean():.3f}')
     print('\nModel summary:')
-    print(fit.summary_df)
+    print(fit.summary_df())
     print('\nParameter recovery:')
     print(comparison)
 

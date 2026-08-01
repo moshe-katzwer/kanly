@@ -693,6 +693,8 @@ class RegressionResultsBase(TestingResultsBase):
                 test_level = None
 
         tbl = self.summary_df(test_level)
+        statistic_name = 't' if 't' in tbl.columns else 'z'
+        pvalue_name = 'p>|t|' if 'p>|t|' in tbl.columns else 'p>|z|'
         tbl_new = tbl.loc[:, []]
         tbl_new['coef'] = round_list(tbl['coef'], param_sigfigs, uniform_decimal_output)
 
@@ -702,9 +704,9 @@ class RegressionResultsBase(TestingResultsBase):
             if show_std_err:
                 tbl_new['std err'] = round_list(tbl['std err'], std_sigfigs, uniform_decimal_output)
             if show_t:
-                tbl_new['t'] = tbl['t'].round(t_decimals).values
+                tbl_new[statistic_name] = tbl[statistic_name].round(t_decimals).values
             if show_p_values:
-                tbl_new['p>|t|'] = [z if not np.isfinite(z) or z > .001 else "<0.001" for z in self._pvalues.round(3)]
+                tbl_new[pvalue_name] = [z if not np.isfinite(z) or z > .001 else "<0.001" for z in self._pvalues.round(3)]
             if show_CI:
                 tbl_new[f'[{"%.3f" % (test_level / 2)}, '] \
                     = round_list(tbl[f'[{"%.3f" % (test_level / 2)}, '], ci_sigfigs, uniform_decimal_output)

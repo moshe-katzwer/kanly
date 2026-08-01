@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from scipy.special import expit
 
-from kanly.count_models.hurdle_models import PoissonHurdle
+from kanly.distributional_models import PoissonHurdle
 
 
 def sample_zero_truncated_poisson(rng, rate):
@@ -67,7 +67,9 @@ def main():
     )
 
     k_positive = len(beta)
-    cross_covariance = fit.cov_params[:k_positive, k_positive:]
+    cross_covariance = np.asarray(fit.cov_params())[
+        :k_positive, k_positive:
+    ]
     max_cross_covariance = np.max(np.abs(cross_covariance))
 
     print(f'Observed zero fraction: {np.mean(y == 0):.3f}')
@@ -78,7 +80,7 @@ def main():
           f'{fit.hurdle_fit.link.name()}')
     print(f'Positive GLM scale: {fit.positive_scale:.1f}')
     print('\nCombined model summary:')
-    print(fit.summary_df)
+    print(fit.summary_df())
     print('\nParameter recovery:')
     print(comparison)
     print('\nMaximum absolute cross-block covariance: '

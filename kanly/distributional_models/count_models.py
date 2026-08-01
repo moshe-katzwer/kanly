@@ -1,20 +1,20 @@
-"""Likelihood-based regression models for count and positive response data.
+"""Likelihood-based regression models for count response data.
 
-The module provides a shared :class:`CountModel` estimation interface plus
-Poisson, generalized-Poisson, negative-binomial, and Gamma likelihoods.  All
-models support optional observation-level likelihood weights, formula-based
-construction, analytical observation scores where available, classical or
-sandwich covariance estimation, and Bayesian-bootstrap covariance estimation.
+The module provides the shared :class:`DistributionalModel` estimation
+interface plus Poisson, generalized-Poisson, negative-binomial, and
+zero-inflated count likelihoods. All models support optional observation-level
+likelihood weights, formula-based construction, analytical observation scores
+where available, classical or sandwich covariance estimation, and
+Bayesian-bootstrap covariance estimation.
 """
 
 from __future__ import absolute_import, print_function
 
 from abc import ABC, abstractmethod
+import time
 import numpy as np
-import pandas as pd
 
 from scipy.special import digamma, expit, gammaln
-from scipy.stats import norm
 from kanly.api import bfgs_pqn
 from kanly.bootstrap.bootstrap import (
     DEFAULT_BB_ALPHA, DEFAULT_BB_SEED, DEFAULT_BOOTSTRAP_N_SAMPLES,
@@ -27,10 +27,11 @@ from kanly.formula.keys import (
     HAS_INTERCEPT_KEY, INDEX_KEY, NULL_ROWS_INFO_DICT_KEY, TIME_ELAPSED_KEY,
     VALID_OBS_ROWS_KEY, WEIGHTS_KEY,
 )
+from kanly.distributional_models.results import DistributionalModelResults
 from kanly.utils.util import dict_2_dataframe
 
 
-class CountModel(ABC):
+class DistributionalModel(ABC):
     """Abstract base class for likelihood-based response models.
 
     Subclasses provide observation log-likelihoods, parameter names, and,
@@ -145,7 +146,7 @@ class CountModel(ABC):
 
         Returns:
             Dictionary containing model data, names, and formula metadata that
-            can be passed directly to a count-model constructor.
+            can be passed directly to a distributional-model constructor.
         """
         result = SparseDataGetter.get_data(
             data=data, formula=formula, index=index, debug=debug,
@@ -170,7 +171,9 @@ class CountModel(ABC):
         endog = np.asarray(endog)
         exog = np.asarray(exog)
         if endog.ndim != 2 or endog.shape[1] != 1:
-            raise ValueError("Count models require exactly one outcome column")
+            raise ValueError(
+                "Distributional models require exactly one outcome column"
+            )
         endog = endog.reshape(-1)
 
         if weights_obj is None:
@@ -267,6 +270,40 @@ class CountModel(ABC):
         if self.exog_names is None:
             return [f'x{i}' for i in range(self.exog.shape[1])]
         return [str(name) for name in self.exog_names]
+
+    def predict(
+            self, params, exog=None, exog_infl=None, which='mean'):
+        """Predict log-link conditional means from a numeric design matrix.
+
+        Args:
+            params: Full model parameter vector.  Distribution parameters
+                following the regression coefficients are ignored here.
+            exog: Optional numeric prediction design; defaults to fitted exog.
+            exog_infl: Unused for one-part models; accepted for a common
+                results interface.
+            which: ``'mean'`` or ``'linear_predictor'``.
+        """
+        del exog_infl
+        params = np.asarray(params, dtype=float).reshape(-1)
+        exog = self.exog if exog is None else np.asarray(exog, dtype=float)
+        if exog.ndim == 1:
+            exog = exog[None, :]
+        if exog.ndim != 2 or exog.shape[1] != self.exog.shape[1]:
+            raise ValueError('exog has the wrong number of columns')
+        if len(params) != len(self.param_names):
+            raise ValueError('params has the wrong length')
+
+        linear_predictor = exog @ params[:self.exog.shape[1]]
+        with np.errstate(over='ignore', invalid='ignore'):
+            mean = np.exp(linear_predictor)
+        predictions = {
+            'mean': mean,
+            'linear_predictor': linear_predictor,
+        }
+        which = str(which).lower()
+        if which not in predictions:
+            raise ValueError("which must be 'mean' or 'linear_predictor'")
+        return predictions[which]
 
     @abstractmethod
     def get_param_names(self):
@@ -404,7 +441,8 @@ class CountModel(ABC):
         method = str(cov_kwds.get('method', 'BAYESIAN')).upper()
         if method != 'BAYESIAN':
             raise ValueError(
-                "CountModel bootstrap covariance currently supports only "
+                "DistributionalModel bootstrap covariance currently supports "
+                "only "
                 "method='BAYESIAN'"
             )
 
@@ -484,25 +522,30 @@ class CountModel(ABC):
             )
         cov_kwds = {} if cov_kwds is None else dict(cov_kwds)
 
-        result = self._fit_internal(
+        fit_start = time.perf_counter()
+        optimization_result = self._fit_internal(
             start_params, weights=self.weights, debug=debug
         )
+        fit_elapsed = time.perf_counter() - fit_start
 
         bootstrapped_params = None
         bootstrap_string = None
+        covariance_start = time.perf_counter()
         if cov_type == 'BOOTSTRAP':
             information = None
             bread = None
             meat = None
             cov_params, bootstrapped_params, cov_kwds = (
-                self._bayesian_bootstrap(result.x, cov_kwds, debug=debug)
+                self._bayesian_bootstrap(
+                    optimization_result.x, cov_kwds, debug=debug
+                )
             )
             bootstrap_string = (
                 f"Did {len(bootstrapped_params)} Bayesian bootstrap "
                 f"repetitions, alpha={cov_kwds['alpha']:.3f}."
             )
         else:
-            hess = self.hessian(result.x)
+            hess = self.hessian(optimization_result.x)
             information = -hess
             try:
                 bread = np.linalg.inv(information)
@@ -511,7 +554,7 @@ class CountModel(ABC):
             bread = (bread + bread.T) / 2.0
 
             if cov_type == 'SANDWICH':
-                score_obs = self.score_obs(result.x)
+                score_obs = self.score_obs(optimization_result.x)
                 if self.is_weighted:
                     score_obs = (
                         score_obs * np.asarray(self.weights)[:, None]
@@ -522,35 +565,34 @@ class CountModel(ABC):
             else:
                 meat = None
                 cov_params = bread.copy()
+        cov_elapsed = time.perf_counter() - covariance_start
 
-        result.model = self
-        result.params = result.x.copy()
-        result.param_names = self.get_param_names()
-        result.information = information
-        result.bread = bread
-        result.meat = meat
-        result.cov_params = cov_params
-        result.bse = np.sqrt(np.clip(np.diag(cov_params), 0.0, np.inf))
-        result.standard_errors = result.bse
-        result.cov_type = cov_type
-        result.cov_kwds = cov_kwds
-        result.bootstrapped_params = bootstrapped_params
-        result.bootstrap_string = bootstrap_string
-
-        result.summary_df = pd.DataFrame(
-            {
-                'coef': result.params,
-                'std err': result.bse,
-                'z': result.params / result.bse,
-                'p>|z|': 2*norm.sf(np.abs(result.params) / result.bse),
-            },
-            index=self.param_names
+        params = np.asarray(optimization_result.x, dtype=float)
+        return DistributionalModelResults(
+            model=self,
+            params=params,
+            cov_params=cov_params,
+            cov_type=cov_type,
+            cov_kwds=cov_kwds,
+            llf=self.loglike(params),
+            converged=optimization_result.converged,
+            message=optimization_result.message,
+            method='BFGS-PQN',
+            optimization_result=optimization_result,
+            information=information,
+            bread=bread,
+            meat=meat,
+            bootstrapped_params=bootstrapped_params,
+            bootstrap_string=bootstrap_string,
+            fit_elapsed=fit_elapsed,
+            cov_elapsed=cov_elapsed,
+            iterations=optimization_result.iter,
+            score_at_params=self.score(params),
+            scale=1.0,
         )
 
-        return result
 
-
-class Poisson(CountModel):
+class Poisson(DistributionalModel):
     """Poisson log-link regression with conditional mean ``exp(X beta)``.
 
     The model has no separately estimated dispersion parameter.  It accepts
@@ -587,7 +629,7 @@ class Poisson(CountModel):
         return self._loglike_obs(params)
 
 
-class _ZeroInflatedModel(CountModel):
+class _ZeroInflatedModel(DistributionalModel):
     """Shared data handling and mixture algebra for zero-inflated models.
 
     ``exog_infl`` controls the probability that an observation is a structural
@@ -617,7 +659,7 @@ class _ZeroInflatedModel(CountModel):
             exog_infl_term_names: Terms represented by ``exog_infl``.
             exog_infl_term_to_indices: Mapping from inflation terms to columns.
             **model_metadata: Remaining metadata accepted by
-                :class:`CountModel`.
+                :class:`DistributionalModel`.
         """
         endog = np.asarray(endog, dtype=float)
         if endog.ndim != 1:
@@ -831,6 +873,73 @@ class _ZeroInflatedModel(CountModel):
             return ['inflate_const']
         return [f'inflate_x{i}' for i in range(self.k_inflate)]
 
+    def _count_zero_probability(self, params, count_mean):
+        """Return the count component's probability of zero."""
+        raise NotImplementedError
+
+    def predict(
+            self, params, exog=None, exog_infl=None, which='mean'):
+        """Predict mixture means and structural or observed-zero probabilities.
+
+        Args:
+            params: Full count-then-inflation parameter vector.
+            exog: Optional count-component numeric design matrix.
+            exog_infl: Optional structural-zero numeric design matrix.
+            which: ``'mean'``, ``'count_mean'``,
+                ``'inflation_probability'``, ``'zero_probability'``, or
+                ``'positive_probability'``.
+        """
+        params = np.asarray(params, dtype=float).reshape(-1)
+        if len(params) != len(self.param_names):
+            raise ValueError('params has the wrong length')
+        exog = self.exog if exog is None else np.asarray(exog, dtype=float)
+        exog_infl = (
+            self.exog_infl
+            if exog_infl is None
+            else np.asarray(exog_infl, dtype=float)
+        )
+        if exog.ndim == 1:
+            exog = exog[None, :]
+        if exog_infl.ndim == 1:
+            exog_infl = exog_infl[None, :]
+        if exog.ndim != 2 or exog.shape[1] != self.exog.shape[1]:
+            raise ValueError('exog has the wrong number of columns')
+        if (exog_infl.ndim != 2
+                or exog_infl.shape[1] != self.exog_infl.shape[1]):
+            raise ValueError('exog_infl has the wrong number of columns')
+        if exog.shape[0] != exog_infl.shape[0]:
+            raise ValueError(
+                'exog and exog_infl must contain the same number of rows'
+            )
+
+        count_params = params[:self.exog.shape[1]]
+        inflation_start = self.exog.shape[1]
+        inflation_params = params[
+            inflation_start:inflation_start + self.k_inflate
+        ]
+        with np.errstate(over='ignore', invalid='ignore'):
+            count_mean = np.exp(exog @ count_params)
+        inflation_probability = expit(exog_infl @ inflation_params)
+        count_zero_probability = self._count_zero_probability(
+            params, count_mean
+        )
+        zero_probability = (
+            inflation_probability
+            + (1.0 - inflation_probability) * count_zero_probability
+        )
+        predictions = {
+            'mean': (1.0 - inflation_probability) * count_mean,
+            'count_mean': count_mean,
+            'inflation_probability': inflation_probability,
+            'zero_probability': zero_probability,
+            'positive_probability': 1.0 - zero_probability,
+        }
+        which = str(which).lower()
+        if which not in predictions:
+            choices = ', '.join(sorted(predictions))
+            raise ValueError(f'which must be one of: {choices}')
+        return predictions[which]
+
     def _mixture_terms(self, inflation_params, count_loglike,
                        count_loglike_zero):
         """Combine a count distribution with a structural-zero process.
@@ -889,6 +998,11 @@ class ZeroInflatedPoisson(_ZeroInflatedModel):
             self._get_regression_param_names()
             + self._get_inflation_param_names()
         )
+
+    def _count_zero_probability(self, params, count_mean):
+        """Return the Poisson component probability of a zero count."""
+        del params
+        return np.exp(-count_mean)
 
     def _model_terms(self, params):
         """Compute mixture likelihood and both linear-predictor scores."""
@@ -970,6 +1084,12 @@ class ZeroInflatedNegativeBinomial(_ZeroInflatedModel):
             + self._get_inflation_param_names()
             + ['log_alpha']
         )
+
+    def _count_zero_probability(self, params, count_mean):
+        """Return the NB-2 component probability of a zero count."""
+        alpha = np.exp(np.asarray(params, dtype=float)[-1])
+        with np.errstate(over='ignore', invalid='ignore'):
+            return np.exp(-np.log1p(alpha * count_mean) / alpha)
 
     def _distribution_terms(self, params):
         """Compute stable NB-2 terms and split the two coefficient vectors."""
@@ -1107,121 +1227,7 @@ class ZeroInflatedNegativeBinomial(_ZeroInflatedModel):
         return self._loglike_obs(params)
 
 
-class Gamma(CountModel):
-    """Gamma regression for strictly positive continuous outcomes.
-
-    The conditional mean is ``mu = exp(exog @ beta)`` and the variance is
-    ``alpha * mu ** 2``.  The final estimated parameter is ``log_alpha``, so
-    the implied dispersion and Gamma shape are always positive:
-    ``alpha = exp(log_alpha)`` and ``shape = 1 / alpha``.
-
-    This model inherits the count-model estimation interface for convenience,
-    although the Gamma response is continuous rather than a count.
-    """
-
-    def __init__(
-            self, endog, exog, weights=None, endog_name=None,
-            exog_names=None, weights_name=None, **model_metadata):
-        """Initialize Gamma data, names, metadata, and positive support."""
-        endog = np.asarray(endog, dtype=float)
-        if endog.ndim != 1:
-            raise ValueError("Gamma outcomes must be one-dimensional")
-        if np.any(~np.isfinite(endog)) or np.any(endog <= 0.0):
-            raise ValueError("Gamma outcomes must be finite and strictly positive")
-        super().__init__(
-            endog,
-            exog,
-            weights=weights,
-            endog_name=endog_name,
-            exog_names=exog_names,
-            weights_name=weights_name,
-            **model_metadata,
-        )
-        self._log_endog = np.log(self.endog)
-
-    def get_param_names(self):
-        """Return coefficient names followed by ``log_alpha``."""
-        return self._get_regression_param_names() + ['log_alpha']
-
-    def _distribution_terms(self, params):
-        """Compute the linear predictor, shape, response ratio, and validity.
-
-        Returns:
-            Tuple ``(eta, shape, y_over_mu, valid)`` where ``valid`` is an
-            observation-level support and finite-value mask.
-        """
-        eta = self.exog @ params[:-1]
-        log_alpha = params[-1]
-        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
-            shape = np.exp(-log_alpha)
-            ratio = np.exp(self._log_endog - eta)
-        valid = (
-            np.isfinite(eta)
-            & np.isfinite(ratio)
-            & np.isfinite(shape)
-            & (shape > 0.0)
-        )
-        return eta, shape, ratio, valid
-
-    def _loglike_obs(self, params):
-        """Compute unweighted Gamma log-density contributions."""
-        eta, shape, ratio, valid = self._distribution_terms(params)
-        safe_shape = shape if np.isfinite(shape) and shape > 0.0 else 1.0
-        safe_eta = np.where(valid, eta, 0.0)
-        safe_ratio = np.where(valid, ratio, 1.0)
-        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
-            llf_obs = (
-                safe_shape * np.log(safe_shape)
-                - gammaln(safe_shape)
-                + (safe_shape - 1.0) * self._log_endog
-                - safe_shape * safe_eta
-                - safe_shape * safe_ratio
-            )
-        return np.where(valid, llf_obs, -np.inf)
-
-    def _score_factors(self, params):
-        """Compute derivatives with respect to ``eta`` and ``log_alpha``."""
-        eta, shape, ratio, valid = self._distribution_terms(params)
-        safe_shape = shape if np.isfinite(shape) and shape > 0.0 else 1.0
-        safe_eta = np.where(valid, eta, 0.0)
-        safe_ratio = np.where(valid, ratio, 1.0)
-        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
-            d_eta = safe_shape * (safe_ratio - 1.0)
-            d_log_alpha = safe_shape * (
-                digamma(safe_shape)
-                - np.log(safe_shape)
-                - 1.0
-                - self._log_endog
-                + safe_eta
-                + safe_ratio
-            )
-        return (
-            np.where(valid, d_eta, np.nan),
-            np.where(valid, d_log_alpha, np.nan),
-        )
-
-    def loglike(self, params, *args, **kwargs):
-        """Return the weighted or unweighted Gamma log-likelihood."""
-        return self._weighted_sum(self._loglike_obs(params))
-
-    def score(self, params, *args, **kwargs):
-        """Return the analytical score of the aggregated Gamma likelihood."""
-        d_eta, d_log_alpha = self._score_factors(params)
-        self._apply_weights(d_eta)
-        self._apply_weights(d_log_alpha)
-        return np.append(self.exog.T @ d_eta, d_log_alpha.sum())
-
-    def score_obs(self, params, *args, **kwargs):
-        """Return unweighted Gamma scores for every observation."""
-        d_eta, d_log_alpha = self._score_factors(params)
-        return np.column_stack((self.exog * d_eta[:, None], d_log_alpha))
-
-    def loglike_obs(self, params, *args, **kwargs):
-        """Return one unweighted Gamma log-density value per observation."""
-        return self._loglike_obs(params)
-
-
-class GeneralizedPoisson(CountModel):
+class GeneralizedPoisson(DistributionalModel):
     """Generalized-Poisson regression with raw dispersion ``alpha``.
 
     ``p=1`` gives GP-1 with variance ``mu * (1 + alpha) ** 2``;
@@ -1245,7 +1251,7 @@ class GeneralizedPoisson(CountModel):
             exog_names: Optional regression coefficient names.
             weights_name: Optional likelihood-weight variable name.
             **model_metadata: Remaining metadata accepted by
-                :class:`CountModel`.
+                :class:`DistributionalModel`.
         """
         if not np.isscalar(p) or not np.isfinite(p) or p <= 0:
             raise ValueError("p must be a finite positive scalar")
@@ -1376,7 +1382,7 @@ class GeneralizedPoisson(CountModel):
         return self._loglike_obs(params)
 
 
-class NegativeBinomial1(CountModel):
+class NegativeBinomial1(DistributionalModel):
     """NB-1 log-link regression with variance ``mu * (1 + alpha)``.
 
     The conditional mean is ``mu = exp(X beta)`` and
@@ -1442,7 +1448,7 @@ class NegativeBinomial1(CountModel):
         return self._loglike_obs(params)
 
 
-class NegativeBinomial2(CountModel):
+class NegativeBinomial2(DistributionalModel):
     """NB-2 log-link regression with variance ``mu + alpha * mu ** 2``.
 
     The conditional mean is ``mu = exp(X beta)`` and
@@ -1504,11 +1510,20 @@ class NegativeBinomial2(CountModel):
         return self._loglike_obs(params)
 
 
+__all__ = [
+    'DistributionalModel',
+    'Poisson',
+    'GeneralizedPoisson',
+    'NegativeBinomial1',
+    'NegativeBinomial2',
+    'ZeroInflatedPoisson',
+    'ZeroInflatedNegativeBinomial',
+]
+
+
 if __name__ == '__main__':
     np.random.seed(0)
     n = 40
-    from kanly.api import GLM
-    import pandas as pd
     x = np.exp(np.random.randn(n))
     v = .05
     y = (np.exp(.2) * x ** .8) * np.exp(v * np.random.randn(n)) * np.exp(-v**2/2)
@@ -1517,10 +1532,10 @@ if __name__ == '__main__':
 
     poisson = Poisson.build_model_from_formula('y ~ np.log(x) $ w', dict(x=x,y=y,w=w))
     fit = poisson.fit([.1] * X.shape[1], cov_type='bootstrap')
-    print(fit.summary_df)
+    print(fit.summary_df())
 
     poisson = GeneralizedPoisson.build_model_from_formula('y ~ np.log(x) $ w', dict(x=x,y=y,w=w))
     fit = poisson.fit([.1] * 3, cov_type='bootstrap', cov_kwds={'n_samples': 1000})
-    print(fit.summary_df)
+    print(fit.summary_df())
 
     #print(GLM(y, X, var_weights=w, family='poisson', cov_type='hc1'))

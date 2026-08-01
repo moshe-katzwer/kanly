@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from scipy.special import expit
 
-from kanly.count_models.hurdle_models import GammaHurdle
+from kanly.distributional_models import GammaHurdle
 
 
 def main():
@@ -59,7 +59,9 @@ def main():
     )
 
     k_positive = len(beta)
-    cross_covariance = fit.cov_params[:k_positive, k_positive:]
+    cross_covariance = np.asarray(fit.cov_params())[
+        :k_positive, k_positive:
+    ]
     max_cross_covariance = np.max(np.abs(cross_covariance))
 
     print(f'Observed zero fraction: {np.mean(y == 0):.3f}')
@@ -73,7 +75,7 @@ def main():
     print(f'Covariance: {fit.cov_type} '
           f'(component GLM type: {fit.component_cov_type})')
     print('\nCombined model summary:')
-    print(fit.summary_df)
+    print(fit.summary_df())
     print('\nParameter recovery:')
     print(comparison)
     print('\nMaximum absolute cross-block covariance: '

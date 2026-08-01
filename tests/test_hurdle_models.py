@@ -5,7 +5,11 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from kanly.count_models.hurdle_models import GammaHurdle, PoissonHurdle
+from kanly.distributional_models import (
+    DistributionalModelResults,
+    GammaHurdle,
+    PoissonHurdle,
+)
 from kanly.regression.generalized_linear_models.families import (
     Bernoulli,
     Gamma,
@@ -62,6 +66,8 @@ class TestHurdleModels(unittest.TestCase):
         )
         fit = model.fit(np.zeros(4), cov_type='NONROBUST')
 
+        self.assertIsInstance(fit, DistributionalModelResults)
+        self.assertEqual(fit.get_result_type(), 'HURDLE')
         self.assertTrue(fit.converged)
         self.assertIsInstance(fit.positive_fit.family, ZeroTruncatedPoisson)
         self.assertIsInstance(fit.hurdle_fit.family, Bernoulli)
@@ -79,10 +85,13 @@ class TestHurdleModels(unittest.TestCase):
 
         positive_cov = np.asarray(fit.positive_fit.cov_params())
         hurdle_cov = np.asarray(fit.hurdle_fit.cov_params())
-        np.testing.assert_allclose(fit.cov_params[:2, :2], positive_cov)
-        np.testing.assert_allclose(fit.cov_params[2:, 2:], hurdle_cov)
-        np.testing.assert_array_equal(fit.cov_params[:2, 2:], 0.0)
-        np.testing.assert_array_equal(fit.cov_params[2:, :2], 0.0)
+        covariance = np.asarray(fit.cov_params())
+        np.testing.assert_allclose(covariance[:2, :2], positive_cov)
+        np.testing.assert_allclose(covariance[2:, 2:], hurdle_cov)
+        np.testing.assert_array_equal(covariance[:2, 2:], 0.0)
+        np.testing.assert_array_equal(covariance[2:, :2], 0.0)
+        self.assertIn('PoissonHurdle Results', fit.summary())
+        self.assertIn('block diagonal', fit.summary())
 
         np.testing.assert_allclose(
             fit.llf,
@@ -120,6 +129,7 @@ class TestHurdleModels(unittest.TestCase):
         )
         fit = model.fit(np.zeros(4), cov_type='SANDWICH')
 
+        self.assertIsInstance(fit, DistributionalModelResults)
         self.assertTrue(fit.converged)
         self.assertEqual(fit.cov_type, 'SANDWICH')
         self.assertEqual(fit.component_cov_type, 'HC1')
@@ -132,7 +142,9 @@ class TestHurdleModels(unittest.TestCase):
             fit.params[2:], hurdle_params, atol=0.1
         )
         self.assertAlmostEqual(fit.scale, 1.0 / shape, delta=0.04)
-        np.testing.assert_array_equal(fit.cov_params[:2, 2:], 0.0)
+        np.testing.assert_array_equal(
+            np.asarray(fit.cov_params())[:2, 2:], 0.0
+        )
 
         expected_mean = (
             (1.0 - fit.zero_probability) * fit.positive_mean

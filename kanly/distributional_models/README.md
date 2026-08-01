@@ -1,29 +1,52 @@
-# Count Models User Guide
+# Distributional Models User Guide
 
 **See also:** [kanly README](../../README.md) ·
 [formula guide](../formula/README.md) ·
 [generalized linear models](../regression/generalized_linear_models/README.md)
-
-> **Naming note:** Despite the package name, `count_models` contains
-> likelihood-based distributional models more broadly. Not every response
-> distribution in this package is discrete: for example, `Gamma` models a
-> strictly positive continuous response, and hurdle models may combine a
-> discrete zero process with either a discrete or continuous positive-response
-> distribution. Treat “count models” as the current package name rather than a
-> restriction on response support.
 
 This package provides compact, likelihood-based regression models for counts
 and positive continuous outcomes. Unlike the IRLS generalized-linear-model
 implementation, these classes jointly optimize all parameters in their
 likelihood, including Gamma and negative-binomial dispersion parameters.
 
-The core likelihood models are implemented in
-[`count_models.py`](count_models.py), and GLM-composed hurdle models are in
-[`hurdle_models.py`](hurdle_models.py).
+The public base class is `DistributionalModel`. Source files are organized by
+response structure:
 
-## Available Models
+- [`count_models.py`](count_models.py) contains the base class and discrete
+  count, zero-inflated, and negative-binomial likelihoods.
+- [`continuous_models.py`](continuous_models.py) contains the continuous
+  `Gamma` likelihood model.
+- [`hurdle_models.py`](hurdle_models.py) contains GLM-composed Poisson and
+  Gamma hurdle models.
+- [`results.py`](results.py) contains the shared fitted-results object.
 
-Every model uses a log link for the conditional mean:
+All public model classes can be imported directly from
+`kanly.distributional_models`.
+
+## Public API and Available Models
+
+```python
+from kanly.distributional_models import (
+    DistributionalModel,
+    DistributionalModelResults,
+    Gamma,
+    GammaHurdle,
+    GeneralizedPoisson,
+    NegativeBinomial1,
+    NegativeBinomial2,
+    Poisson,
+    PoissonHurdle,
+    ZeroInflatedNegativeBinomial,
+    ZeroInflatedPoisson,
+)
+```
+
+`DistributionalModel` supplies formula construction, likelihood weighting,
+optimization, observation scores, covariance estimation, bootstrap refits,
+and common prediction behavior. Concrete subclasses provide the distribution
+likelihood and parameter names.
+
+Direct models and count components use a log link for the conditional mean:
 
 ```text
 eta_i = x_i' beta
@@ -47,8 +70,10 @@ For models reporting `log_alpha`, the positive dispersion is
 `alpha = exp(log_alpha)`. Generalized Poisson estimates raw `alpha` because
 valid negative values permit underdispersion.
 
-`Gamma` shares the estimation interface but is not a count distribution. Its
-outcome must be finite and strictly positive.
+`Gamma`, imported from `continuous_models.py`, is a continuous distribution;
+its outcome must be finite and strictly positive. Zero-inflation and hurdle
+probabilities use a logit. `GammaHurdle` uses a log positive-response link by
+default and permits another supported GLM link through `positive_link`.
 
 ## Basic Formula API
 
@@ -57,7 +82,7 @@ Build a model and then call `fit`:
 ```python
 import numpy as np
 
-from kanly.count_models.count_models import NegativeBinomial2
+from kanly.distributional_models import NegativeBinomial2
 
 model = NegativeBinomial2.build_model_from_formula(
     "y ~ x + I(z**2) $ weight",
@@ -69,7 +94,7 @@ fit = model.fit(
     cov_type="SANDWICH",
 )
 
-print(fit.summary_df)
+print(fit.summary_df())
 ```
 
 The `$` formula extension supplies optional observation likelihood weights.
@@ -103,7 +128,7 @@ or the ordinary count component.
 The count and inflation equations are supplied separately:
 
 ```python
-from kanly.count_models.count_models import ZeroInflatedPoisson
+from kanly.distributional_models import ZeroInflatedPoisson
 
 model = ZeroInflatedPoisson.build_model_from_formula(
     "orders ~ price + promotion $ weight",
@@ -134,7 +159,7 @@ such as `inflate_Intercept`, `inflate_customer_age`, and
 `inflate_C(region)[...]`.
 
 A complete parameter-recovery simulation is available in
-[`example_zero_inflated_poisson.py`](../../examples/count_models/example_zero_inflated_poisson.py).
+[`example_zero_inflated_poisson.py`](../../examples/distributional_models/example_zero_inflated_poisson.py).
 
 ## Hurdle Models
 
@@ -155,7 +180,7 @@ already has support on `(0, infinity)`; its positive conditional mean uses a
 log link by default.
 
 ```python
-from kanly.count_models.hurdle_models import PoissonHurdle
+from kanly.distributional_models import PoissonHurdle
 
 model = PoissonHurdle.build_model_from_formula(
     "orders ~ price + promotion $ weight",
@@ -164,7 +189,7 @@ model = PoissonHurdle.build_model_from_formula(
 )
 fit = model.fit(cov_type="SANDWICH")
 
-print(fit.summary_df)
+print(fit.summary_df())
 print(fit.positive_fit)  # positive-response GLM
 print(fit.hurdle_fit)    # Bernoulli/logit GLM for P(Y=0)
 ```
@@ -182,24 +207,25 @@ block diagonal and preserves the covariance block from each component fit.
 
 The combined object provides `loglike`, `loglike_obs`, `score`, `score_obs`,
 and predictions for the overall mean, conditional positive mean, zero
-probability, or positive probability. The combined count-model API keeps
-`loglike_obs` and `score_obs` unweighted and applies observation weights only
-when aggregating them. During component estimation those weights are supplied
-through the GLM variance-weight interface. This is identical to likelihood
-weighting for fixed-scale Bernoulli and zero-truncated Poisson; the Gamma
-component's fitted scale and native covariance retain the usual GLM
+probability, or positive probability. The combined distributional-model API
+keeps `loglike_obs` and `score_obs` unweighted and applies observation weights
+only when aggregating them. During component estimation those weights are
+supplied through the GLM variance-weight interface. This is identical to
+likelihood weighting for fixed-scale Bernoulli and zero-truncated Poisson; the
+Gamma component's fitted scale and native covariance retain the usual GLM
 precision-weight interpretation.
 
 Complete parameter-recovery examples are available for both
-[`PoissonHurdle`](../../examples/count_models/example_poisson_hurdle.py) and
-[`GammaHurdle`](../../examples/count_models/example_gamma_hurdle.py).
+[`PoissonHurdle`](../../examples/distributional_models/example_poisson_hurdle.py)
+and
+[`GammaHurdle`](../../examples/distributional_models/example_gamma_hurdle.py).
 
 ## Array API
 
 Construct models directly when matrices have already been prepared:
 
 ```python
-from kanly.count_models.count_models import ZeroInflatedNegativeBinomial
+from kanly.distributional_models import ZeroInflatedNegativeBinomial
 
 model = ZeroInflatedNegativeBinomial(
     endog=y,
@@ -341,7 +367,7 @@ Bootstrap results expose:
 
 ```python
 fit.bootstrapped_params
-fit.cov_params
+fit.cov_params()
 fit.bse
 fit.cov_kwds["n_successful"]
 fit.cov_kwds["n_failed"]
@@ -350,20 +376,31 @@ fit.cov_kwds["n_failed"]
 The model's original likelihood weights are restored after every refit,
 including when optimization fails.
 
-## Result Attributes
+## Results
 
-The optimizer result returned by `fit` is augmented with common inference
-attributes:
+Every count, zero-inflated, Gamma, and hurdle fit returns a
+`DistributionalModelResults` object derived from the package-wide
+`RegressionResultsBase`. The raw BFGS result remains available as
+`fit.optimization_result`; hurdle component GLM results remain available as
+`fit.positive_fit` and `fit.hurdle_fit`.
 
 | Attribute | Meaning |
 |---|---|
 | `params` | Estimated parameters |
 | `param_names` | Names in estimation order |
-| `cov_params` | Estimated parameter covariance |
+| `cov_params()` | Named estimated parameter covariance DataFrame |
 | `bse` / `standard_errors` | Standard errors |
 | `cov_type` | Selected covariance estimator |
 | `cov_kwds` | Covariance/bootstrap options and diagnostics |
-| `summary_df` | Coefficient, standard error, z statistic, and p-value table |
+| `summary_df()` | Coefficient, standard error, z statistic, p-value, and CI table |
+| `llf` / `average_loglike` | Total and per-observation fitted log likelihood |
+| `aic` / `bic` | Information criteria using every estimated parameter |
+| `fittedvalues` / `resid_response` | Unconditional fitted means and response residuals |
+| `dispersion` | Transformed dispersion for Gamma, NB-1, NB-2, and ZINB, or raw GP alpha |
+| `zero_probability` / `positive_probability` | Fitted outcome probabilities for two-part models |
+| `inflation_probability` / `count_mean` | ZIP/ZINB structural-zero probability and count-component mean |
+| `positive_fit` / `hurdle_fit` | Original component GLM results for hurdle models |
+| `optimization_result` | Original BFGS-PQN result for direct-likelihood models |
 | `bread` | Inverse observed information for non-bootstrap covariance |
 | `meat` | Score cross-product for sandwich covariance |
 | `bootstrapped_params` | Retained bootstrap draws, if requested |
@@ -371,7 +408,8 @@ attributes:
 Example:
 
 ```python
-print(fit.summary_df)
+print(fit.summary())
+print(fit.summary_df())
 print(fit.params)
 print(fit.bse)
 ```
@@ -391,7 +429,7 @@ print(fit.bse)
   Invalid trial parameters receive `-inf` likelihood so the optimizer rejects
   them.
 
-## Count Models Versus GLMs
+## Distributional Models Versus GLMs
 
 Use this package when you need joint maximum-likelihood estimation of
 dispersion, zero inflation, or the complete weighted observation likelihood.
@@ -403,7 +441,7 @@ features, or GLM marginal effects.
 
 Important differences include:
 
-| Feature | `count_models` | GLM package |
+| Feature | `distributional_models` | GLM package |
 |---|---|---|
 | Optimization | BFGS likelihood optimization | IRLS |
 | NB dispersion | Estimated jointly | Fixed by the user |
