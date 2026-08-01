@@ -4,12 +4,22 @@
 [formula guide](../formula/README.md) ·
 [generalized linear models](../regression/generalized_linear_models/README.md)
 
+> **Naming note:** Despite the package name, `count_models` contains
+> likelihood-based distributional models more broadly. Not every response
+> distribution in this package is discrete: for example, `Gamma` models a
+> strictly positive continuous response, and hurdle models may combine a
+> discrete zero process with either a discrete or continuous positive-response
+> distribution. Treat “count models” as the current package name rather than a
+> restriction on response support.
+
 This package provides compact, likelihood-based regression models for counts
 and positive continuous outcomes. Unlike the IRLS generalized-linear-model
 implementation, these classes jointly optimize all parameters in their
 likelihood, including Gamma and negative-binomial dispersion parameters.
 
-The implementation is in [`count_models.py`](count_models.py).
+The core likelihood models are implemented in
+[`count_models.py`](count_models.py), and GLM-composed hurdle models are in
+[`hurdle_models.py`](hurdle_models.py).
 
 ## Available Models
 
@@ -30,6 +40,8 @@ mu_i = exp(eta_i)
 | `NegativeBinomial2` | NB-2 | `mu + alpha * mu**2` | `log_alpha` |
 | `ZeroInflatedPoisson` | Structural-zero mixture with Poisson counts | Mixture variance | Inflation coefficients |
 | `ZeroInflatedNegativeBinomial` | Structural-zero mixture with NB-2 counts | Mixture variance | Inflation coefficients and `log_alpha` |
+| `PoissonHurdle` | Logit zero hurdle plus zero-truncated Poisson GLM | Two-part model | Hurdle coefficients |
+| `GammaHurdle` | Logit zero hurdle plus Gamma/log GLM | Two-part model | Hurdle coefficients; Pearson GLM scale |
 
 For models reporting `log_alpha`, the positive dispersion is
 `alpha = exp(log_alpha)`. Generalized Poisson estimates raw `alpha` because
@@ -122,7 +134,65 @@ such as `inflate_Intercept`, `inflate_customer_age`, and
 `inflate_C(region)[...]`.
 
 A complete parameter-recovery simulation is available in
-[`example_zero_inflated_poisson.py`](../../examples/regression/generalized_linear_models/example_zero_inflated_poisson.py).
+[`example_zero_inflated_poisson.py`](../../examples/count_models/example_zero_inflated_poisson.py).
+
+## Hurdle Models
+
+Hurdle models assign every zero to a Bernoulli/logit zero process and model
+the positive observations conditionally:
+
+```text
+pi_i = P(Y_i = 0) = expit(z_i' gamma)
+
+P(Y_i = 0) = pi_i
+P(Y_i = y), y > 0 = (1 - pi_i) * f_positive(y | x_i)
+```
+
+Unlike a zero-inflated model, the positive distribution cannot generate a
+zero. `PoissonHurdle` uses the `ZeroTruncatedPoisson` GLM family for the
+positive counts. `GammaHurdle` uses the ordinary Gamma family because Gamma
+already has support on `(0, infinity)`; its positive conditional mean uses a
+log link by default.
+
+```python
+from kanly.count_models.hurdle_models import PoissonHurdle
+
+model = PoissonHurdle.build_model_from_formula(
+    "orders ~ price + promotion $ weight",
+    data=df,
+    exog_infl="customer_age + C(region)",
+)
+fit = model.fit(cov_type="SANDWICH")
+
+print(fit.summary_df)
+print(fit.positive_fit)  # positive-response GLM
+print(fit.hurdle_fit)    # Bernoulli/logit GLM for P(Y=0)
+```
+
+`exog_infl=None` creates an intercept-only zero hurdle. Instruments remain
+unsupported and are rejected by formula construction. Parameters are ordered
+as the positive-response coefficients followed by coefficients named
+`hurdle_...`.
+
+The likelihood is separable, so `fit` estimates the two component GLMs rather
+than jointly optimizing the combined likelihood. The returned covariance is
+block diagonal and preserves the covariance block from each component fit.
+`cov_type="SANDWICH"` maps to the GLM `HC1` estimator; `NONROBUST`, `HC1`, and
+`BOOTSTRAP` are also accepted.
+
+The combined object provides `loglike`, `loglike_obs`, `score`, `score_obs`,
+and predictions for the overall mean, conditional positive mean, zero
+probability, or positive probability. The combined count-model API keeps
+`loglike_obs` and `score_obs` unweighted and applies observation weights only
+when aggregating them. During component estimation those weights are supplied
+through the GLM variance-weight interface. This is identical to likelihood
+weighting for fixed-scale Bernoulli and zero-truncated Poisson; the Gamma
+component's fitted scale and native covariance retain the usual GLM
+precision-weight interpretation.
+
+Complete parameter-recovery examples are available for both
+[`PoissonHurdle`](../../examples/count_models/example_poisson_hurdle.py) and
+[`GammaHurdle`](../../examples/count_models/example_gamma_hurdle.py).
 
 ## Array API
 
@@ -172,6 +242,8 @@ Starting values must contain exactly one entry for every name returned by
 | `NegativeBinomial2` | `beta`, `log_alpha` |
 | `ZeroInflatedPoisson` | count `beta`, inflation `gamma` |
 | `ZeroInflatedNegativeBinomial` | count `beta`, inflation `gamma`, `log_alpha` |
+| `PoissonHurdle` | positive `beta`, hurdle `gamma` |
+| `GammaHurdle` | positive `beta`, hurdle `gamma` |
 
 For a design matrix with `k` columns, a common initial value for a positive
 dispersion is `log_alpha=-1`. A simple NB-2 start is therefore:

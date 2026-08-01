@@ -5,7 +5,7 @@
 
 **Author:** Moshe Katzwer ([`richard.katzwer@gmail.com`](richard.katzwer@gmail.com))
 
-**kanly** is a Python toolkit for statistical modeling with an emphasis on **sparse matrix–first** implementations. It was built initially for **large sparse OLS and instrumental-variables regression**—designs with **tens of millions of rows** and **hundreds of predictors**—using one formula-driven sparse design pipeline. The package has since grown to cover GLM, robust and quantile linear models, nonlinear least squares, GMM, time series (SARIMAX), nonparametrics, **extensive bootstrap inference** (Bayesian bootstrap, classical bootstrap, block/cluster resampling), and **Bayesian** posterior sampling, while keeping the same Patsy-like formula interface.
+**kanly** is a Python toolkit for statistical modeling with an emphasis on **sparse matrix–first** implementations. It was built initially for **large sparse OLS and instrumental-variables regression**—designs with **tens of millions of rows** and **hundreds of predictors**—using one formula-driven sparse design pipeline. The package has since grown to cover GLM, count and other distributional models, robust and quantile linear models, nonlinear least squares, GMM, time series (SARIMAX), nonparametrics, **extensive bootstrap inference** (Bayesian bootstrap, classical bootstrap, block/cluster resampling), and **Bayesian** posterior sampling, while keeping the same Patsy-like formula interface.
 
 Typical applications include:
 
@@ -20,6 +20,12 @@ Typical applications include:
    - A custom modeling syntax for defining large models.  It is analogous to [STAN](https://mc-stan.org/docs/reference-manual/mcmc.html), but generates numba-optimized python code.  (See [`DataModel`](#datamodel-data-block-model-block-then-mcmc) class documentation.)
    - Convenience wrappers for Bayesian Linear Regression, Bayesian GLM, etc..
 - **Generalized linear models (GLM)** — Binomial, Poisson, Gaussian, Gamma, inverse Gaussian, negative binomial; IRLS with optional elastic-net regularization; **generalized additive models (GAM)** via ``gam`` (penalized B-spline smooths — see [GLM README](kanly/regression/generalized_linear_models/README.md#generalized-additive-models-gam)); IV-style formulas with residual inclusion; bootstrap and robust covariances.
+- **Count and distributional models** — Direct likelihood fitting for Poisson,
+  generalized Poisson, negative-binomial, Gamma, zero-inflated, and hurdle
+  models, with jointly estimated dispersion where applicable and classical,
+  sandwich, or bootstrap covariance. Despite the package name, this support
+  includes continuous and mixed discrete/continuous response distributions;
+  see the [count models user guide](kanly/count_models/README.md).
 - **Robust and quantile regression** — M-estimation (IRLS) and quantile regression (IRLS with smooth check losses) at large scale.
 - **Penalized linear models** — Elastic net / LASSO / ridge via coordinate descent with optional OLS refit on selected support.
 - **Bootstrap inference** — Built-in resampling for covariance and tests: **Bayesian bootstrap** (Dirichlet weights), **classical bootstrap** (with-replacement row or cluster resampling), and **block / cluster bootstrap** when observations are correlated within groups. Available on `lm`, `glm`, `qr`, `nlls`, GMM, and related fits via `cov_type='bootstrap'`; optional **Ray** parallelism for large `n_samples`; **joint covariance** across multiple bootstrapped models (`get_joint_bootstrapped_distribution`). See [`kanly/bootstrap/README.md`](kanly/bootstrap/README.md).
@@ -154,6 +160,7 @@ Some utilities (for example `StatisticalTests`) are imported from their submodul
 - [`kanly/automatic_differentiation/README.md`](kanly/automatic_differentiation/README.md)
 - [`kanly/bayes/README.md`](kanly/bayes/README.md)
 - [`kanly/bootstrap/README.md`](kanly/bootstrap/README.md)
+- [`kanly/count_models/README.md`](kanly/count_models/README.md)
 - [`kanly/formula/README.md`](kanly/formula/README.md)
 - [`kanly/nonparametric/README.md`](kanly/nonparametric/README.md)
 - [`kanly/optimize/README.md`](kanly/optimize/README.md)
@@ -225,6 +232,7 @@ Trees such as `kanly/__sandbox__/`, `___to_delete/`, `to_delete2/`, and `wip/` u
 | `kanly/regression/generalized_method_of_moments/`     | `gmm`, `GMM`, `gmm_iv_linear`, `gmm_iv_nonlinear`, `gmm_mle`                                                       | [`kanly/regression/generalized_method_of_moments/README.md`](kanly/regression/generalized_method_of_moments/README.md)         |
 | `kanly/regression/nonlinear_least_squares/`           | `nlls`, `nlls_en`, …                                                                                               | [`kanly/regression/nonlinear_least_squares/README.md`](kanly/regression/nonlinear_least_squares/README.md)                     |
 | `kanly/regression/partial_least_squares/`             | `pls1`, `PLS1`, `PLS2`                                                                                             | [`kanly/regression/partial_least_squares/README.md`](kanly/regression/partial_least_squares/README.md)                         |
+| `kanly/count_models/`                                 | `Poisson`, `Gamma`, negative-binomial, zero-inflated, and hurdle model classes                                     | [`kanly/count_models/README.md`](kanly/count_models/README.md)                                                                 |
 | `kanly/bootstrap/`                                    | `cov_type='bootstrap'` on fits; `get_joint_bootstrapped_distribution`                                              | [`kanly/bootstrap/README.md`](kanly/bootstrap/README.md)                                                                       |
 | `kanly/time_series/` (SARIMAX in `sarimax/`)          | `SARIMAX`, `sarimax`, `ARIMA`, `arima`, `simulate_sarima`, `acf`, `pacf`                                           | [`kanly/time_series/README.md`](kanly/time_series/README.md) — package readme (not under `sarimax/`)                           |
 | `kanly/bayes/`                                        | `bmodel`, `DataModel`, `amha`, `mala`, `blm`, `bayes_lm_model`, …                                                  | [`kanly/bayes/README.md`](kanly/bayes/README.md)                                                                               |
