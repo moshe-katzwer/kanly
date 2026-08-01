@@ -3,7 +3,8 @@
 The first component is a Bernoulli/logit model for the probability of zero.
 Conditional on a positive response, the second component is a Gamma GLM with
 a log link.  Gamma already has support over ``(0, infinity)``, so no further
-truncation normalization is required.
+truncation normalization is required. The positive scale is Pearson-estimated,
+so the combined result is explicitly reported as quasi-likelihood.
 """
 
 import numpy as np
@@ -45,8 +46,8 @@ def main():
         cov_type='SANDWICH',
     )
 
-    # Gamma scale is estimated by the positive GLM and is not an additional
-    # regression coefficient in the combined parameter vector.
+    # Gamma scale is Pearson-estimated by the positive GLM and is not an
+    # additional regression coefficient in the combined parameter vector.
     true_params = np.concatenate((beta, gamma))
     comparison = pd.DataFrame(
         {
@@ -90,7 +91,10 @@ def main():
     print(f'Absolute Gamma scale error: {scale_error:.4f}')
     assert max_absolute_error < 0.08
     assert scale_error < 0.04
-    assert max_cross_covariance == 0.0
+    assert fit.is_quasi_likelihood
+    assert fit.aic is None and fit.bic is None
+    assert fit.inference_valid
+    assert max_cross_covariance > 0.0
     assert np.all(y[y > 0] > 0.0)
 
 

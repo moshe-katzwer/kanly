@@ -30,7 +30,12 @@ class DistributionalModelResults(RegressionResultsBase):
             iterations=None, score_at_params=None, scale=1.0,
             positive_fit=None, hurdle_fit=None, component_cov_type=None,
             specification_name=None, test_level=DEFAULT_TEST_LEVEL,
-            loglike_kwargs=None):
+            loglike_kwargs=None, optimizer_converged=None,
+            first_order_valid=True, inference_valid=True,
+            inference_issues=None, normalized_score=None,
+            covariance_status=None, information_rank=None,
+            information_condition=None, information_min_eigenvalue=None,
+            is_quasi_likelihood=False, report_information_criteria=True):
         """Initialize a complete distributional-model regression result.
 
         Args:
@@ -62,6 +67,18 @@ class DistributionalModelResults(RegressionResultsBase):
             test_level: Significance level for inference.
             loglike_kwargs: Extra keywords required to evaluate likelihoods,
                 such as a fitted Gamma hurdle scale.
+            optimizer_converged: Raw optimizer convergence indicator.
+            first_order_valid: Whether fitted scores satisfy validation.
+            inference_valid: Whether covariance diagnostics permit inference.
+            inference_issues: Human-readable fit or covariance problems.
+            normalized_score: Maximum score magnitude divided by total weight.
+            covariance_status: Short covariance diagnostic description.
+            information_rank: Numerical rank of observed information.
+            information_condition: Condition number of observed information.
+            information_min_eigenvalue: Smallest information eigenvalue.
+            is_quasi_likelihood: Whether the fit is estimating-equation based
+                rather than a fully maximized likelihood.
+            report_information_criteria: Whether AIC and BIC are meaningful.
         """
         params = np.asarray(params, dtype=float).reshape(-1)
         param_names = list(model.get_param_names())
@@ -92,18 +109,46 @@ class DistributionalModelResults(RegressionResultsBase):
             l1_ratio=0.0,
             specification_name=specification_name,
         )
+        self.cov_kwds = {} if cov_kwds is None else dict(cov_kwds)
 
         self.model = model
         self.keep_model = True
         self.model_name = model.__class__.__name__
         self.method = method
         self.converged = bool(converged)
+        self.optimizer_converged = (
+            self.converged
+            if optimizer_converged is None
+            else bool(optimizer_converged)
+        )
+        self.first_order_valid = bool(first_order_valid)
+        self.inference_valid = bool(inference_valid)
+        self.inference_issues = (
+            [] if inference_issues is None else list(inference_issues)
+        )
+        self.normalized_score = (
+            None if normalized_score is None else float(normalized_score)
+        )
+        self.covariance_status = covariance_status
+        self.information_rank = information_rank
+        self.information_condition = information_condition
+        self.information_min_eigenvalue = information_min_eigenvalue
+        self.is_quasi_likelihood = bool(is_quasi_likelihood)
+        self.report_information_criteria = bool(report_information_criteria)
         self.message = '' if message is None else str(message)
         self.llf = float(llf)
-        self.average_loglike = self.llf / self.nobs
+        self.weight_total = (
+            float(self.nobs)
+            if model.weights is None else float(np.sum(model.weights))
+        )
+        self.average_loglike = self.llf / self.weight_total
         self.num_params = len(params)
-        self.aic = -2.0 * self.llf + 2.0 * self.num_params
-        self.bic = -2.0 * self.llf + np.log(self.nobs) * self.num_params
+        if self.report_information_criteria:
+            self.aic = -2.0 * self.llf + 2.0 * self.num_params
+            self.bic = -2.0 * self.llf + np.log(self.nobs) * self.num_params
+        else:
+            self.aic = None
+            self.bic = None
         self.scale = float(scale)
 
         self.optimization_result = optimization_result
@@ -189,6 +234,15 @@ class DistributionalModelResults(RegressionResultsBase):
         self.resid_response = self.resid
 
         self._set_model_specific_attributes()
+        if self.is_hurdle:
+            self.resid_zero = (
+                (model.endog == 0.0).astype(float) - self.zero_probability
+            )
+            self.resid_positive = np.full(self.nobs, np.nan, dtype=float)
+            positive = model.endog > 0.0
+            self.resid_positive[positive] = (
+                model.endog[positive] - self.positive_mean[positive]
+            )
 
         self.bootstrap_string = bootstrap_string
         self.bootstrapped_params = None
@@ -197,6 +251,14 @@ class DistributionalModelResults(RegressionResultsBase):
                 np.asarray(bootstrapped_params, dtype=float),
                 cov_string=bootstrap_string,
             )
+            if self.is_hurdle:
+                k_positive = model.k_positive
+                self.positive_bootstrapped_params = (
+                    self.bootstrapped_params[:, :k_positive].copy()
+                )
+                self.hurdle_bootstrapped_params = (
+                    self.bootstrapped_params[:, k_positive:].copy()
+                )
         self.cov_string = self._get_covariance_description()
         self.standard_errors = getattr(self, 'bse', None)
 
@@ -261,6 +323,22 @@ class DistributionalModelResults(RegressionResultsBase):
     def _get_covariance_description(self):
         """Return an estimator-specific covariance explanation."""
         if self.is_hurdle:
+            if str(self.cov_type).upper() in {'SANDWICH', 'HC1'}:
+                correction = (
+                    ' with an HC1 finite-sample correction'
+                    if str(self.cov_type).upper() == 'HC1' else ''
+                )
+                return (
+                    'Covariance uses the full combined observation-score '
+                    f'sandwich{correction}; its bread is block diagonal but '
+                    'cross-component score covariance is retained.'
+                )
+            if str(self.cov_type).upper() == 'BOOTSTRAP':
+                return (
+                    self.bootstrap_string
+                    or 'Covariance uses coherent full-sample Bayesian '
+                    'bootstrap refits of both hurdle components.'
+                )
             return (
                 'Covariance is block diagonal; the positive-response and '
                 f'zero-hurdle blocks each use the component GLM '
@@ -320,20 +398,23 @@ class DistributionalModelResults(RegressionResultsBase):
         return self.model.score_obs(np.asarray(params), **evaluation_kwds)
 
     def predict(
-            self, exog=None, params=None, exog_infl=None, which='mean'):
-        """Predict means or two-part probabilities from numeric designs.
+            self, exog=None, params=None, exog_infl=None, which='mean',
+            data=None, index=None, debug=False):
+        """Predict means or probabilities from numeric designs or new data.
 
         With no arguments, returns the in-sample unconditional fitted mean.
-        Distributional-model formula prediction on a new DataFrame is not yet
-        implemented; supply already constructed ``exog`` arrays instead.
+        Models constructed from formulas can evaluate those formulas on new
+        DataFrame or dict-like data.
         """
-        if (exog is None and exog_infl is None and params is None
+        if (exog is None and exog_infl is None and data is None
+                and params is None
                 and which == 'mean'):
             return self.fittedvalues.copy()
         if params is None:
             params = self._params
         return self.model.predict(
-            np.asarray(params), exog=exog, exog_infl=exog_infl, which=which
+            np.asarray(params), exog=exog, exog_infl=exog_infl, which=which,
+            data=data, index=index, debug=debug,
         )
 
     def summary_df(self, test_level=DEFAULT_TEST_LEVEL):
@@ -389,10 +470,19 @@ class DistributionalModelResults(RegressionResultsBase):
             ('Df Residuals:', self.df_resid),
             ('Df Model:', self.df_model),
             ('No. Params:', self.num_params),
-            ('Log-Likelihood:', '%.4e' % self.llf),
-            ('Average LL:', '%.4e' % self.average_loglike),
-            ('AIC:', '%.4f' % self.aic),
-            ('BIC:', '%.4f' % self.bic),
+            (
+                'Quasi-Likelihood:' if self.is_quasi_likelihood
+                else (
+                    'Weighted Log-Likelihood:' if self.is_weighted
+                    else 'Log-Likelihood:'
+                ),
+                '%.4e' % self.llf,
+            ),
+            (
+                'Average Quasi-LL:' if self.is_quasi_likelihood
+                else 'Average LL:',
+                '%.4e' % self.average_loglike,
+            ),
             ('Cov. Type:', self.cov_type),
             ('Weights:', (
                 self.weights_name
@@ -400,6 +490,8 @@ class DistributionalModelResults(RegressionResultsBase):
                 else ('Provided' if self.is_weighted else 'None')
             )),
             ('Converged:', self.converged),
+            ('Optimizer Converged:', self.optimizer_converged),
+            ('Inference Valid:', self.inference_valid),
             ('Iterations:', iterations if iterations is not None else 'N/A'),
             ('Max |score|:', '%.2e' % self.gnorm),
             ('Zero Nobs:', self.nobs_zero),
@@ -408,6 +500,24 @@ class DistributionalModelResults(RegressionResultsBase):
             ('Fit Time:', '%.2fs' % self.fit_elapsed),
             ('Cov Time:', '%.2fs' % self.cov_elapsed),
         ]
+        if self.normalized_score is not None:
+            header.append((
+                'Scaled |score|:', '%.2e' % self.normalized_score
+            ))
+        if self.information_rank is not None:
+            header.append((
+                'Information Rank:',
+                f'{self.information_rank}/{self.num_params}',
+            ))
+        if self.information_condition is not None:
+            header.append((
+                'Information Cond.:', '%.2e' % self.information_condition
+            ))
+        if self.report_information_criteria:
+            header.extend([
+                ('AIC:', '%.4f' % self.aic),
+                ('BIC:', '%.4f' % self.bic),
+            ])
         if self.dispersion is not None:
             header.append(('Dispersion:', '%.4e' % self.dispersion))
         if hasattr(self, 'generalized_poisson_p'):
@@ -442,8 +552,20 @@ class DistributionalModelResults(RegressionResultsBase):
                 'Parameter order is positive-response coefficients followed '
                 'by hurdle coefficients.'
             )
+            if self.is_quasi_likelihood:
+                lines.append(
+                    'The Gamma positive component uses GLM estimating '
+                    'equations with Pearson-estimated scale. This is a '
+                    'quasi-likelihood fit; likelihood-based AIC and BIC are '
+                    'not reported.'
+                )
         else:
-            lines.append('Parameters were estimated by maximum likelihood.')
+            lines.append(
+                'Parameters were estimated by quasi-likelihood-like '
+                'optimization.'
+                if self.is_quasi_likelihood else
+                'Parameters were estimated by maximum likelihood.'
+            )
 
         if self.is_zero_inflated:
             lines.append(
@@ -462,8 +584,20 @@ class DistributionalModelResults(RegressionResultsBase):
             )
         if self.is_weighted:
             lines.append(
-                'Weights multiply observation likelihood and score '
-                'contributions during aggregation.'
+                'Importance weights multiply observation likelihood and '
+                'score contributions during aggregation.'
+            )
+            if not self.report_information_criteria:
+                lines.append(
+                    'Likelihood-based AIC and BIC are not reported for '
+                    'importance-weighted objectives.'
+                )
+
+        if self.covariance_status:
+            lines.append(f'Covariance status: {self.covariance_status}.')
+        if self.inference_issues:
+            lines.append(
+                'Inference warning: ' + ' '.join(self.inference_issues)
             )
 
         if self.did_compute_var_covar():

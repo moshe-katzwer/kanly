@@ -4,7 +4,7 @@ import sys
 import traceback
 import warnings
 
-__version__ = '0.0.1052'
+__version__ = '0.0.1053'
 
 top_bar = '┏' + '━' * (31 + len(__version__) - 2) + '┓'
 bottom_bar = '┗' + '━' * (31 + len(__version__) - 2) + '┛'

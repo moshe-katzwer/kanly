@@ -4,16 +4,27 @@
 [formula guide](../formula/README.md) ·
 [generalized linear models](../regression/generalized_linear_models/README.md)
 
+> **Experimental status and authorship:** Almost all code in the other kanly
+> modules was written by Moshe Katzwer. The code in this module was written
+> largely by Codex on a scaffold defined by Moshe Katzwer. This module is
+> experimental and should be validated carefully before use in production or
+> consequential statistical analysis.
+
 This package provides compact, likelihood-based regression models for counts
 and positive continuous outcomes. Unlike the IRLS generalized-linear-model
-implementation, these classes jointly optimize all parameters in their
+implementation, direct models jointly optimize all parameters in their
 likelihood, including Gamma and negative-binomial dispersion parameters.
+Hurdle models deliberately retain separable component-GLM estimation.
 
 The public base class is `DistributionalModel`. Source files are organized by
 response structure:
 
-- [`count_models.py`](count_models.py) contains the base class and discrete
-  count, zero-inflated, and negative-binomial likelihoods.
+- [`base.py`](base.py) contains the common `DistributionalModel` estimation,
+  validation, bootstrap, and inference machinery.
+- [`two_part.py`](two_part.py) contains shared zero-process data and formula
+  handling for zero-inflated and hurdle models.
+- [`count_models.py`](count_models.py) contains discrete count,
+  zero-inflated, and negative-binomial likelihoods.
 - [`continuous_models.py`](continuous_models.py) contains the continuous
   `Gamma` likelihood model.
 - [`hurdle_models.py`](hurdle_models.py) contains GLM-composed Poisson and
@@ -29,6 +40,7 @@ All public model classes can be imported directly from
 from kanly.distributional_models import (
     DistributionalModel,
     DistributionalModelResults,
+    TwoPartModel,
     Gamma,
     GammaHurdle,
     GeneralizedPoisson,
@@ -41,10 +53,10 @@ from kanly.distributional_models import (
 )
 ```
 
-`DistributionalModel` supplies formula construction, likelihood weighting,
-optimization, observation scores, covariance estimation, bootstrap refits,
-and common prediction behavior. Concrete subclasses provide the distribution
-likelihood and parameter names.
+`DistributionalModel` supplies formula construction, importance weighting of
+likelihood observations, optimization, observation scores, covariance
+estimation, bootstrap refits, and common prediction behavior. Concrete
+subclasses provide the distribution likelihood and parameter names.
 
 Direct models and count components use a log link for the conditional mean:
 
@@ -64,7 +76,7 @@ mu_i = exp(eta_i)
 | `ZeroInflatedPoisson` | Structural-zero mixture with Poisson counts | Mixture variance | Inflation coefficients |
 | `ZeroInflatedNegativeBinomial` | Structural-zero mixture with NB-2 counts | Mixture variance | Inflation coefficients and `log_alpha` |
 | `PoissonHurdle` | Logit zero hurdle plus zero-truncated Poisson GLM | Two-part model | Hurdle coefficients |
-| `GammaHurdle` | Logit zero hurdle plus Gamma/log GLM | Two-part model | Hurdle coefficients; Pearson GLM scale |
+| `GammaHurdle` | Logit zero hurdle plus Gamma/log GLM quasi-likelihood | Two-part model | Hurdle coefficients; Pearson GLM scale |
 
 For models reporting `log_alpha`, the positive dispersion is
 `alpha = exp(log_alpha)`. Generalized Poisson estimates raw `alpha` because
@@ -90,7 +102,6 @@ model = NegativeBinomial2.build_model_from_formula(
 )
 
 fit = model.fit(
-    start_params=np.array([0.0, 0.0, 0.0, -1.0]),
     cov_type="SANDWICH",
 )
 
@@ -103,6 +114,15 @@ Instrumental-variable and absorbed-effect formulas are rejected.
 Formula construction records column names and row-alignment metadata on the
 model. For example, `fit.param_names` uses formula names rather than generated
 names such as `x0` and `x1`.
+
+Every concrete direct-likelihood model supplies automatic starting values, so
+`model.fit()` does not require `start_params`. Inspect them with
+`model.get_start_params()` or `model.default_start_params`. Passing an explicit
+vector still takes precedence:
+
+```python
+fit = model.fit(start_params=np.zeros(len(model.param_names)))
+```
 
 ## Zero-Inflated Models
 
@@ -137,7 +157,6 @@ model = ZeroInflatedPoisson.build_model_from_formula(
 )
 
 fit = model.fit(
-    start_params=np.zeros(len(model.param_names)),
     cov_type="NONROBUST",
 )
 ```
@@ -199,21 +218,24 @@ unsupported and are rejected by formula construction. Parameters are ordered
 as the positive-response coefficients followed by coefficients named
 `hurdle_...`.
 
-The likelihood is separable, so `fit` estimates the two component GLMs rather
-than jointly optimizing the combined likelihood. The returned covariance is
-block diagonal and preserves the covariance block from each component fit.
-`cov_type="SANDWICH"` maps to the GLM `HC1` estimator; `NONROBUST`, `HC1`, and
-`BOOTSTRAP` are also accepted.
+The objective separates, so `fit` estimates the two component GLMs rather
+than jointly optimizing the combined objective. `NONROBUST` returns the exact
+block-diagonal component covariance. `SANDWICH` and `HC1` use that block-
+diagonal bread with the full combined observation-score meat, retaining
+cross-component covariance; `HC1` adds its finite-sample correction.
+`COMPONENT_HC1` preserves the historical block-diagonal robust estimator.
+`BOOTSTRAP` uses each full-sample Bayesian weight draw for both components and
+therefore retains coherent joint parameter draws and cross covariance.
 
 The combined object provides `loglike`, `loglike_obs`, `score`, `score_obs`,
 and predictions for the overall mean, conditional positive mean, zero
 probability, or positive probability. The combined distributional-model API
 keeps `loglike_obs` and `score_obs` unweighted and applies observation weights
-only when aggregating them. During component estimation those weights are
-supplied through the GLM variance-weight interface. This is identical to
-likelihood weighting for fixed-scale Bernoulli and zero-truncated Poisson; the
-Gamma component's fitted scale and native covariance retain the usual GLM
-precision-weight interpretation.
+only when aggregating them. During component estimation those importance
+weights are supplied through the GLM weight machinery. This gives the desired
+weighted estimating equations. `GammaHurdle` retains Pearson-estimated scale,
+so it is explicitly reported as quasi-likelihood and does not report AIC or
+BIC.
 
 Complete parameter-recovery examples are available for both
 [`PoissonHurdle`](../../examples/distributional_models/example_poisson_hurdle.py)
@@ -235,7 +257,7 @@ model = ZeroInflatedNegativeBinomial(
     exog_infl=Z,
     exog_infl_names=["constant", "prior_zero"],
     weights=w,
-    weights_name="frequency_weight",
+    weights_name="importance_weight",
 )
 
 fit = model.fit(
@@ -256,8 +278,21 @@ the fallback names are `x0`, `x1`, and so on.
 
 ## Parameter Order and Starting Values
 
-Starting values must contain exactly one entry for every name returned by
-`model.get_param_names()` or `model.param_names`.
+Automatic starting values contain exactly one entry for every name returned by
+`model.get_param_names()` or `model.param_names`:
+
+| Model | Automatic starting values |
+|---|---|
+| `Poisson` | Log of the weighted response mean in a detected constant; other coefficients zero |
+| `Gamma` | Log-mean regression start plus moment-based `log_alpha` |
+| `GeneralizedPoisson` | Log-mean regression start plus near-Poisson `alpha=0.05` |
+| `NegativeBinomial1` | Log-mean regression start plus NB-1 moment `log_alpha` |
+| `NegativeBinomial2` | Log-mean regression start plus NB-2 moment `log_alpha` |
+| `ZeroInflatedPoisson` | Excess-zero logit and zero-adjusted count mean |
+| `ZeroInflatedNegativeBinomial` | ZIP starts plus an NB-2 moment `log_alpha` |
+
+An explicit `start_params` vector remains supported and must follow this
+parameter order:
 
 | Model | Parameter order |
 |---|---|
@@ -310,17 +345,17 @@ ll = model.loglike(params)        # weights applied during aggregation
 score = model.score(params)       # weights applied during aggregation
 ```
 
-This differs from GLM variance weights. It is appropriate for likelihood,
-frequency, or importance weighting when multiplying the entire observation
-contribution is the intended estimand.
+These are importance weights on the complete objective, not frequency weights
+or a general variance-weight API. Consequently the sandwich meat uses squared
+weighted scores, `sum_i (w_i score_i) (w_i score_i)'`.
 
-Weights must be finite and non-negative. With formula construction,
-`sum_to_n=True` rescales them to sum to the final aligned number of
-observations.
+Weights must be finite and non-negative and have positive total mass. With
+formula construction, `sum_to_n=True` rescales them to sum to the final
+aligned number of observations.
 
 ## Covariance Estimation
 
-`fit` accepts three covariance types:
+Direct-model `fit` accepts three covariance types:
 
 ```python
 fit_nonrobust = model.fit(start, cov_type="NONROBUST")
@@ -357,11 +392,17 @@ meat = sum_i weighted_score_i * weighted_score_i'
 cov(theta_hat) = bread * meat * bread'
 ```
 
+For hurdle models this is the full combined score meat. Although the hurdle
+bread is block diagonal, robust covariance need not have zero cross blocks.
+
 ### Bayesian bootstrap
 
 `BOOTSTRAP` draws Dirichlet observation weights, multiplies them by any
 existing model weights, and refits the model. Every refit starts from the
 original point estimate. Failed or non-finite repetitions are excluded.
+`min_success_rate` defaults to `0.8`; covariance estimation fails rather than
+silently accepting too few successful draws. `use_correction=True` computes
+the ordinary sample covariance correction exactly once.
 
 Bootstrap results expose:
 
@@ -373,8 +414,9 @@ fit.cov_kwds["n_successful"]
 fit.cov_kwds["n_failed"]
 ```
 
-The model's original likelihood weights are restored after every refit,
-including when optimization fails.
+Direct-model bootstrap objectives receive draw-specific weights explicitly;
+the model's stored weights are never mutated. Hurdle bootstrap repetitions use
+the same full-sample draw for both component GLMs.
 
 ## Results
 
@@ -392,10 +434,15 @@ Every count, zero-inflated, Gamma, and hurdle fit returns a
 | `bse` / `standard_errors` | Standard errors |
 | `cov_type` | Selected covariance estimator |
 | `cov_kwds` | Covariance/bootstrap options and diagnostics |
+| `optimizer_converged` / `first_order_valid` | Raw stopping status and post-fit score validation |
+| `inference_valid` / `inference_issues` | Whether covariance inference passed diagnostics and any failure reasons |
+| `information_rank` / `information_condition` | Observed-information identification diagnostics |
 | `summary_df()` | Coefficient, standard error, z statistic, p-value, and CI table |
+| `predict(data=...)` | Re-evaluate stored main and zero-process formulas on new DataFrame or dict-like data |
 | `llf` / `average_loglike` | Total and per-observation fitted log likelihood |
-| `aic` / `bic` | Information criteria using every estimated parameter |
+| `aic` / `bic` | Information criteria for unweighted normalized-likelihood fits; otherwise `None` |
 | `fittedvalues` / `resid_response` | Unconditional fitted means and response residuals |
+| `resid_zero` / `resid_positive` | Hurdle-component residuals for the zero indicator and positive response |
 | `dispersion` | Transformed dispersion for Gamma, NB-1, NB-2, and ZINB, or raw GP alpha |
 | `zero_probability` / `positive_probability` | Fitted outcome probabilities for two-part models |
 | `inflation_probability` / `count_mean` | ZIP/ZINB structural-zero probability and count-component mean |
@@ -417,7 +464,12 @@ print(fit.bse)
 ## Response Support and Interpretation
 
 - `Gamma` requires finite, strictly positive outcomes.
-- Zero-inflated models require finite, non-negative outcomes.
+- Poisson, generalized-Poisson, negative-binomial, and zero-inflated models
+  require finite, non-negative outcomes.
+- `PoissonHurdle` additionally requires integer outcomes. Every hurdle sample
+  needs a zero and a strictly positive outcome with positive weight.
+- An all-zero zero-inflated sample is rejected as unidentified. A sample with
+  no observed zeros is flagged as a boundary fit and inference is suppressed.
 - Count distributions have a literal probability-mass interpretation for
   non-negative integer outcomes.
 - The likelihood expressions use Gamma-function extensions and can be
@@ -427,7 +479,13 @@ print(fit.bse)
   quasi-likelihood estimates rather than a correctly normalized count model.
 - Negative generalized-Poisson dispersion has parameter-dependent support.
   Invalid trial parameters receive `-inf` likelihood so the optimizer rejects
-  them.
+  them. Estimates near that boundary fail inference validation.
+
+An optimizer stopping flag alone is not treated as sufficient. The fitted
+likelihood and score must be finite and the scaled first-order condition must
+hold. Observed information must also be finite, full rank, sufficiently
+conditioned, and positive definite; otherwise covariance and standard errors
+are withheld rather than silently using a pseudoinverse.
 
 ## Distributional Models Versus GLMs
 

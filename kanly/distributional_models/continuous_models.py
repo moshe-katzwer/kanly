@@ -5,7 +5,7 @@ from __future__ import absolute_import, print_function
 import numpy as np
 from scipy.special import digamma, gammaln
 
-from kanly.distributional_models.count_models import DistributionalModel
+from kanly.distributional_models.base import DistributionalModel
 
 
 class Gamma(DistributionalModel):
@@ -42,6 +42,16 @@ class Gamma(DistributionalModel):
     def get_param_names(self):
         """Return coefficient names followed by ``log_alpha``."""
         return self._get_regression_param_names() + ['log_alpha']
+
+    def get_start_params(self):
+        """Return log-mean coefficients and a Gamma moment dispersion."""
+        mean, variance = self._response_moments()
+        safe_mean = max(mean, 1e-6)
+        alpha = variance / safe_mean ** 2
+        return np.append(
+            self._mean_regression_start(safe_mean),
+            self._log_dispersion_start(alpha),
+        )
 
     def _distribution_terms(self, params):
         """Compute the linear predictor, shape, response ratio, and validity.

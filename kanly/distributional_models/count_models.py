@@ -10,589 +10,38 @@ Bayesian-bootstrap covariance estimation.
 
 from __future__ import absolute_import, print_function
 
-from abc import ABC, abstractmethod
-import time
 import numpy as np
 
 from scipy.special import digamma, expit, gammaln
-from kanly.api import bfgs_pqn
-from kanly.bootstrap.bootstrap import (
-    DEFAULT_BB_ALPHA, DEFAULT_BB_SEED, DEFAULT_BOOTSTRAP_N_SAMPLES,
-    get_bayesian_bootstrap_weights, get_bootstrap_weights2,
+from kanly.distributional_models.base import (
+    DistributionalModel,
+    _NonnegativeDistributionalModel,
 )
-from kanly.formula.data_getter import SparseDataGetter
-from kanly.formula.exceptions import MissingDataException
-from kanly.formula.keys import (
-    ENDOG_KEY, EXOG_KEY, FORMULA_DESIGN_INFO_KEY, HAS_IMPLICIT_CONSTANT_KEY,
-    HAS_INTERCEPT_KEY, INDEX_KEY, NULL_ROWS_INFO_DICT_KEY, TIME_ELAPSED_KEY,
-    VALID_OBS_ROWS_KEY, WEIGHTS_KEY,
-)
-from kanly.distributional_models.results import DistributionalModelResults
-from kanly.utils.util import dict_2_dataframe
+from kanly.distributional_models.two_part import TwoPartModel
 
 
-class DistributionalModel(ABC):
-    """Abstract base class for likelihood-based response models.
+_POISSON_LIMIT_LOG_ALPHA = float(np.log(1e-8))
 
-    Subclasses provide observation log-likelihoods, parameter names, and,
-    preferably, analytical scores.  ``weights`` are estimation weights: they
-    multiply observation log-likelihoods and scores during aggregation but do
-    not alter the values returned by :meth:`loglike_obs` or :meth:`score_obs`.
 
-    Args:
-        endog: One-dimensional response array of length ``nobs``.
-        exog: Two-dimensional design matrix with ``nobs`` rows.
-        weights: Optional non-negative likelihood weights of length ``nobs``.
-    """
+def _poisson_loglike_obs(endog, eta):
+    """Return stable Poisson-limit contributions for count likelihoods."""
+    with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+        mean = np.exp(eta)
+        values = endog * eta - mean - gammaln(endog + 1.0)
+    valid = np.isfinite(eta) & np.isfinite(mean) & np.isfinite(values)
+    return np.where(valid, values, -np.inf)
 
-    def __init__(
-            self, endog, exog, weights=None, endog_name=None,
-            exog_names=None, weights_name=None, formula_design_info=None,
-            formula=None, from_formula=False, exog_term_names=None,
-            exog_term_to_indices=None, has_intercept=False,
-            has_implicit_constant=False, valid_obs_rows=None,
-            null_rows_info_dict=None, index=None, model_elapsed=0.0):
-        """Initialize model data, names, formula metadata, and parameters.
 
-        Args:
-            endog: One-dimensional response data.
-            exog: Two-dimensional regression design matrix.
-            weights: Optional non-negative likelihood weights.
-            endog_name: Optional response name.
-            exog_names: Optional coefficient names matching the columns of
-                ``exog``. Generated names are used when omitted.
-            weights_name: Optional name of the likelihood-weight variable.
-            formula_design_info: Formula engine metadata, when applicable.
-            formula: Original formula string, when applicable.
-            from_formula: Whether the model was constructed from a formula.
-            exog_term_names: Formula terms represented by ``exog``.
-            exog_term_to_indices: Mapping from formula terms to exog columns.
-            has_intercept: Whether ``exog`` has an explicit intercept.
-            has_implicit_constant: Whether its span contains a constant.
-            valid_obs_rows: Retained row positions after missing-data handling.
-            null_rows_info_dict: Missing-row diagnostics by formula block.
-            index: Original row selector supplied to formula construction.
-            model_elapsed: Formula/model construction time in seconds.
-        """
-        endog = np.asarray(endog, dtype=float)
-        if endog.ndim == 2 and endog.shape[1] == 1:
-            endog = endog.reshape(-1)
-        if endog.ndim != 1:
-            raise ValueError("endog must be one-dimensional")
+def _poisson_score_factor(endog, eta):
+    """Return the Poisson linear-predictor score with finite guards."""
+    with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+        mean = np.exp(eta)
+        values = endog - mean
+    valid = np.isfinite(eta) & np.isfinite(mean) & np.isfinite(values)
+    return np.where(valid, values, np.nan)
 
-        exog = np.asarray(exog, dtype=float)
-        if exog.ndim == 1:
-            exog = exog[:, None]
-        if exog.ndim != 2:
-            raise ValueError("exog must be two-dimensional")
-        if exog.shape[0] != len(endog):
-            raise ValueError("endog and exog must contain the same number of rows")
 
-        if weights is not None:
-            weights = np.asarray(weights, dtype=float).reshape(-1)
-            if len(weights) != len(endog):
-                raise ValueError("weights must have one value per observation")
-            if np.any(~np.isfinite(weights)) or np.any(weights < 0.0):
-                raise ValueError("weights must be finite and non-negative")
-
-        if exog_names is not None:
-            exog_names = [str(name) for name in exog_names]
-            if len(exog_names) != exog.shape[1]:
-                raise ValueError("exog_names must match the columns of exog")
-
-        self.endog = endog
-        self.exog = exog
-        self.weights = weights
-        self.is_weighted = self.weights is not None
-        self.nobs = len(self.endog)
-
-        self.formula_design_info = formula_design_info
-        self.formula = formula
-        self.from_formula = bool(from_formula)
-        self.endog_name = None if endog_name is None else str(endog_name)
-        self.exog_names = exog_names
-        self.weights_name = (
-            None if weights_name is None else str(weights_name)
-        )
-        self.exog_term_names = (
-            None if exog_term_names is None else list(exog_term_names)
-        )
-        self.exog_term_to_indices = exog_term_to_indices
-        self.has_intercept = bool(has_intercept)
-        self.has_implicit_constant = bool(has_implicit_constant)
-        self.valid_obs_rows = (
-            np.arange(self.nobs)
-            if valid_obs_rows is None
-            else np.asarray(valid_obs_rows, dtype=int).copy()
-        )
-        self.null_rows_info_dict = (
-            {} if null_rows_info_dict is None else null_rows_info_dict.copy()
-        )
-        self.index = index
-        self.model_elapsed = float(model_elapsed)
-        self.param_names = self.get_param_names()
-
-    @classmethod
-    def _get_formula_constructor_kwargs(
-            cls, formula, data, index=None, debug=False,
-            check_constant_cols=False, fail_on_missing=False,
-            cache_intermediate=True, sum_to_n=False,
-            test_formula_on_dummy=True, drop_1_for_FE=True):
-        """Build aligned formula arrays and return constructor keywords.
-
-        The ``$`` formula extension supplies optional likelihood weights.
-        Instrumental-variable and absorbed-effect formulas are not supported.
-        Missing rows are aligned and removed by ``SparseDataGetter``.
-
-        Returns:
-            Dictionary containing model data, names, and formula metadata that
-            can be passed directly to a distributional-model constructor.
-        """
-        result = SparseDataGetter.get_data(
-            data=data, formula=formula, index=index, debug=debug,
-            check_constant_cols=check_constant_cols,
-            fail_on_missing=fail_on_missing,
-            cache_intermediate=cache_intermediate, sum_to_n=sum_to_n,
-            test_formula_on_dummy=test_formula_on_dummy,
-            drop_1_for_FE=drop_1_for_FE, fail_on_iv=True,
-            fail_on_absorb=True,
-        )
-
-        endog_obj = result[ENDOG_KEY]
-        exog_obj = result[EXOG_KEY]
-        weights_obj = result[WEIGHTS_KEY]
-
-        endog = endog_obj.values
-        exog = exog_obj.values
-        if hasattr(endog, 'toarray'):
-            endog = endog.toarray()
-        if hasattr(exog, 'toarray'):
-            exog = exog.toarray()
-        endog = np.asarray(endog)
-        exog = np.asarray(exog)
-        if endog.ndim != 2 or endog.shape[1] != 1:
-            raise ValueError(
-                "Distributional models require exactly one outcome column"
-            )
-        endog = endog.reshape(-1)
-
-        if weights_obj is None:
-            weights = None
-        else:
-            weights = weights_obj.values
-            if hasattr(weights, 'toarray'):
-                weights = weights.toarray()
-            weights = np.asarray(weights).reshape(-1)
-
-        formula_design_info = result[FORMULA_DESIGN_INFO_KEY]
-        return {
-            'endog': endog,
-            'exog': exog,
-            'weights': weights,
-            'endog_name': endog_obj.column_names[0],
-            'exog_names': list(exog_obj.column_names),
-            'weights_name': (
-                None if weights_obj is None else weights_obj.column_names[0]
-            ),
-            'formula_design_info': formula_design_info,
-            'formula': formula_design_info.formula,
-            'from_formula': True,
-            'exog_term_names': exog_obj.term_names,
-            'exog_term_to_indices': exog_obj.var_2_col_indices,
-            'has_intercept': result[HAS_INTERCEPT_KEY],
-            'has_implicit_constant': result[HAS_IMPLICIT_CONSTANT_KEY],
-            'valid_obs_rows': result[VALID_OBS_ROWS_KEY],
-            'null_rows_info_dict': result[NULL_ROWS_INFO_DICT_KEY],
-            'index': result[INDEX_KEY],
-            'model_elapsed': result[TIME_ELAPSED_KEY],
-        }
-
-    @classmethod
-    def build_model_from_formula(
-            cls, formula, data, index=None, debug=False,
-            check_constant_cols=False, fail_on_missing=False,
-            cache_intermediate=True, sum_to_n=False,
-            test_formula_on_dummy=True, drop_1_for_FE=True, **model_kwargs):
-        """Build an unfitted model with constructor-owned formula metadata."""
-        constructor_kwargs = cls._get_formula_constructor_kwargs(
-            formula=formula,
-            data=data,
-            index=index,
-            debug=debug,
-            check_constant_cols=check_constant_cols,
-            fail_on_missing=fail_on_missing,
-            cache_intermediate=cache_intermediate,
-            # Normalize after all formula rows have been aligned.
-            sum_to_n=False,
-            test_formula_on_dummy=test_formula_on_dummy,
-            drop_1_for_FE=drop_1_for_FE,
-        )
-        if sum_to_n and constructor_kwargs['weights'] is not None:
-            weights = constructor_kwargs['weights']
-            weights_sum = weights.sum()
-            if weights_sum <= 0.0:
-                raise ValueError(
-                    "weights must have a positive sum when sum_to_n=True"
-                )
-            constructor_kwargs['weights'] = (
-                weights * len(constructor_kwargs['endog']) / weights_sum
-            )
-        duplicate_kwargs = set(constructor_kwargs).intersection(model_kwargs)
-        if duplicate_kwargs:
-            duplicates = ', '.join(sorted(duplicate_kwargs))
-            raise TypeError(
-                f'Formula construction supplies these arguments: {duplicates}'
-            )
-
-        return cls(**constructor_kwargs, **model_kwargs)
-
-    def _apply_weights(self, values):
-        """Multiply an observation array by stored weights in place.
-
-        Args:
-            values: Array whose first dimension corresponds to observations.
-
-        Returns:
-            The input array after weighting, or unchanged when unweighted.
-        """
-        if self.is_weighted:
-            np.multiply(values, self.weights, out=values)
-        return values
-
-    def _weighted_sum(self, values):
-        """Aggregate observation values using optional likelihood weights."""
-        if self.is_weighted:
-            return np.dot(self.weights, values)
-        return values.sum()
-
-    def _get_regression_param_names(self):
-        """Return formula column names or generated names for coefficients."""
-        if self.exog_names is None:
-            return [f'x{i}' for i in range(self.exog.shape[1])]
-        return [str(name) for name in self.exog_names]
-
-    def predict(
-            self, params, exog=None, exog_infl=None, which='mean'):
-        """Predict log-link conditional means from a numeric design matrix.
-
-        Args:
-            params: Full model parameter vector.  Distribution parameters
-                following the regression coefficients are ignored here.
-            exog: Optional numeric prediction design; defaults to fitted exog.
-            exog_infl: Unused for one-part models; accepted for a common
-                results interface.
-            which: ``'mean'`` or ``'linear_predictor'``.
-        """
-        del exog_infl
-        params = np.asarray(params, dtype=float).reshape(-1)
-        exog = self.exog if exog is None else np.asarray(exog, dtype=float)
-        if exog.ndim == 1:
-            exog = exog[None, :]
-        if exog.ndim != 2 or exog.shape[1] != self.exog.shape[1]:
-            raise ValueError('exog has the wrong number of columns')
-        if len(params) != len(self.param_names):
-            raise ValueError('params has the wrong length')
-
-        linear_predictor = exog @ params[:self.exog.shape[1]]
-        with np.errstate(over='ignore', invalid='ignore'):
-            mean = np.exp(linear_predictor)
-        predictions = {
-            'mean': mean,
-            'linear_predictor': linear_predictor,
-        }
-        which = str(which).lower()
-        if which not in predictions:
-            raise ValueError("which must be 'mean' or 'linear_predictor'")
-        return predictions[which]
-
-    @abstractmethod
-    def get_param_names(self):
-        """Return names for every parameter in estimation order."""
-        raise NotImplementedError()
-
-    @abstractmethod
-    def loglike_obs(self, params, *args, **kwargs):
-        """Evaluate unweighted log-likelihood contributions.
-
-        Args:
-            params: Model parameters in the order given by
-                :meth:`get_param_names`.
-
-        Returns:
-            One-dimensional array with one contribution per observation.
-        """
-        raise NotImplementedError(
-            "Must implement a loglikelihood function at "
-            "observation level!")
-
-    def loglike(self, params, *args, **kwargs):
-        """Return the optionally weighted sum of observation log-likelihoods."""
-        return self._weighted_sum(self.loglike_obs(params, *args, **kwargs))
-
-    def score_obs(self, params, dx=None, *args, **kwargs):
-        """Approximate unweighted observation scores by forward differences.
-
-        Args:
-            params: Parameter vector at which to evaluate the score.
-            dx: Relative finite-difference step.  Defaults to the cube root of
-                machine precision.
-
-        Returns:
-            Array of shape ``(nobs, n_params)``.
-        """
-        if dx is None:
-            dx = np.cbrt(np.finfo(float).eps)
-
-        f0 = self.loglike_obs(params, *args, **kwargs)
-        k = len(params)
-        n = len(f0)
-        g = np.zeros((n, k))
-        for i in range(k):
-            step = dx * max(1.0, abs(params[i]))
-            paramsi = params.copy()
-            paramsi[i] += step
-            fi = self.loglike_obs(paramsi, *args, **kwargs)
-            g[:, i] = (fi - f0) / step
-        return g
-
-    def score(self, params, dx=None, *args, **kwargs):
-        """Approximate the gradient of the aggregated log-likelihood."""
-        if dx is None:
-            dx = np.cbrt(np.finfo(float).eps)
-
-        f0 = self.loglike(params, *args, **kwargs)
-        k = len(params)
-        g = np.zeros(k)
-        for i in range(k):
-            step = dx * max(1.0, abs(params[i]))
-            paramsi = params.copy()
-            paramsi[i] += step
-            fi = self.loglike(paramsi, *args, **kwargs)
-            g[i] = (fi - f0) / step
-        return g
-
-    def hessian(self, params, dx=None, *args, **kwargs):
-        """Approximate and symmetrize the aggregated likelihood Hessian.
-
-        Central differences of :meth:`score` are used column by column.
-
-        Returns:
-            Square array of shape ``(n_params, n_params)``.
-        """
-        params = np.asarray(params, dtype=float)
-        if dx is None:
-            dx = np.cbrt(np.finfo(float).eps)
-
-        k = len(params)
-        hess = np.empty((k, k))
-        for i in range(k):
-            step = dx * max(1.0, abs(params[i]))
-            params_lo = params.copy()
-            params_hi = params.copy()
-            params_lo[i] -= step
-            params_hi[i] += step
-            hess[:, i] = (
-                    self.score(params_hi, *args, **kwargs)
-                    - self.score(params_lo, *args, **kwargs)
-            ) / (2.0 * step)
-
-        return (hess + hess.T) / 2.0
-
-    def _fit_internal(self, start_params, weights=None, debug=False):
-        """Optimize with temporary likelihood weights and no inference."""
-        original_weights = self.weights
-        original_is_weighted = self.is_weighted
-
-        if weights is not None:
-            weights = np.asarray(weights, dtype=float).reshape(-1)
-            if len(weights) != self.nobs:
-                raise ValueError("weights must have one value per observation")
-            if np.any(~np.isfinite(weights)) or np.any(weights < 0.0):
-                raise ValueError("weights must be finite and non-negative")
-
-        try:
-            self.weights = weights
-            self.is_weighted = weights is not None
-            return bfgs_pqn(
-                self.loglike, start_params, maximize=True, debug=debug,
-                gradient_callable=self.score,
-            )
-        finally:
-            # A failed bootstrap fit must not leak its temporary weights into
-            # the model used for subsequent draws or post-estimation work.
-            self.weights = original_weights
-            self.is_weighted = original_is_weighted
-
-    def _bayesian_bootstrap(self, params, cov_kwds, debug=False):
-        """Refit Bayesian-bootstrap likelihoods and return their covariance."""
-        n_samples = cov_kwds.get(
-            'n_samples', DEFAULT_BOOTSTRAP_N_SAMPLES
-        )
-        if (isinstance(n_samples, bool)
-                or not isinstance(n_samples, (int, np.integer))
-                or n_samples < 2):
-            raise ValueError("n_samples must be an integer of at least 2")
-
-        seed = cov_kwds.get('seed', DEFAULT_BB_SEED)
-        alpha = cov_kwds.get('alpha', DEFAULT_BB_ALPHA)
-        if not np.isscalar(alpha) or not np.isfinite(alpha) or alpha <= 0.0:
-            raise ValueError("alpha must be a finite positive scalar")
-
-        method = str(cov_kwds.get('method', 'BAYESIAN')).upper()
-        if method != 'BAYESIAN':
-            raise ValueError(
-                "DistributionalModel bootstrap covariance currently supports "
-                "only "
-                "method='BAYESIAN'"
-            )
-
-        sample_weights, _ = get_bayesian_bootstrap_weights(
-            self.nobs, n_samples=n_samples, seed=seed, alpha=alpha
-        )
-        params = np.asarray(params, dtype=float)
-        parameter_draws = []
-        n_failed = 0
-
-        for bootstrap_weights in sample_weights:
-            # This multiplies the bootstrap draw by any original likelihood
-            # weights; it only mutates the newly generated draw.
-            combined_weights = get_bootstrap_weights2(
-                bootstrap_weights, self.weights
-            )
-            try:
-                fit = self._fit_internal(
-                    params, weights=combined_weights, debug=False
-                )
-            except Exception:
-                n_failed += 1
-                continue
-
-            draw = np.asarray(fit.x, dtype=float)
-            if fit.converged and np.all(np.isfinite(draw)):
-                parameter_draws.append(draw.copy())
-            else:
-                n_failed += 1
-
-        parameter_draws = np.asarray(parameter_draws, dtype=float)
-        if len(parameter_draws) < 2:
-            raise RuntimeError(
-                "Fewer than two Bayesian bootstrap repetitions converged; "
-                "the bootstrap covariance cannot be estimated"
-            )
-
-        cov_params = np.atleast_2d(
-            np.cov(parameter_draws, rowvar=False)
-        )
-        use_correction = bool(cov_kwds.get('use_correction', True))
-        if use_correction:
-            n_successful = len(parameter_draws)
-            cov_params *= n_successful / (n_successful - 1.0)
-        cov_params = (cov_params + cov_params.T) / 2.0
-
-        if debug and n_failed:
-            print(
-                f'Bayesian bootstrap retained {len(parameter_draws)} of '
-                f'{n_samples} repetitions.'
-            )
-
-        bootstrap_kwds = {
-            'method': method,
-            'n_samples': int(n_samples),
-            'n_successful': len(parameter_draws),
-            'n_failed': n_failed,
-            'seed': seed,
-            'alpha': alpha,
-            'use_correction': use_correction,
-        }
-        return cov_params, parameter_draws, bootstrap_kwds
-
-    def fit(self, start_params, debug=False, cov_type='SANDWICH',
-            cov_kwds=None):
-        """Estimate parameters and a likelihood-based covariance matrix.
-
-        For ``cov_type='BOOTSTRAP'``, ``cov_kwds`` may contain ``n_samples``,
-        ``seed``, ``alpha``, and ``use_correction``.  Every Bayesian-bootstrap
-        draw is multiplied by, rather than substituted for, any original
-        observation weights.
-        """
-        cov_type = str(cov_type).upper()
-        if cov_type not in {'SANDWICH', 'NONROBUST', 'BOOTSTRAP'}:
-            raise ValueError(
-                "cov_type must be 'SANDWICH', 'NONROBUST', or 'BOOTSTRAP'"
-            )
-        cov_kwds = {} if cov_kwds is None else dict(cov_kwds)
-
-        fit_start = time.perf_counter()
-        optimization_result = self._fit_internal(
-            start_params, weights=self.weights, debug=debug
-        )
-        fit_elapsed = time.perf_counter() - fit_start
-
-        bootstrapped_params = None
-        bootstrap_string = None
-        covariance_start = time.perf_counter()
-        if cov_type == 'BOOTSTRAP':
-            information = None
-            bread = None
-            meat = None
-            cov_params, bootstrapped_params, cov_kwds = (
-                self._bayesian_bootstrap(
-                    optimization_result.x, cov_kwds, debug=debug
-                )
-            )
-            bootstrap_string = (
-                f"Did {len(bootstrapped_params)} Bayesian bootstrap "
-                f"repetitions, alpha={cov_kwds['alpha']:.3f}."
-            )
-        else:
-            hess = self.hessian(optimization_result.x)
-            information = -hess
-            try:
-                bread = np.linalg.inv(information)
-            except np.linalg.LinAlgError:
-                bread = np.linalg.pinv(information)
-            bread = (bread + bread.T) / 2.0
-
-            if cov_type == 'SANDWICH':
-                score_obs = self.score_obs(optimization_result.x)
-                if self.is_weighted:
-                    score_obs = (
-                        score_obs * np.asarray(self.weights)[:, None]
-                    )
-                meat = score_obs.T @ score_obs
-                cov_params = bread @ meat @ bread.T
-                cov_params = (cov_params + cov_params.T) / 2.0
-            else:
-                meat = None
-                cov_params = bread.copy()
-        cov_elapsed = time.perf_counter() - covariance_start
-
-        params = np.asarray(optimization_result.x, dtype=float)
-        return DistributionalModelResults(
-            model=self,
-            params=params,
-            cov_params=cov_params,
-            cov_type=cov_type,
-            cov_kwds=cov_kwds,
-            llf=self.loglike(params),
-            converged=optimization_result.converged,
-            message=optimization_result.message,
-            method='BFGS-PQN',
-            optimization_result=optimization_result,
-            information=information,
-            bread=bread,
-            meat=meat,
-            bootstrapped_params=bootstrapped_params,
-            bootstrap_string=bootstrap_string,
-            fit_elapsed=fit_elapsed,
-            cov_elapsed=cov_elapsed,
-            iterations=optimization_result.iter,
-            score_at_params=self.score(params),
-            scale=1.0,
-        )
-
-
-class Poisson(DistributionalModel):
+class Poisson(_NonnegativeDistributionalModel):
     """Poisson log-link regression with conditional mean ``exp(X beta)``.
 
     The model has no separately estimated dispersion parameter.  It accepts
@@ -607,7 +56,7 @@ class Poisson(DistributionalModel):
     def _loglike_obs(self, params):
         """Compute unweighted Poisson log-likelihood contributions."""
         eta = self.exog @ params
-        return self.endog * eta - np.exp(eta) - gammaln(self.endog + 1.0)
+        return _poisson_loglike_obs(self.endog, eta)
 
     def loglike(self, params, *args, **kwargs):
         """Return the weighted or unweighted Poisson log-likelihood."""
@@ -615,13 +64,13 @@ class Poisson(DistributionalModel):
 
     def score(self, params, *args, **kwargs):
         """Return the analytical score of the aggregated likelihood."""
-        residual = self.endog - np.exp(self.exog @ params)
+        residual = _poisson_score_factor(self.endog, self.exog @ params)
         self._apply_weights(residual)
         return self.exog.T @ residual
 
     def score_obs(self, params, *args, **kwargs):
         """Return unweighted Poisson scores with shape ``(nobs, n_params)``."""
-        residual = self.endog - np.exp(self.exog @ params)
+        residual = _poisson_score_factor(self.endog, self.exog @ params)
         return self.exog * residual[:, None]
 
     def loglike_obs(self, params, *args, **kwargs):
@@ -629,240 +78,8 @@ class Poisson(DistributionalModel):
         return self._loglike_obs(params)
 
 
-class _ZeroInflatedModel(DistributionalModel):
-    """Shared data handling and mixture algebra for zero-inflated models.
-
-    ``exog_infl`` controls the probability that an observation is a structural
-    zero.  Its coefficients use a logit link.  When it is omitted, a single
-    intercept column is used.
-    """
-
-    def __init__(
-            self, endog, exog, weights=None, exog_infl=None,
-            exog_infl_names=None, endog_name=None, exog_names=None,
-            weights_name=None, exog_infl_formula=None,
-            exog_infl_term_names=None, exog_infl_term_to_indices=None,
-            **model_metadata):
-        """Initialize and validate count and zero-inflation design data.
-
-        Args:
-            endog: Finite non-negative response observations.
-            exog: Design matrix for the conditional count mean.
-            weights: Optional observation likelihood weights.
-            exog_infl: Optional design matrix for the structural-zero logit.
-                Defaults to an intercept-only matrix.
-            exog_infl_names: Optional names for columns of ``exog_infl``.
-            endog_name: Optional response name.
-            exog_names: Optional names for count-equation columns.
-            weights_name: Optional likelihood-weight variable name.
-            exog_infl_formula: Formula used to build the inflation matrix.
-            exog_infl_term_names: Terms represented by ``exog_infl``.
-            exog_infl_term_to_indices: Mapping from inflation terms to columns.
-            **model_metadata: Remaining metadata accepted by
-                :class:`DistributionalModel`.
-        """
-        endog = np.asarray(endog, dtype=float)
-        if endog.ndim != 1:
-            raise ValueError(
-                "Zero-inflated outcomes must be one-dimensional"
-            )
-        if np.any(~np.isfinite(endog)) or np.any(endog < 0.0):
-            raise ValueError(
-                "Zero-inflated outcomes must be finite and non-negative"
-            )
-
-        has_default_inflation = exog_infl is None
-        if has_default_inflation:
-            exog_infl = np.ones((len(endog), 1), dtype=float)
-        else:
-            exog_infl = np.asarray(exog_infl, dtype=float)
-            if exog_infl.ndim == 1:
-                exog_infl = exog_infl[:, None]
-        if exog_infl.ndim != 2 or exog_infl.shape[0] != len(endog):
-            raise ValueError(
-                "exog_infl must be two-dimensional with one row per outcome"
-            )
-        if np.any(~np.isfinite(exog_infl)):
-            raise ValueError("exog_infl must contain only finite values")
-
-        if exog_infl_names is not None:
-            exog_infl_names = [str(name) for name in exog_infl_names]
-            if len(exog_infl_names) != exog_infl.shape[1]:
-                raise ValueError(
-                    "exog_infl_names must match the columns of exog_infl"
-                )
-
-        self.exog_infl = exog_infl
-        self.exog_infl_names = exog_infl_names
-        self.k_inflate = exog_infl.shape[1]
-        self.exog_infl_formula = exog_infl_formula
-        self.exog_infl_term_names = (
-            ['Intercept']
-            if exog_infl_term_names is None and has_default_inflation
-            else (
-                None
-                if exog_infl_term_names is None
-                else list(exog_infl_term_names)
-            )
-        )
-        self.exog_infl_term_to_indices = (
-            {'Intercept': np.array([0])}
-            if exog_infl_term_to_indices is None and has_default_inflation
-            else exog_infl_term_to_indices
-        )
-        super().__init__(
-            endog,
-            exog,
-            weights=weights,
-            endog_name=endog_name,
-            exog_names=exog_names,
-            weights_name=weights_name,
-            **model_metadata,
-        )
-
-    @classmethod
-    def build_model_from_formula(
-            cls, formula, data, index=None, exog_infl=None, debug=False,
-            check_constant_cols=False, fail_on_missing=False,
-            cache_intermediate=True, sum_to_n=False,
-            test_formula_on_dummy=True, drop_1_for_FE=True, **model_kwargs):
-        """Build count and inflation equations from Patsy-style formulas.
-
-        Args:
-            formula: Full count-model formula, including the outcome and
-                optional ``$`` likelihood-weight expression.
-            data: DataFrame or dict-like object containing formula variables.
-            index: Optional boolean or integer row selector.
-            exog_infl: Patsy-style right-hand-side formula for the
-                structural-zero logit, such as ``'z1 + C(group)'``.  ``None``
-                creates a single constant column.
-            debug: Whether to print formula-construction diagnostics.
-            check_constant_cols: Whether to remove redundant constant columns.
-            fail_on_missing: Raise instead of dropping rows with missing data.
-            cache_intermediate: Formula-term cache configuration.
-            sum_to_n: Normalize likelihood weights to sum to retained rows.
-            test_formula_on_dummy: Validate the count formula on dummy data.
-            drop_1_for_FE: Apply the formula engine's drop-one categorical rule.
-            **model_kwargs: Additional constructor arguments.
-
-        Returns:
-            An unfitted zero-inflated model of type ``cls`` with aligned count,
-            inflation, response, and weight arrays.
-        """
-        if exog_infl is not None and not isinstance(exog_infl, str):
-            raise TypeError(
-                "exog_infl must be a Patsy-style string or None when using "
-                "build_model_from_formula"
-            )
-
-        # Formula-derived inflation names replace matrix-API names.
-        if exog_infl is not None:
-            model_kwargs.pop('exog_infl_names', None)
-
-        constructor_kwargs = super()._get_formula_constructor_kwargs(
-            formula=formula,
-            data=data,
-            index=index,
-            debug=debug,
-            check_constant_cols=check_constant_cols,
-            fail_on_missing=fail_on_missing,
-            cache_intermediate=cache_intermediate,
-            # Normalize only after inflation-specific missing rows are removed;
-            # the final retained sample size is the appropriate target.
-            sum_to_n=False,
-            test_formula_on_dummy=test_formula_on_dummy,
-            drop_1_for_FE=drop_1_for_FE,
-        )
-        inflation_kwargs = {}
-
-        if exog_infl is not None:
-            data_frame = dict_2_dataframe(data)
-            inflation_obj = SparseDataGetter.sparse_dmatrix(
-                exog_infl,
-                data_frame,
-                debug=debug,
-                check_constant_cols=check_constant_cols,
-                cache_intermediate=cache_intermediate,
-                drop_1_for_FE=drop_1_for_FE,
-                name='EXOG_INFL',
-                index=index,
-            )
-            inflation_null_rows = inflation_obj.null_rows.copy()
-            if fail_on_missing and inflation_null_rows:
-                missing_rows = sorted(int(row) for row in inflation_null_rows)
-                raise MissingDataException(
-                    "Inflation exog has missing data in rows "
-                    f"{missing_rows}!"
-                )
-
-            main_valid_rows = np.asarray(
-                constructor_kwargs['valid_obs_rows'], dtype=int
-            )
-            keep_main_rows = ~np.isin(
-                main_valid_rows, list(inflation_null_rows)
-            )
-            final_valid_rows = main_valid_rows[keep_main_rows]
-            if len(final_valid_rows) == 0:
-                raise ValueError(
-                    "No valid observations remain after aligning exog_infl"
-                )
-
-            constructor_kwargs['endog'] = (
-                constructor_kwargs['endog'][keep_main_rows]
-            )
-            constructor_kwargs['exog'] = (
-                constructor_kwargs['exog'][keep_main_rows]
-            )
-            if constructor_kwargs['weights'] is not None:
-                constructor_kwargs['weights'] = (
-                    constructor_kwargs['weights'][keep_main_rows]
-                )
-
-            # Inflation values still refer to the original selected-row space.
-            inflation_obj.slice_null_rows(final_valid_rows)
-            exog_infl_values = inflation_obj.values
-            if hasattr(exog_infl_values, 'toarray'):
-                exog_infl_values = exog_infl_values.toarray()
-            exog_infl_values = np.asarray(exog_infl_values, dtype=float)
-            if exog_infl_values.ndim == 1:
-                exog_infl_values = exog_infl_values[:, None]
-
-            null_rows_info = constructor_kwargs['null_rows_info_dict'].copy()
-            null_rows_info['EXOG_INFL'] = inflation_null_rows
-            constructor_kwargs['null_rows_info_dict'] = null_rows_info
-            constructor_kwargs['valid_obs_rows'] = final_valid_rows
-            inflation_kwargs = {
-                'exog_infl': exog_infl_values,
-                'exog_infl_names': list(inflation_obj.column_names),
-                'exog_infl_formula': exog_infl,
-                'exog_infl_term_names': list(inflation_obj.term_names),
-                'exog_infl_term_to_indices': (
-                    inflation_obj.var_2_col_indices
-                ),
-            }
-
-        if sum_to_n and constructor_kwargs['weights'] is not None:
-            weights = constructor_kwargs['weights']
-            weights_sum = weights.sum()
-            if weights_sum <= 0.0:
-                raise ValueError(
-                    "weights must have a positive sum when sum_to_n=True"
-                )
-            constructor_kwargs['weights'] = (
-                weights * len(constructor_kwargs['endog']) / weights_sum
-            )
-
-        supplied_kwargs = set(constructor_kwargs) | set(inflation_kwargs)
-        duplicate_kwargs = supplied_kwargs.intersection(model_kwargs)
-        if duplicate_kwargs:
-            duplicates = ', '.join(sorted(duplicate_kwargs))
-            raise TypeError(
-                f'Formula construction supplies these arguments: {duplicates}'
-            )
-
-        return cls(
-            **constructor_kwargs, **inflation_kwargs, **model_kwargs
-        )
+class _ZeroInflatedModel(TwoPartModel):
+    """Mixture algebra shared by zero-inflated count models."""
 
     def _get_inflation_param_names(self):
         """Return prefixed parameter names for the inflation equation."""
@@ -873,22 +90,88 @@ class _ZeroInflatedModel(DistributionalModel):
             return ['inflate_const']
         return [f'inflate_x{i}' for i in range(self.k_inflate)]
 
+    def _mixture_start_components(self):
+        """Return count, inflation, probability, and latent-mean starts."""
+        observed_mean, _ = self._response_moments()
+        is_zero = (self.endog == 0.0).astype(float)
+        if self.weights is None:
+            zero_fraction = float(np.mean(is_zero))
+        else:
+            total_weight = float(np.sum(self.weights))
+            if total_weight <= 0.0:
+                raise ValueError(
+                    'Cannot initialize parameters without positive total weight'
+                )
+            zero_fraction = float(
+                np.dot(self.weights, is_zero) / total_weight
+            )
+
+        baseline_mean = max(observed_mean, 1e-6)
+        poisson_zero_probability = float(np.exp(-baseline_mean))
+        denominator = 1.0 - poisson_zero_probability
+        if denominator > 1e-8:
+            inflation_probability = (
+                zero_fraction - poisson_zero_probability
+            ) / denominator
+        else:
+            inflation_probability = 0.05
+        inflation_probability = float(np.clip(
+            inflation_probability, 0.02, 0.80
+        ))
+
+        latent_mean = max(
+            observed_mean / (1.0 - inflation_probability), 1e-6
+        )
+        count_start = self._mean_regression_start(latent_mean)
+        inflation_logit = (
+            np.log(inflation_probability)
+            - np.log1p(-inflation_probability)
+        )
+        inflation_start = self._constant_predictor_start(
+            self.exog_infl, inflation_logit
+        )
+        return (
+            count_start,
+            inflation_start,
+            inflation_probability,
+            latent_mean,
+        )
+
+    def get_start_params(self):
+        """Return moment-based count and structural-zero starting values."""
+        count_start, inflation_start, _, _ = (
+            self._mixture_start_components()
+        )
+        return np.concatenate((count_start, inflation_start))
+
     def _count_zero_probability(self, params, count_mean):
         """Return the count component's probability of zero."""
         raise NotImplementedError
 
     def predict(
-            self, params, exog=None, exog_infl=None, which='mean'):
+            self, params, exog=None, exog_infl=None, which='mean',
+            data=None, index=None, debug=False):
         """Predict mixture means and structural or observed-zero probabilities.
 
         Args:
             params: Full count-then-inflation parameter vector.
             exog: Optional count-component numeric design matrix.
             exog_infl: Optional structural-zero numeric design matrix.
+            data: Optional new data evaluated through both stored formulas.
+            index: Optional positional row selector applied to ``data``.
+            debug: Whether formula construction prints diagnostics.
             which: ``'mean'``, ``'count_mean'``,
                 ``'inflation_probability'``, ``'zero_probability'``, or
                 ``'positive_probability'``.
         """
+        if data is not None:
+            if exog is not None or exog_infl is not None:
+                raise ValueError(
+                    'Supply either data or numeric component designs, not both'
+                )
+            exog, exog_infl = self._get_formula_prediction_designs(
+                data, index=index, debug=debug
+            )
         params = np.asarray(params, dtype=float).reshape(-1)
         if len(params) != len(self.param_names):
             raise ValueError('params has the wrong length')
@@ -1085,11 +368,38 @@ class ZeroInflatedNegativeBinomial(_ZeroInflatedModel):
             + ['log_alpha']
         )
 
+    def get_start_params(self):
+        """Return mixture starts plus an NB-2 moment dispersion."""
+        count_start, inflation_start, inflation_probability, latent_mean = (
+            self._mixture_start_components()
+        )
+        _, observed_variance = self._response_moments()
+        count_probability = 1.0 - inflation_probability
+        count_variance = (
+            observed_variance
+            - inflation_probability * count_probability * latent_mean ** 2
+        ) / count_probability
+        alpha = (
+            (count_variance - latent_mean) / latent_mean ** 2
+        )
+        log_alpha = self._log_dispersion_start(alpha, upper=3.0)
+        return np.concatenate((
+            count_start, inflation_start, [log_alpha]
+        ))
+
     def _count_zero_probability(self, params, count_mean):
         """Return the NB-2 component probability of a zero count."""
-        alpha = np.exp(np.asarray(params, dtype=float)[-1])
-        with np.errstate(over='ignore', invalid='ignore'):
-            return np.exp(-np.log1p(alpha * count_mean) / alpha)
+        log_alpha = np.asarray(params, dtype=float)[-1]
+        if log_alpha <= _POISSON_LIMIT_LOG_ALPHA:
+            return np.exp(-count_mean)
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            alpha = np.exp(log_alpha)
+            zero_probability = np.exp(
+                -np.log1p(alpha * count_mean) / alpha
+            )
+        return np.where(
+            np.isfinite(zero_probability), zero_probability, np.nan
+        )
 
     def _distribution_terms(self, params):
         """Compute stable NB-2 terms and split the two coefficient vectors."""
@@ -1115,6 +425,15 @@ class ZeroInflatedNegativeBinomial(_ZeroInflatedModel):
 
     def _count_loglike_terms(self, params):
         """Return observed and zero NB-2 log-likelihood contributions."""
+        if params[-1] <= _POISSON_LIMIT_LOG_ALPHA:
+            k_count = self.exog.shape[1]
+            eta = self.exog @ params[:k_count]
+            mean = np.exp(eta)
+            return (
+                _poisson_loglike_obs(self.endog, eta),
+                -mean,
+                params[k_count:k_count + self.k_inflate],
+            )
         eta, size, log_alpha, log_denom, inflation_params, valid = (
             self._distribution_terms(params)
         )
@@ -1149,6 +468,24 @@ class ZeroInflatedNegativeBinomial(_ZeroInflatedModel):
 
     def _score_factors(self, params):
         """Return count, inflation, and log-dispersion score factors."""
+        if params[-1] <= _POISSON_LIMIT_LOG_ALPHA:
+            k_count = self.exog.shape[1]
+            eta = self.exog @ params[:k_count]
+            count_loglike = _poisson_loglike_obs(self.endog, eta)
+            with np.errstate(over='ignore', invalid='ignore'):
+                mean = np.exp(eta)
+            count_loglike_zero = -mean
+            inflation_params = params[
+                k_count:k_count + self.k_inflate
+            ]
+            _, posterior_count, d_inflation_eta = self._mixture_terms(
+                inflation_params, count_loglike, count_loglike_zero
+            )
+            d_count_eta = posterior_count * _poisson_score_factor(
+                self.endog, eta
+            )
+            return d_count_eta, d_inflation_eta, np.zeros(self.nobs)
+
         eta, size, log_alpha, log_denom, inflation_params, valid = (
             self._distribution_terms(params)
         )
@@ -1227,7 +564,7 @@ class ZeroInflatedNegativeBinomial(_ZeroInflatedModel):
         return self._loglike_obs(params)
 
 
-class GeneralizedPoisson(DistributionalModel):
+class GeneralizedPoisson(_NonnegativeDistributionalModel):
     """Generalized-Poisson regression with raw dispersion ``alpha``.
 
     ``p=1`` gives GP-1 with variance ``mu * (1 + alpha) ** 2``;
@@ -1270,6 +607,10 @@ class GeneralizedPoisson(DistributionalModel):
     def get_param_names(self):
         """Return coefficient names followed by the raw ``alpha`` parameter."""
         return self._get_regression_param_names() + ['alpha']
+
+    def get_start_params(self):
+        """Return log-mean coefficients and a stable near-Poisson alpha."""
+        return np.append(self._mean_regression_start(), 0.05)
 
     def _distribution_terms(self, params):
         """Compute reusable generalized-Poisson likelihood terms.
@@ -1361,6 +702,26 @@ class GeneralizedPoisson(DistributionalModel):
             np.where(valid, d_alpha, np.nan),
         )
 
+    def _inference_issues(self, params):
+        """Flag invalid or near-boundary generalized-Poisson support."""
+        eta, mu, mu_p, _, a1, a2 = self._distribution_terms(params)
+        valid = self._valid_distribution_terms(
+            eta, mu, mu_p, a1, a2
+        )
+        if not np.all(valid):
+            return [
+                'The fitted generalized-Poisson parameters violate the '
+                'distribution support.'
+            ]
+        relative_a2 = a2 / np.maximum(mu, 1.0)
+        support_margin = min(float(np.min(a1)), float(np.min(relative_a2)))
+        if support_margin <= 1e-5:
+            return [
+                'The generalized-Poisson estimate is on or extremely near '
+                'its parameter-dependent support boundary.'
+            ]
+        return []
+
     def loglike(self, params, *args, **kwargs):
         """Return the aggregated generalized-Poisson log-likelihood."""
         return self._weighted_sum(self._loglike_obs(params))
@@ -1382,7 +743,7 @@ class GeneralizedPoisson(DistributionalModel):
         return self._loglike_obs(params)
 
 
-class NegativeBinomial1(DistributionalModel):
+class NegativeBinomial1(_NonnegativeDistributionalModel):
     """NB-1 log-link regression with variance ``mu * (1 + alpha)``.
 
     The conditional mean is ``mu = exp(X beta)`` and
@@ -1395,37 +756,66 @@ class NegativeBinomial1(DistributionalModel):
         """Return coefficient names followed by ``log_alpha``."""
         return self._get_regression_param_names() + ['log_alpha']
 
+    def get_start_params(self):
+        """Return log-mean coefficients and an NB-1 moment dispersion."""
+        mean, variance = self._response_moments()
+        safe_mean = max(mean, 1e-6)
+        alpha = (variance - safe_mean) / safe_mean
+        return np.append(
+            self._mean_regression_start(safe_mean),
+            self._log_dispersion_start(alpha),
+        )
+
     def _loglike_obs(self, params):
         """Compute unweighted NB-1 log-likelihood contributions."""
         log_alpha = params[-1]
         eta = self.exog @ params[:-1]
-        size = np.exp(eta - log_alpha)
-        log1p_alpha = np.logaddexp(0.0, log_alpha)
+        if log_alpha <= _POISSON_LIMIT_LOG_ALPHA:
+            return _poisson_loglike_obs(self.endog, eta)
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            size = np.exp(eta - log_alpha)
+            log1p_alpha = np.logaddexp(0.0, log_alpha)
 
-        return (
+            values = (
                 gammaln(self.endog + size)
                 - gammaln(size)
                 - gammaln(self.endog + 1.0)
                 - size * log1p_alpha
                 + self.endog * (log_alpha - log1p_alpha)
-        )
+            )
+        valid = np.isfinite(size) & (size > 0.0) & np.isfinite(values)
+        return np.where(valid, values, -np.inf)
 
     def _score_factors(self, params):
         """Compute NB-1 derivatives with respect to ``eta`` and ``log_alpha``."""
         log_alpha = params[-1]
         eta = self.exog @ params[:-1]
-        size = np.exp(eta - log_alpha)
-        log1p_alpha = np.logaddexp(0.0, log_alpha)
+        if log_alpha <= _POISSON_LIMIT_LOG_ALPHA:
+            return (
+                _poisson_score_factor(self.endog, eta),
+                np.zeros(self.nobs),
+            )
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            size = np.exp(eta - log_alpha)
+            log1p_alpha = np.logaddexp(0.0, log_alpha)
         alpha_ratio = expit(log_alpha)
-        d_eta = size * (
-                digamma(self.endog + size) - digamma(size) - log1p_alpha
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            d_eta = size * (
+                    digamma(self.endog + size) - digamma(size) - log1p_alpha
+            )
+            d_log_alpha = (
+                    -d_eta
+                    + self.endog * (1.0 - alpha_ratio)
+                    - size * alpha_ratio
+            )
+        valid = (
+            np.isfinite(size) & (size > 0.0)
+            & np.isfinite(d_eta) & np.isfinite(d_log_alpha)
         )
-        d_log_alpha = (
-                -d_eta
-                + self.endog * (1.0 - alpha_ratio)
-                - size * alpha_ratio
+        return (
+            np.where(valid, d_eta, np.nan),
+            np.where(valid, d_log_alpha, np.nan),
         )
-        return d_eta, d_log_alpha
 
     def loglike(self, params, *args, **kwargs):
         """Return the weighted or unweighted NB-1 log-likelihood."""
@@ -1448,7 +838,7 @@ class NegativeBinomial1(DistributionalModel):
         return self._loglike_obs(params)
 
 
-class NegativeBinomial2(DistributionalModel):
+class NegativeBinomial2(_NonnegativeDistributionalModel):
     """NB-2 log-link regression with variance ``mu + alpha * mu ** 2``.
 
     The conditional mean is ``mu = exp(X beta)`` and
@@ -1460,34 +850,63 @@ class NegativeBinomial2(DistributionalModel):
         """Return coefficient names followed by ``log_alpha``."""
         return self._get_regression_param_names() + ['log_alpha']
 
+    def get_start_params(self):
+        """Return log-mean coefficients and an NB-2 moment dispersion."""
+        mean, variance = self._response_moments()
+        safe_mean = max(mean, 1e-6)
+        alpha = (variance - safe_mean) / safe_mean ** 2
+        return np.append(
+            self._mean_regression_start(safe_mean),
+            self._log_dispersion_start(alpha),
+        )
+
     def _loglike_obs(self, params):
         """Compute unweighted NB-2 log-likelihood contributions."""
         log_alpha = params[-1]
-        size = np.exp(-log_alpha)
         eta = self.exog @ params[:-1]
-        log_denom = np.logaddexp(0.0, eta + log_alpha)
+        if log_alpha <= _POISSON_LIMIT_LOG_ALPHA:
+            return _poisson_loglike_obs(self.endog, eta)
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            size = np.exp(-log_alpha)
+            log_denom = np.logaddexp(0.0, eta + log_alpha)
 
-        return (
+            values = (
                 gammaln(self.endog + size)
                 - gammaln(size)
                 - gammaln(self.endog + 1.0)
                 - size * log_denom
                 + self.endog * (eta + log_alpha - log_denom)
-        )
+            )
+        valid = np.isfinite(size) & (size > 0.0) & np.isfinite(values)
+        return np.where(valid, values, -np.inf)
 
     def _score_factors(self, params):
         """Compute NB-2 derivatives with respect to ``eta`` and ``log_alpha``."""
         log_alpha = params[-1]
-        size = np.exp(-log_alpha)
-        z = self.exog @ params[:-1] + log_alpha
-        log_denom = np.logaddexp(0.0, z)
-        d_eta = self.endog - (self.endog + size) * expit(z)
-        d_log_alpha = (
-                d_eta
-                + size * (digamma(size) - digamma(self.endog + size)
-                          + log_denom)
+        eta = self.exog @ params[:-1]
+        if log_alpha <= _POISSON_LIMIT_LOG_ALPHA:
+            return (
+                _poisson_score_factor(self.endog, eta),
+                np.zeros(self.nobs),
+            )
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            size = np.exp(-log_alpha)
+            z = eta + log_alpha
+            log_denom = np.logaddexp(0.0, z)
+            d_eta = self.endog - (self.endog + size) * expit(z)
+            d_log_alpha = (
+                    d_eta
+                    + size * (digamma(size) - digamma(self.endog + size)
+                              + log_denom)
+            )
+        valid = (
+            np.isfinite(size) & (size > 0.0)
+            & np.isfinite(d_eta) & np.isfinite(d_log_alpha)
         )
-        return d_eta, d_log_alpha
+        return (
+            np.where(valid, d_eta, np.nan),
+            np.where(valid, d_log_alpha, np.nan),
+        )
 
     def loglike(self, params, *args, **kwargs):
         """Return the weighted or unweighted NB-2 log-likelihood."""
@@ -1519,23 +938,3 @@ __all__ = [
     'ZeroInflatedPoisson',
     'ZeroInflatedNegativeBinomial',
 ]
-
-
-if __name__ == '__main__':
-    np.random.seed(0)
-    n = 40
-    x = np.exp(np.random.randn(n))
-    v = .05
-    y = (np.exp(.2) * x ** .8) * np.exp(v * np.random.randn(n)) * np.exp(-v**2/2)
-    X = np.vstack([np.ones(n), np.log(x)]).T
-    w = np.exp(np.random.randn(n))
-
-    poisson = Poisson.build_model_from_formula('y ~ np.log(x) $ w', dict(x=x,y=y,w=w))
-    fit = poisson.fit([.1] * X.shape[1], cov_type='bootstrap')
-    print(fit.summary_df())
-
-    poisson = GeneralizedPoisson.build_model_from_formula('y ~ np.log(x) $ w', dict(x=x,y=y,w=w))
-    fit = poisson.fit([.1] * 3, cov_type='bootstrap', cov_kwds={'n_samples': 1000})
-    print(fit.summary_df())
-
-    #print(GLM(y, X, var_weights=w, family='poisson', cov_type='hc1'))

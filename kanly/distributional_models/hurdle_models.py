@@ -14,12 +14,22 @@ coefficients prefixed with ``hurdle_``.
 from __future__ import absolute_import, print_function
 
 from abc import abstractmethod
+from collections import Counter
+import time
+import warnings
 
 import numpy as np
 from scipy.special import expit
 
-from kanly.distributional_models.count_models import _ZeroInflatedModel
+from kanly.bootstrap.bootstrap import (
+    DEFAULT_BB_ALPHA,
+    DEFAULT_BB_SEED,
+    DEFAULT_BOOTSTRAP_N_SAMPLES,
+    get_bayesian_bootstrap_weights,
+    get_bootstrap_weights2,
+)
 from kanly.distributional_models.results import DistributionalModelResults
+from kanly.distributional_models.two_part import TwoPartModel
 from kanly.regression.generalized_linear_models.families import (
     Bernoulli,
     Gamma as GammaFamily,
@@ -36,19 +46,22 @@ from kanly.regression.generalized_linear_models.model import (
 HurdleModelResults = DistributionalModelResults
 
 
-class HurdleModel(_ZeroInflatedModel):
+class HurdleModel(TwoPartModel):
     """Base class for separable zero-hurdle and positive-response GLMs.
 
     ``exog`` controls the positive conditional response.  ``exog_infl``
     controls ``P(Y=0)`` through a Bernoulli/logit GLM and defaults to a single
-    constant.  Observation ``weights`` are passed to both component GLMs as
-    variance weights; the positive component receives the subset associated
-    with positive responses.
+    constant. Observation ``weights`` multiply the component estimating
+    equations as importance weights; the positive component receives the
+    subset associated with positive responses.
 
     Subclasses specify the positive GLM family and link.  The inherited
     formula builder accepts ``exog_infl`` as a Patsy-style right-hand-side
     formula and rejects instruments through the distributional-model parser.
     """
+
+    _requires_both_outcome_parts = True
+    is_quasi_likelihood = False
 
     def __init__(self, *args, **kwargs):
         """Initialize aligned hurdle data and validate both response parts."""
@@ -104,6 +117,37 @@ class HurdleModel(_ZeroInflatedModel):
             self._get_regression_param_names()
             + self._get_inflation_param_names()
         )
+
+    def get_start_params(self):
+        """Return family-aware positive and empirical hurdle starts."""
+        positive_endog = self.endog[self.is_positive]
+        positive_weights = (
+            None if self.weights is None else self.weights[self.is_positive]
+        )
+        positive_intercept = self.positive_family.get_starting_intercept(
+            positive_endog,
+            var_weights=positive_weights,
+            link=self.positive_link,
+        )
+        positive_start = self._constant_predictor_start(
+            self.exog[self.is_positive], positive_intercept
+        )
+
+        if self.weights is None:
+            zero_probability = float(np.mean(self.is_zero))
+        else:
+            zero_probability = float(
+                np.dot(self.weights, self.is_zero.astype(float))
+                / np.sum(self.weights)
+            )
+        zero_probability = float(np.clip(zero_probability, 1e-4, 1 - 1e-4))
+        hurdle_intercept = (
+            np.log(zero_probability) - np.log1p(-zero_probability)
+        )
+        hurdle_start = self._constant_predictor_start(
+            self.exog_infl, hurdle_intercept
+        )
+        return np.concatenate((positive_start, hurdle_start))
 
     @property
     def k_positive(self):
@@ -231,13 +275,17 @@ class HurdleModel(_ZeroInflatedModel):
     def _normalize_cov_type(cov_type):
         """Map distributional covariance terminology to GLM terminology."""
         cov_type = str(cov_type).upper()
-        if cov_type == 'SANDWICH':
+        if cov_type in {'SANDWICH', 'HC1'}:
+            return cov_type, 'NONROBUST'
+        if cov_type == 'COMPONENT_HC1':
             return cov_type, 'HC1'
-        if cov_type in {'HC1', 'NONROBUST', 'BOOTSTRAP'}:
+        if cov_type == 'BOOTSTRAP':
+            return cov_type, 'NONROBUST'
+        if cov_type == 'NONROBUST':
             return cov_type, cov_type
         raise ValueError(
-            "cov_type must be 'SANDWICH', 'HC1', 'NONROBUST', or "
-            "'BOOTSTRAP'"
+            "cov_type must be 'SANDWICH', 'HC1', 'COMPONENT_HC1', "
+            "'NONROBUST', or 'BOOTSTRAP'"
         )
 
     @staticmethod
@@ -262,7 +310,7 @@ class HurdleModel(_ZeroInflatedModel):
         return result
 
     def fit(
-            self, start_params=None, debug=False, cov_type='NONROBUST',
+            self, start_params=None, debug=False, cov_type='SANDWICH',
             cov_kwds=None, positive_fit_kwargs=None,
             hurdle_fit_kwargs=None, **glm_fit_kwargs):
         """Fit the positive and zero-hurdle GLMs separately and merge them.
@@ -271,10 +319,11 @@ class HurdleModel(_ZeroInflatedModel):
             start_params: Optional combined starting vector in positive-then-
                 hurdle order.
             debug: Whether to show GLM fitting diagnostics.
-            cov_type: ``'NONROBUST'``, ``'SANDWICH'``/``'HC1'``, or
-                ``'BOOTSTRAP'``.  Each component computes this covariance and
-                the combined covariance is block diagonal.
-            cov_kwds: Common covariance keywords for both component GLMs.
+            cov_type: ``'NONROBUST'`` for block-diagonal model information,
+                ``'SANDWICH'``/``'HC1'`` for a full observation-score robust
+                covariance, ``'COMPONENT_HC1'`` for the historical block-
+                diagonal component estimator, or ``'BOOTSTRAP'``.
+            cov_kwds: Hurdle-level covariance and bootstrap options.
             positive_fit_kwargs: Overrides passed only to the positive GLM.
             hurdle_fit_kwargs: Overrides passed only to the Bernoulli GLM.
             **glm_fit_kwargs: Additional options shared by both GLM fits.
@@ -314,6 +363,9 @@ class HurdleModel(_ZeroInflatedModel):
 
         positive_start = positive_fit_kwargs.pop('start_params', None)
         hurdle_start = hurdle_fit_kwargs.pop('start_params', None)
+        if (start_params is None and positive_start is None
+                and hurdle_start is None):
+            start_params = self.get_start_params()
         if start_params is not None:
             if positive_start is not None or hurdle_start is not None:
                 raise TypeError(
@@ -326,63 +378,70 @@ class HurdleModel(_ZeroInflatedModel):
         common_kwargs.update({
             'debug': debug,
             'cov_type': component_cov_type,
-            'cov_kwds': cov_kwds,
+            # Hurdle-level covariance options are consumed below. Component
+            # GLMs receive only options valid for their native estimator.
+            'cov_kwds': {},
         })
         positive_kwargs = common_kwargs.copy()
         positive_kwargs.update(positive_fit_kwargs)
-        positive_kwargs['cov_kwds'] = cov_kwds.copy()
+        positive_kwargs['cov_kwds'] = {}
         positive_first_column_constant = self._first_column_is_constant(
             self.exog[self.is_positive]
         )
         positive_kwargs['fit_intercept'] = positive_first_column_constant
         hurdle_kwargs = common_kwargs.copy()
         hurdle_kwargs.update(hurdle_fit_kwargs)
-        hurdle_kwargs['cov_kwds'] = cov_kwds.copy()
+        hurdle_kwargs['cov_kwds'] = {}
         hurdle_first_column_constant = self._first_column_is_constant(
             self.exog_infl
         )
         hurdle_kwargs['fit_intercept'] = hurdle_first_column_constant
 
-        positive_weights = (
-            None
-            if self.weights is None
-            else self.weights[self.is_positive]
-        )
-        positive_fit = SparseGeneralizedLinearModel.GLM(
-            self.endog[self.is_positive],
-            self.exog[self.is_positive],
-            family=self.positive_family,
-            link=self.positive_link,
-            var_weights=positive_weights,
-            exog_names=self._get_regression_param_names(),
-            endog_name=self.endog_name,
-            var_weights_name=self.weights_name,
-            start_params=positive_start,
-            first_column_constant=positive_first_column_constant,
-            **positive_kwargs,
-        )
-        hurdle_fit = SparseGeneralizedLinearModel.GLM(
-            self.is_zero.astype(float),
-            self.exog_infl,
-            family=Bernoulli(),
-            link=Logit(),
-            var_weights=self.weights,
-            exog_names=self._get_inflation_param_names(),
-            endog_name=(
-                None
-                if self.endog_name is None
-                else f'{self.endog_name}_is_zero'
-            ),
-            var_weights_name=self.weights_name,
-            start_params=hurdle_start,
-            first_column_constant=hurdle_first_column_constant,
-            **hurdle_kwargs,
+        def fit_components(component_weights, positive_x0, hurdle_x0):
+            positive_weights = (
+                None if component_weights is None
+                else component_weights[self.is_positive]
+            )
+            positive_result = SparseGeneralizedLinearModel.GLM(
+                self.endog[self.is_positive],
+                self.exog[self.is_positive],
+                family=self.positive_family,
+                link=self.positive_link,
+                var_weights=positive_weights,
+                exog_names=self._get_regression_param_names(),
+                endog_name=self.endog_name,
+                var_weights_name=self.weights_name,
+                start_params=positive_x0,
+                first_column_constant=positive_first_column_constant,
+                **positive_kwargs,
+            )
+            hurdle_result = SparseGeneralizedLinearModel.GLM(
+                self.is_zero.astype(float),
+                self.exog_infl,
+                family=Bernoulli(),
+                link=Logit(),
+                var_weights=component_weights,
+                exog_names=self._get_inflation_param_names(),
+                endog_name=(
+                    None
+                    if self.endog_name is None
+                    else f'{self.endog_name}_is_zero'
+                ),
+                var_weights_name=self.weights_name,
+                start_params=hurdle_x0,
+                first_column_constant=hurdle_first_column_constant,
+                **hurdle_kwargs,
+            )
+            return positive_result, hurdle_result
+
+        positive_fit, hurdle_fit = fit_components(
+            self.weights, positive_start, hurdle_start
         )
 
         self._positive_scale = float(positive_fit.scale)
         self.positive_model_fit = positive_fit
         self.hurdle_model_fit = hurdle_fit
-        covariance = self._block_diagonal(
+        component_covariance = self._block_diagonal(
             self._component_covariance(positive_fit),
             self._component_covariance(hurdle_fit),
         )
@@ -390,23 +449,296 @@ class HurdleModel(_ZeroInflatedModel):
             np.asarray(positive_fit.params, dtype=float),
             np.asarray(hurdle_fit.params, dtype=float),
         ))
-        converged = bool(positive_fit.converged and hurdle_fit.converged)
+        positive_scale = float(positive_fit.scale)
+        score_at_params = self.score(
+            params, positive_scale=positive_scale
+        )
+        weight_total = (
+            float(self.nobs)
+            if self.weights is None else float(np.sum(self.weights))
+        )
+        normalized_score = (
+            float(np.max(np.abs(score_at_params))) / max(weight_total, 1.0)
+        )
+        optimizer_converged = bool(
+            positive_fit.converged and hurdle_fit.converged
+        )
+        first_order_valid = bool(
+            np.all(np.isfinite(score_at_params))
+            and normalized_score <= 1e-5
+        )
+        converged = optimizer_converged and first_order_valid
+        inference_issues = []
+        if not optimizer_converged:
+            inference_issues.append(
+                'At least one component GLM did not converge.'
+            )
+        if not first_order_valid:
+            inference_issues.append(
+                'The combined hurdle score did not satisfy the scaled '
+                'first-order condition.'
+            )
+
+        bread = None
+        meat = None
+        information = None
+        bootstrapped_params = None
+        bootstrap_string = None
+        bootstrap_cov_elapsed = 0.0
+        covariance = component_covariance
+        if display_cov_type in {'SANDWICH', 'HC1'}:
+            bread = component_covariance
+            if bread is not None:
+                score_obs = self.score_obs(
+                    params, positive_scale=positive_scale
+                )
+                if self.weights is not None:
+                    score_obs = score_obs * self.weights[:, None]
+                meat = score_obs.T @ score_obs
+                covariance = bread @ meat @ bread.T
+                if display_cov_type == 'HC1':
+                    covariance *= self.nobs / max(
+                        self.nobs - len(params), 1
+                    )
+                covariance = (covariance + covariance.T) / 2.0
+        elif display_cov_type == 'NONROBUST':
+            bread = component_covariance
+        elif display_cov_type == 'BOOTSTRAP' and converged:
+            bootstrap_start = time.perf_counter()
+            n_samples = cov_kwds.get(
+                'n_samples', DEFAULT_BOOTSTRAP_N_SAMPLES
+            )
+            if (isinstance(n_samples, bool)
+                    or not isinstance(n_samples, (int, np.integer))
+                    or n_samples < 2):
+                raise ValueError(
+                    'n_samples must be an integer of at least 2'
+                )
+            seed = cov_kwds.get('seed', DEFAULT_BB_SEED)
+            alpha = cov_kwds.get('alpha', DEFAULT_BB_ALPHA)
+            if (not np.isscalar(alpha) or not np.isfinite(alpha)
+                    or alpha <= 0.0):
+                raise ValueError('alpha must be a finite positive scalar')
+            method = str(cov_kwds.get('method', 'BAYESIAN')).upper()
+            if method != 'BAYESIAN':
+                raise ValueError(
+                    "Hurdle bootstrap covariance supports only "
+                    "method='BAYESIAN'"
+                )
+            min_success_rate = cov_kwds.get('min_success_rate', 0.8)
+            if (not np.isscalar(min_success_rate)
+                    or not np.isfinite(min_success_rate)
+                    or not 0.0 <= min_success_rate <= 1.0):
+                raise ValueError(
+                    'min_success_rate must be between 0 and 1'
+                )
+
+            bootstrap_weights, _ = get_bayesian_bootstrap_weights(
+                self.nobs,
+                n_samples=n_samples,
+                seed=seed,
+                alpha=alpha,
+            )
+            draws = []
+            failure_reasons = Counter()
+            point_positive = params[:self.k_positive]
+            point_hurdle = params[self.k_positive:]
+            for draw_weights in bootstrap_weights:
+                combined_weights = get_bootstrap_weights2(
+                    draw_weights, self.weights
+                )
+                try:
+                    draw_positive, draw_hurdle = fit_components(
+                        combined_weights, point_positive, point_hurdle
+                    )
+                except Exception as error:
+                    failure_reasons[
+                        f'{type(error).__name__}: {error}'
+                    ] += 1
+                    continue
+                draw = np.concatenate((
+                    np.asarray(draw_positive.params, dtype=float),
+                    np.asarray(draw_hurdle.params, dtype=float),
+                ))
+                draw_valid = bool(
+                    draw_positive.converged
+                    and draw_hurdle.converged
+                    and np.all(np.isfinite(draw))
+                )
+                if draw_valid:
+                    draw_score_obs = self.score_obs(
+                        draw, positive_scale=float(draw_positive.scale)
+                    )
+                    draw_score = (
+                        draw_score_obs * combined_weights[:, None]
+                    ).sum(axis=0)
+                    draw_normalized_score = (
+                        float(np.max(np.abs(draw_score)))
+                        / max(float(np.sum(combined_weights)), 1.0)
+                    )
+                    draw_valid = bool(
+                        np.all(np.isfinite(draw_score))
+                        and draw_normalized_score <= 1e-5
+                    )
+                if draw_valid:
+                    draws.append(draw)
+                elif (draw_positive.converged and draw_hurdle.converged
+                      and np.all(np.isfinite(draw))):
+                    failure_reasons[
+                        'Combined bootstrap first-order validation failed '
+                        f'(scaled score={draw_normalized_score:.3e})'
+                    ] += 1
+                else:
+                    failure_reasons['Component non-convergence'] += 1
+
+            bootstrapped_params = np.asarray(draws, dtype=float)
+            minimum_successes = max(
+                2, int(np.ceil(float(min_success_rate) * n_samples))
+            )
+            if len(bootstrapped_params) < minimum_successes:
+                failures = '; '.join(
+                    f'{count} x {reason}'
+                    for reason, count in failure_reasons.most_common(3)
+                )
+                raise RuntimeError(
+                    f'Only {len(bootstrapped_params)} of {n_samples} '
+                    'coherent hurdle bootstrap repetitions converged; '
+                    f'at least {minimum_successes} were required. {failures}'
+                )
+
+            use_correction = bool(
+                cov_kwds.get('use_correction', True)
+            )
+            covariance = np.atleast_2d(np.cov(
+                bootstrapped_params, rowvar=False, ddof=0
+            ))
+            if use_correction:
+                covariance *= (
+                    len(bootstrapped_params)
+                    / (len(bootstrapped_params) - 1.0)
+                )
+            covariance = (covariance + covariance.T) / 2.0
+            n_failed = n_samples - len(bootstrapped_params)
+            if n_failed:
+                warnings.warn(
+                    'Hurdle bootstrap retained '
+                    f'{len(bootstrapped_params)} of {n_samples} coherent '
+                    'repetitions.',
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            cov_kwds = {
+                'method': method,
+                'n_samples': int(n_samples),
+                'n_successful': len(bootstrapped_params),
+                'n_failed': n_failed,
+                'seed': seed,
+                'alpha': alpha,
+                'use_correction': use_correction,
+                'min_success_rate': float(min_success_rate),
+                'failure_reasons': dict(failure_reasons),
+                'joint_draws': True,
+            }
+            bootstrap_string = (
+                f'Did {len(bootstrapped_params)} coherent Bayesian hurdle '
+                f'bootstrap repetitions, alpha={alpha:.3f}.'
+            )
+            bootstrap_cov_elapsed = time.perf_counter() - bootstrap_start
+
+        information_rank = None
+        information_condition = None
+        information_min_eigenvalue = None
+        if bread is not None and np.all(np.isfinite(bread)):
+            bread = (bread + bread.T) / 2.0
+            bread_rank = int(np.linalg.matrix_rank(bread))
+            bread_condition = float(np.linalg.cond(bread))
+            bread_eigenvalues = np.linalg.eigvalsh(bread)
+            bread_eigenvalue_tolerance = (
+                np.finfo(float).eps * max(len(params), 1)
+                * max(float(np.max(np.abs(bread_eigenvalues))), 1.0)
+            )
+            if (bread_rank == len(params)
+                    and np.isfinite(bread_condition)
+                    and bread_condition <= 1e12
+                    and np.min(bread_eigenvalues)
+                    > bread_eigenvalue_tolerance):
+                information = np.linalg.inv(bread)
+                information = (information + information.T) / 2.0
+                information_rank = int(np.linalg.matrix_rank(information))
+                information_condition = float(np.linalg.cond(information))
+                information_min_eigenvalue = float(np.min(
+                    np.linalg.eigvalsh(information)
+                ))
+            else:
+                inference_issues.append(
+                    'The block-diagonal hurdle bread is rank deficient or '
+                    'ill-conditioned, or not positive definite.'
+                )
+                covariance = None
+
+        inference_valid = bool(
+            converged
+            and covariance is not None
+            and np.all(np.isfinite(covariance))
+        )
+        if inference_valid:
+            covariance_eigenvalues = np.linalg.eigvalsh(covariance)
+            covariance_tolerance = (
+                np.finfo(float).eps * max(len(params), 1)
+                * max(float(np.max(np.abs(covariance_eigenvalues))), 1.0)
+            )
+            inference_valid = bool(
+                np.min(covariance_eigenvalues) >= -covariance_tolerance
+            )
+        if not inference_valid:
+            inference_issues.append(
+                'The combined hurdle covariance is unavailable, non-finite, '
+                'or not positive semidefinite.'
+            )
+            covariance = None
+
         message = (
             'Both component GLMs converged.'
             if converged
-            else 'At least one component GLM did not converge.'
+            else 'Hurdle fit diagnostics failed.'
         )
-        positive_scale = float(positive_fit.scale)
+        if inference_issues:
+            warnings.warn(
+                ' '.join(inference_issues), RuntimeWarning, stacklevel=2
+            )
         return DistributionalModelResults(
             model=self,
             params=params,
             llf=self.loglike(params, positive_scale=positive_scale),
             converged=converged,
+            optimizer_converged=optimizer_converged,
+            first_order_valid=first_order_valid,
+            inference_valid=inference_valid,
+            inference_issues=inference_issues,
+            normalized_score=normalized_score,
+            covariance_status=(
+                'valid full observation-score covariance'
+                if inference_valid and display_cov_type in {'SANDWICH', 'HC1'}
+                else (
+                    'valid coherent bootstrap covariance'
+                    if inference_valid and display_cov_type == 'BOOTSTRAP'
+                    else 'valid block-diagonal component covariance'
+                    if inference_valid else 'unavailable after diagnostics'
+                )
+            ),
             message=message,
             method='SEPARATE GLMS',
             positive_fit=positive_fit,
             hurdle_fit=hurdle_fit,
             cov_params=covariance,
+            information=information,
+            information_rank=information_rank,
+            information_condition=information_condition,
+            information_min_eigenvalue=information_min_eigenvalue,
+            bread=bread,
+            meat=meat,
+            bootstrapped_params=bootstrapped_params,
+            bootstrap_string=bootstrap_string,
             cov_type=display_cov_type,
             component_cov_type=component_cov_type,
             cov_kwds=cov_kwds,
@@ -418,26 +750,41 @@ class HurdleModel(_ZeroInflatedModel):
             cov_elapsed=(
                 float(positive_fit.cov_elapsed)
                 + float(hurdle_fit.cov_elapsed)
+                + bootstrap_cov_elapsed
             ),
             iterations=(positive_fit.num_iter, hurdle_fit.num_iter),
-            score_at_params=self.score(
-                params, positive_scale=positive_scale
-            ),
+            score_at_params=score_at_params,
             scale=positive_scale,
             loglike_kwargs={'positive_scale': positive_scale},
+            is_quasi_likelihood=self.is_quasi_likelihood,
+            report_information_criteria=(
+                not self.is_quasi_likelihood and not self.is_weighted
+            ),
         )
 
     def predict(
-            self, params, exog=None, exog_infl=None, which='mean'):
+            self, params, exog=None, exog_infl=None, which='mean',
+            data=None, index=None, debug=False):
         """Predict hurdle probabilities and conditional or overall means.
 
         Args:
             params: Combined parameter vector.
             exog: Optional positive-response design matrix.
             exog_infl: Optional zero-hurdle design matrix.
+            data: Optional new data evaluated through both stored formulas.
+            index: Optional positional row selector applied to ``data``.
+            debug: Whether formula construction prints diagnostics.
             which: One of ``'mean'``, ``'positive_mean'``,
                 ``'zero_probability'``, or ``'positive_probability'``.
         """
+        if data is not None:
+            if exog is not None or exog_infl is not None:
+                raise ValueError(
+                    'Supply either data or numeric component designs, not both'
+                )
+            exog, exog_infl = self._get_formula_prediction_designs(
+                data, index=index, debug=debug
+            )
         positive_params, hurdle_params = self._split_params(params)
         exog = self.exog if exog is None else np.asarray(exog, dtype=float)
         exog_infl = (
@@ -515,6 +862,8 @@ class GammaHurdle(HurdleModel):
     truncation normalization is needed.  The positive conditional mean uses a
     log link by default.
     """
+
+    is_quasi_likelihood = True
 
     def __init__(self, endog, exog, *args, positive_link=None, **kwargs):
         """Initialize the Gamma family and its configurable positive link."""

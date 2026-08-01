@@ -9,6 +9,7 @@ from kanly.distributional_models import (
     DistributionalModelResults,
     GammaHurdle,
     PoissonHurdle,
+    TwoPartModel,
 )
 from kanly.regression.generalized_linear_models.families import (
     Bernoulli,
@@ -132,7 +133,7 @@ class TestHurdleModels(unittest.TestCase):
         self.assertIsInstance(fit, DistributionalModelResults)
         self.assertTrue(fit.converged)
         self.assertEqual(fit.cov_type, 'SANDWICH')
-        self.assertEqual(fit.component_cov_type, 'HC1')
+        self.assertEqual(fit.component_cov_type, 'NONROBUST')
         self.assertIsInstance(fit.positive_fit.family, Gamma)
         self.assertIsInstance(fit.positive_fit.link, Log)
         np.testing.assert_allclose(
@@ -142,9 +143,14 @@ class TestHurdleModels(unittest.TestCase):
             fit.params[2:], hurdle_params, atol=0.1
         )
         self.assertAlmostEqual(fit.scale, 1.0 / shape, delta=0.04)
-        np.testing.assert_array_equal(
-            np.asarray(fit.cov_params())[:2, 2:], 0.0
+        self.assertGreater(
+            np.linalg.norm(np.asarray(fit.cov_params())[:2, 2:]), 0.0
         )
+        self.assertTrue(fit.is_quasi_likelihood)
+        self.assertIsNone(fit.aic)
+        self.assertIsNone(fit.bic)
+        self.assertIn('Quasi-Likelihood:', fit.summary())
+        self.assertNotIn('AIC:', fit.summary())
 
         expected_mean = (
             (1.0 - fit.zero_probability) * fit.positive_mean
@@ -176,6 +182,7 @@ class TestHurdleModels(unittest.TestCase):
         model = PoissonHurdle(
             endog, exog, exog_infl=exog_infl, weights=weights
         )
+        self.assertIsInstance(model, TwoPartModel)
         params = np.array([0.15, 0.2, -0.35, 0.25])
         score = model.score(params)
         numerical_score = np.empty_like(params)
@@ -197,6 +204,17 @@ class TestHurdleModels(unittest.TestCase):
             np.dot(weights, model.loglike_obs(params)),
         )
         self.assertEqual(model.score_obs(params).shape, (nobs, 4))
+
+        starts = model.get_start_params()
+        weighted_zero_fraction = np.dot(
+            weights, endog == 0.0
+        ) / weights.sum()
+        expected_hurdle_intercept = (
+            np.log(weighted_zero_fraction)
+            - np.log1p(-weighted_zero_fraction)
+        )
+        self.assertAlmostEqual(starts[2], expected_hurdle_intercept)
+        self.assertEqual(starts[3], 0.0)
 
     def test_formula_builder_names_alignment_and_default_hurdle(self):
         """Build explicit and constant hurdle designs through formula syntax."""
@@ -224,6 +242,21 @@ class TestHurdleModels(unittest.TestCase):
         self.assertEqual(model.exog_infl_formula, 'z')
         fit = model.fit(cov_type='NONROBUST')
         self.assertTrue(fit.converged)
+        prediction_data = pd.DataFrame(
+            {'x': [-0.4, 0.8], 'z': [0.2, -0.5]}
+        )
+        numeric_exog = np.column_stack((
+            np.ones(2), prediction_data['x']
+        ))
+        numeric_exog_infl = np.column_stack((
+            np.ones(2), prediction_data['z']
+        ))
+        np.testing.assert_allclose(
+            fit.predict(data=prediction_data),
+            fit.predict(
+                exog=numeric_exog, exog_infl=numeric_exog_infl
+            ),
+        )
 
         constant_model = PoissonHurdle.build_model_from_formula(
             'y ~ x', data
@@ -243,6 +276,54 @@ class TestHurdleModels(unittest.TestCase):
             GammaHurdle(np.array([1.0, 2.0, 3.0, 4.0]), exog)
         with self.assertRaisesRegex(ValueError, 'at least one zero'):
             GammaHurdle(np.zeros(4), exog)
+        with self.assertRaisesRegex(ValueError, 'finite and non-negative'):
+            GammaHurdle(np.array([0.0, -1.0, 2.0, 3.0]), exog)
+
+    def test_full_sandwich_and_coherent_hurdle_bootstrap(self):
+        """Retain robust cross blocks and joint full-sample bootstrap draws."""
+        rng = np.random.default_rng(812)
+        nobs = 300
+        _, _, exog, exog_infl = make_designs(rng, nobs)
+        zero_probability = 1.0 / (
+            1.0 + np.exp(-(-0.35 + 0.5 * exog_infl[:, 1]))
+        )
+        is_zero = rng.random(nobs) < zero_probability
+        endog = sample_zero_truncated_poisson(
+            rng, np.exp(0.2 + 0.25 * exog[:, 1])
+        )
+        endog[is_zero] = 0
+        model = PoissonHurdle(endog, exog, exog_infl=exog_infl)
+
+        sandwich = model.fit(cov_type='SANDWICH')
+        covariance = np.asarray(sandwich.cov_params())
+        self.assertTrue(sandwich.inference_valid)
+        self.assertGreater(np.linalg.norm(covariance[:2, 2:]), 0.0)
+        self.assertIsNotNone(sandwich.bread)
+        self.assertIsNotNone(sandwich.meat)
+
+        bootstrap = model.fit(
+            cov_type='BOOTSTRAP',
+            cov_kwds={
+                'n_samples': 4,
+                'seed': 44,
+                'min_success_rate': 0.5,
+            },
+        )
+        self.assertTrue(bootstrap.inference_valid)
+        self.assertEqual(bootstrap.bootstrapped_params.shape, (4, 4))
+        np.testing.assert_array_equal(
+            bootstrap.positive_bootstrapped_params,
+            bootstrap.bootstrapped_params[:, :model.k_positive],
+        )
+        np.testing.assert_array_equal(
+            bootstrap.hurdle_bootstrapped_params,
+            bootstrap.bootstrapped_params[:, model.k_positive:],
+        )
+        self.assertTrue(bootstrap.cov_kwds['joint_draws'])
+        np.testing.assert_allclose(
+            np.asarray(bootstrap.cov_params()),
+            np.cov(bootstrap.bootstrapped_params, rowvar=False, ddof=1),
+        )
 
 
 if __name__ == '__main__':

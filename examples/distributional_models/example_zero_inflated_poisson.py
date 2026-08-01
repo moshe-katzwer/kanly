@@ -43,10 +43,9 @@ def main():
         exog_infl='z',
     )
 
-    # Parameter order is count coefficients followed by inflation
-    # coefficients: beta_0, beta_x, gamma_0, gamma_z.
+    # The model supplies moment-based count and inflation starting values.
+    # Pass ``start_params=...`` here to override them when needed.
     fit = model.fit(
-        start_params=np.array([0.0, 0.0, -0.5, 0.0]),
         cov_type='NONROBUST',
     )
 
