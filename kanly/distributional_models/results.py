@@ -16,9 +16,9 @@ class DistributionalModelResults(RegressionResultsBase):
 
     The class supplies the normal-asymptotic inference, named covariance,
     summary, likelihood, score, prediction, bootstrap, and model metadata APIs
-    expected from other ``RegressionResultsBase`` subclasses.  Raw BFGS output
-    and hurdle component GLM fits are retained rather than exposed as the
-    public result object themselves.
+expected from other ``RegressionResultsBase`` subclasses.  Raw BFGS output
+and hurdle component estimator fits are retained rather than exposed as the
+public result object themselves.
     """
 
     def __init__(
@@ -61,7 +61,7 @@ class DistributionalModelResults(RegressionResultsBase):
             score_at_params: Aggregated score at the fitted parameters.
             scale: Distribution or positive-component scale shown in summaries.
             positive_fit: Positive-response component result for hurdle
-                models; either a GLM result or direct-likelihood result.
+                models; an OLS, GLM, or direct-likelihood result.
             hurdle_fit: Bernoulli/logit GLM result for hurdle models.
             component_cov_type: Native component covariance type for hurdles.
             specification_name: Optional summary title suffix.
@@ -219,7 +219,7 @@ class DistributionalModelResults(RegressionResultsBase):
         self.nobs_positive = int(self.nobs - self.nobs_zero)
         self.zero_fraction = self.nobs_zero / self.nobs
         if self.is_hurdle:
-            self.positive_scale = float(positive_fit.scale)
+            self.positive_scale = self.scale
             self.positive_bootstrapped_params = getattr(
                 positive_fit, 'bootstrapped_params', None
             )
@@ -567,11 +567,16 @@ class DistributionalModelResults(RegressionResultsBase):
                 'followed by hurdle coefficients.'
             )
             if self.is_quasi_likelihood:
+                quasi_footer = getattr(
+                    self.model, '_quasi_likelihood_footer', None
+                )
                 lines.append(
-                    'The Gamma positive component uses GLM estimating '
-                    'equations with Pearson-estimated scale. This is a '
-                    'quasi-likelihood fit; likelihood-based AIC and BIC are '
-                    'not reported.'
+                    quasi_footer()
+                    if callable(quasi_footer)
+                    else (
+                        'This is a quasi-likelihood fit; likelihood-based '
+                        'AIC and BIC are not reported.'
+                    )
                 )
         else:
             lines.append(

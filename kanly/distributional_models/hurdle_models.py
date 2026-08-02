@@ -2,11 +2,12 @@
 
 The zero hurdle is a Bernoulli GLM with a logit link for
 ``P(Y = 0 | exog_infl)``.  Conditional on crossing that hurdle, the response
-is modeled over the strictly positive observations. Poisson and Gamma use
-GLMs; negative-binomial-P uses an exact zero-truncated likelihood so its
-dispersion can be estimated. Because the likelihood separates, the two
-components are fitted independently and their coefficient vectors and
-covariance matrices are combined afterwards.
+is modeled over the strictly positive observations. Gaussian and lognormal
+components use OLS; Poisson, Gamma, and Inverse Gaussian use GLMs;
+negative-binomial-P uses an exact zero-truncated likelihood so its dispersion
+can be estimated. Because the likelihood separates, the two components are
+fitted independently and their coefficient vectors and covariance matrices
+are combined afterwards.
 
 Parameter order follows the count-model convention used by the zero-inflated
 classes: all positive-response parameters first, followed by zero-process
@@ -36,6 +37,7 @@ from kanly.distributional_models.two_part import TwoPartModel
 from kanly.regression.generalized_linear_models.families import (
     Bernoulli,
     Gamma as GammaFamily,
+    InverseGaussian as InverseGaussianFamily,
     ZeroTruncatedPoisson,
     _get_family_and_link,
 )
@@ -43,6 +45,7 @@ from kanly.regression.generalized_linear_models.links import Log, Logit
 from kanly.regression.generalized_linear_models.model import (
     SparseGeneralizedLinearModel,
 )
+from kanly.regression.linear_models.model import SparseLinearModel
 
 
 # Hurdle fits use the shared distributional-model result implementation.
@@ -391,6 +394,32 @@ class HurdleModel(TwoPartModel):
             **fit_kwargs,
         )
 
+    def _positive_fit_params(self, fit):
+        """Return positive-component parameters to merge into the hurdle fit."""
+        return np.asarray(fit.params, dtype=float).reshape(-1)
+
+    def _positive_fit_covariance(self, fit):
+        """Return the covariance for the merged positive parameters."""
+        return self._component_covariance(fit)
+
+    @staticmethod
+    def _positive_fit_converged(fit):
+        """Return component convergence, treating closed-form fits as solved."""
+        return bool(getattr(fit, 'converged', True))
+
+    @staticmethod
+    def _positive_fit_scale(fit):
+        """Return the positive-component scale used by hurdle likelihoods."""
+        return float(fit.scale)
+
+    def _quasi_likelihood_footer(self):
+        """Return the default quasi-likelihood summary explanation."""
+        return (
+            'The positive component uses GLM estimating equations with '
+            'Pearson-estimated scale. This is a quasi-likelihood fit; '
+            'likelihood-based AIC and BIC are not reported.'
+        )
+
     def _get_inflation_param_names(self):
         """Return hurdle-prefixed names for zero-logit coefficients."""
         if self.exog_infl_names is not None:
@@ -495,7 +524,7 @@ class HurdleModel(TwoPartModel):
         )
 
     def score_obs(self, params, positive_scale=None, *args, **kwargs):
-        """Return unweighted scores from both separable GLM components."""
+        """Return unweighted scores from both separable components."""
         del args, kwargs
         positive_params, hurdle_params = self._split_params(params)
         positive_scale = self._resolve_positive_scale(positive_scale)
@@ -537,7 +566,7 @@ class HurdleModel(TwoPartModel):
 
     @staticmethod
     def _normalize_cov_type(cov_type):
-        """Map distributional covariance terminology to GLM terminology."""
+        """Map distributional covariance terminology to component fits."""
         cov_type = str(cov_type).upper()
         if cov_type in {'SANDWICH', 'HC1'}:
             return cov_type, 'NONROBUST'
@@ -584,7 +613,7 @@ class HurdleModel(TwoPartModel):
         Args:
             start_params: Optional combined starting vector in positive-then-
                 hurdle order.
-            debug: Whether to show GLM fitting diagnostics.
+            debug: Whether to show component fitting diagnostics.
             cov_type: ``'NONROBUST'`` for block-diagonal model information,
                 ``'SANDWICH'``/``'HC1'`` for a full observation-score robust
                 covariance, ``'COMPONENT_HC1'`` for the historical block-
@@ -593,14 +622,15 @@ class HurdleModel(TwoPartModel):
             positive_fit_kwargs: Overrides passed only to the positive
                 component estimator.
             hurdle_fit_kwargs: Overrides passed only to the Bernoulli GLM.
-            **glm_fit_kwargs: Additional options shared by both GLM fits.
+            **glm_fit_kwargs: Additional options shared by both component
+                fits when supported. The zero hurdle is always a GLM.
 
         Returns:
             :class:`DistributionalModelResults` containing the two component
             fits and their combined parameters and covariance.
 
         With ``debug=True``, component designs and starts are printed, verbose
-        diagnostics are passed to both point-estimate GLMs, and coherent
+        diagnostics are passed to both point-estimate components, and coherent
         bootstrap refits are shown with a progress bar.
         """
         display_cov_type, component_cov_type = self._normalize_cov_type(
@@ -629,7 +659,7 @@ class HurdleModel(TwoPartModel):
             if duplicate:
                 names = ', '.join(sorted(duplicate))
                 raise TypeError(
-                    f'{label} GLM fit keywords cannot override: {names}'
+                    f'{label} component fit keywords cannot override: {names}'
                 )
 
         positive_start = positive_fit_kwargs.pop('start_params', None)
@@ -710,7 +740,7 @@ class HurdleModel(TwoPartModel):
             'debug': debug,
             'cov_type': component_cov_type,
             # Hurdle-level covariance options are consumed below. Component
-            # GLMs receive only options valid for their native estimator.
+            # Components receive only options valid for their native estimator.
             'cov_kwds': {},
         })
         positive_kwargs = common_kwargs.copy()
@@ -770,26 +800,30 @@ class HurdleModel(TwoPartModel):
         )
 
         if debug:
+            positive_converged = self._positive_fit_converged(positive_fit)
             print('\nComponent-fit diagnostics:')
             print(
                 '* Positive component converged: '
-                f'{positive_fit.converged}'
+                f'{positive_converged}'
             )
             print(f'* Zero-hurdle GLM converged: {hurdle_fit.converged}')
-            print(f'* Positive scale: {float(positive_fit.scale):.6g}')
+            print(
+                '* Positive scale: '
+                f'{self._positive_fit_scale(positive_fit):.6g}'
+            )
 
-        self._positive_scale = float(positive_fit.scale)
+        self._positive_scale = self._positive_fit_scale(positive_fit)
         self.positive_model_fit = positive_fit
         self.hurdle_model_fit = hurdle_fit
         component_covariance = self._block_diagonal(
-            self._component_covariance(positive_fit),
+            self._positive_fit_covariance(positive_fit),
             self._component_covariance(hurdle_fit),
         )
         params = np.concatenate((
-            np.asarray(positive_fit.params, dtype=float),
+            self._positive_fit_params(positive_fit),
             np.asarray(hurdle_fit.params, dtype=float),
         ))
-        positive_scale = float(positive_fit.scale)
+        positive_scale = self._positive_fit_scale(positive_fit)
         score_at_params = self.score(
             params, positive_scale=positive_scale
         )
@@ -801,7 +835,8 @@ class HurdleModel(TwoPartModel):
             float(np.max(np.abs(score_at_params))) / max(weight_total, 1.0)
         )
         optimizer_converged = bool(
-            positive_fit.converged and hurdle_fit.converged
+            self._positive_fit_converged(positive_fit)
+            and hurdle_fit.converged
         )
         first_order_valid = bool(
             np.all(np.isfinite(score_at_params))
@@ -811,7 +846,7 @@ class HurdleModel(TwoPartModel):
         inference_issues = []
         if not optimizer_converged:
             inference_issues.append(
-                'At least one component GLM did not converge.'
+                'At least one component estimator did not converge.'
             )
         if not first_order_valid:
             inference_issues.append(
@@ -903,10 +938,11 @@ class HurdleModel(TwoPartModel):
                 )
                 print(
                     '* The same observation-weight draw is used for both '
-                    'component GLMs.'
+                    'component estimators.'
                 )
                 print(
-                    '* Per-draw GLM output is suppressed; progress is shown.'
+                    '* Per-draw component output is suppressed; progress is '
+                    'shown.'
                 )
                 bootstrap_weights = tqdm(
                     bootstrap_weights,
@@ -932,17 +968,20 @@ class HurdleModel(TwoPartModel):
                     ] += 1
                     continue
                 draw = np.concatenate((
-                    np.asarray(draw_positive.params, dtype=float),
+                    self._positive_fit_params(draw_positive),
                     np.asarray(draw_hurdle.params, dtype=float),
                 ))
                 draw_valid = bool(
-                    draw_positive.converged
+                    self._positive_fit_converged(draw_positive)
                     and draw_hurdle.converged
                     and np.all(np.isfinite(draw))
                 )
                 if draw_valid:
                     draw_score_obs = self.score_obs(
-                        draw, positive_scale=float(draw_positive.scale)
+                        draw,
+                        positive_scale=self._positive_fit_scale(
+                            draw_positive
+                        ),
                     )
                     draw_score = (
                         draw_score_obs * combined_weights[:, None]
@@ -957,7 +996,8 @@ class HurdleModel(TwoPartModel):
                     )
                 if draw_valid:
                     draws.append(draw)
-                elif (draw_positive.converged and draw_hurdle.converged
+                elif (self._positive_fit_converged(draw_positive)
+                      and draw_hurdle.converged
                       and np.all(np.isfinite(draw))):
                     failure_reasons[
                         'Combined bootstrap first-order validation failed '
@@ -1244,6 +1284,301 @@ class HurdleModel(TwoPartModel):
         return predictions[which]
 
 
+class _OLSPositiveHurdle(HurdleModel):
+    """Shared closed-form OLS machinery for continuous positive components."""
+
+    _positive_distribution_name = 'Gaussian'
+    _ignored_glm_fit_options = {
+        'alpha', 'L2_penalty_matrix', 'l1_ratio', 'line_search_fallback',
+        'max_iter', 'normalize', 'opt_method', 'penalize_scale',
+        'pick_default_start', 'prompt_user_for_more_iters',
+        'regularize_to_values', 'store_convergence_path', 'tol',
+    }
+    _linear_fit_options = {
+        'compute_eigenvalues', 'dense_threshold_mb', 'inverse_method',
+        'scale_design_matrix', 'test_level', 'use_t',
+    }
+
+    @property
+    def positive_family(self):
+        """Return ``None`` because the positive component is fitted by OLS."""
+        return None
+
+    @property
+    def positive_link(self):
+        """Return ``None`` because OLS uses an identity linear predictor."""
+        return None
+
+    def _get_positive_param_names(self):
+        """Return OLS coefficients followed by the log residual variance."""
+        return self._get_regression_param_names() + ['log_scale']
+
+    def _positive_component_description(self):
+        """Return a concise description of the transformed OLS component."""
+        return f'{self._positive_distribution_name} via weighted OLS'
+
+    def _transform_positive_endog(self, endog):
+        """Return the response used by OLS; subclasses may transform it."""
+        return np.asarray(endog, dtype=float)
+
+    def _positive_log_jacobian(self):
+        """Return the response-transformation log Jacobian."""
+        return np.zeros(self.nobs_positive, dtype=float)
+
+    def _split_positive_params(self, params):
+        """Split positive regression coefficients and log variance."""
+        params = np.asarray(params, dtype=float).reshape(-1)
+        expected = self.exog.shape[1] + 1
+        if len(params) != expected:
+            raise ValueError(
+                f'Expected {expected} positive parameters but received '
+                f'{len(params)}'
+            )
+        beta = params[:-1]
+        log_scale = float(params[-1])
+        with np.errstate(over='ignore', invalid='ignore'):
+            scale = float(np.exp(log_scale))
+        if not np.isfinite(scale) or scale <= 0.0:
+            raise ValueError('log_scale must imply a finite positive scale')
+        return beta, log_scale, scale
+
+    def _get_positive_start_params(self):
+        """Return weighted constant-mean and residual-variance starts."""
+        transformed = self._transform_positive_endog(
+            self.endog[self.is_positive]
+        )
+        weights = (
+            np.ones(self.nobs_positive, dtype=float)
+            if self.weights is None
+            else self.weights[self.is_positive]
+        )
+        weight_total = float(np.sum(weights))
+        mean = float(np.dot(weights, transformed) / weight_total)
+        beta = self._constant_predictor_start(
+            self.exog[self.is_positive], mean
+        )
+        residual = transformed - self.exog[self.is_positive] @ beta
+        scale = float(np.dot(weights, residual ** 2) / weight_total)
+        scale = max(scale, np.finfo(float).eps)
+        return np.concatenate((beta, [np.log(scale)]))
+
+    def _positive_loglike_obs(self, params, positive_scale):
+        """Return Gaussian working-density contributions on the fit scale."""
+        beta, log_scale, scale = self._split_positive_params(params)
+        del positive_scale
+        transformed = self._transform_positive_endog(
+            self.endog[self.is_positive]
+        )
+        residual = transformed - self.exog[self.is_positive] @ beta
+        return (
+            -0.5 * (
+                np.log(2.0 * np.pi) + log_scale + residual ** 2 / scale
+            )
+            + self._positive_log_jacobian()
+        )
+
+    def _positive_score_obs(self, params, positive_scale):
+        """Return beta and log-variance likelihood scores."""
+        beta, _, scale = self._split_positive_params(params)
+        del positive_scale
+        transformed = self._transform_positive_endog(
+            self.endog[self.is_positive]
+        )
+        residual = transformed - self.exog[self.is_positive] @ beta
+        beta_score = self.exog[self.is_positive] * (
+            residual / scale
+        )[:, None]
+        scale_score = 0.5 * (residual ** 2 / scale - 1.0)
+        return np.column_stack((beta_score, scale_score))
+
+    def _positive_conditional_mean(self, params, exog):
+        """Return the Gaussian positive-component working mean."""
+        beta, _, _ = self._split_positive_params(params)
+        return exog @ beta
+
+    def _positive_underlying_mean(self, params, exog):
+        """Return the same mean because this component is not truncated."""
+        return self._positive_conditional_mean(params, exog)
+
+    def _fit_positive_component(
+            self, weights, start_params, fit_kwargs,
+            first_column_constant):
+        """Fit coefficients by kanly OLS and estimate Gaussian scale."""
+        del start_params
+        fit_kwargs = dict(fit_kwargs)
+        cov_type = str(fit_kwargs.pop('cov_type', 'NONROBUST')).upper()
+        cov_kwds = fit_kwargs.pop('cov_kwds', {})
+        debug = bool(fit_kwargs.pop('debug', False))
+        compute_cov = bool(fit_kwargs.pop('compute_cov', True))
+        fit_kwargs.pop('fit_intercept', None)
+
+        linear_options = {
+            name: fit_kwargs.pop(name)
+            for name in tuple(fit_kwargs)
+            if name in self._linear_fit_options
+        }
+        for name in self._ignored_glm_fit_options:
+            fit_kwargs.pop(name, None)
+        if fit_kwargs:
+            unsupported = ', '.join(sorted(fit_kwargs))
+            raise TypeError(
+                'The OLS positive component does not accept these fit '
+                f'options: {unsupported}'
+            )
+        if cov_type not in {'NONROBUST', 'HC1'}:
+            raise ValueError(
+                "The OLS positive component covariance must be 'NONROBUST' "
+                "or 'HC1'"
+            )
+
+        positive_endog = self._transform_positive_endog(
+            self.endog[self.is_positive]
+        )
+        positive_exog = self.exog[self.is_positive]
+        positive_weights = (
+            np.ones(self.nobs_positive, dtype=float)
+            if weights is None else np.asarray(weights, dtype=float)
+        )
+        positive_name = self.endog_name
+        if (positive_name is not None
+                and self._positive_distribution_name == 'Lognormal'):
+            positive_name = f'log({positive_name})'
+
+        # Covariance is assembled below using likelihood-importance weights,
+        # so avoid duplicating kanly's native WLS covariance calculation.
+        fit = SparseLinearModel.LM(
+            positive_endog,
+            positive_exog,
+            weights=None if weights is None else positive_weights,
+            has_constant=(
+                first_column_constant or self.has_implicit_constant
+            ),
+            exog_names=self._get_regression_param_names(),
+            endog_name=positive_name,
+            weights_name=self.weights_name,
+            debug=debug,
+            cov_type='NONROBUST',
+            cov_kwds={},
+            compute_cov=False,
+            keep_model=True,
+            **linear_options,
+        )
+        beta = np.asarray(fit.params, dtype=float).reshape(-1)
+        residual = positive_endog - positive_exog @ beta
+        weight_total = float(np.sum(positive_weights))
+        scale = float(
+            np.dot(positive_weights, residual ** 2) / weight_total
+        )
+        if not np.isfinite(scale) or scale <= np.finfo(float).tiny:
+            raise ValueError(
+                'The positive OLS residual variance must be finite and '
+                'strictly positive'
+            )
+
+        normalized_covariance = fit.normalized_cov_params
+        if hasattr(normalized_covariance, 'toarray'):
+            normalized_covariance = normalized_covariance.toarray()
+        normalized_covariance = np.asarray(
+            normalized_covariance, dtype=float
+        )
+        k_beta = positive_exog.shape[1]
+        bread = np.zeros((k_beta + 1, k_beta + 1), dtype=float)
+        bread[:k_beta, :k_beta] = scale * normalized_covariance
+        bread[-1, -1] = 2.0 / weight_total
+
+        full_covariance = None
+        if compute_cov:
+            if cov_type == 'NONROBUST':
+                full_covariance = bread
+            else:
+                beta_score = positive_exog * (residual / scale)[:, None]
+                scale_score = 0.5 * (residual ** 2 / scale - 1.0)
+                score_obs = np.column_stack((beta_score, scale_score))
+                weighted_score = score_obs * positive_weights[:, None]
+                meat = weighted_score.T @ weighted_score
+                full_covariance = bread @ meat @ bread.T
+                full_covariance *= self.nobs_positive / max(
+                    self.nobs_positive - (k_beta + 1), 1
+                )
+                full_covariance = (
+                    full_covariance + full_covariance.T
+                ) / 2.0
+            fit.set_cov_params(
+                full_covariance[:k_beta, :k_beta],
+                cov_type=cov_type,
+                cov_kwds=cov_kwds,
+                df_t_dist=fit.df_resid,
+            )
+
+        fit.scale = scale
+        fit.scale_mle = scale
+        fit.converged = True
+        fit._distributional_params = np.concatenate((
+            beta, [np.log(scale)]
+        ))
+        fit._distributional_covariance = full_covariance
+        return fit
+
+    @staticmethod
+    def _positive_fit_params(fit):
+        """Return OLS coefficients and the closed-form log variance."""
+        return np.asarray(fit._distributional_params, dtype=float)
+
+    @staticmethod
+    def _positive_fit_covariance(fit):
+        """Return joint coefficient/log-variance covariance."""
+        covariance = fit._distributional_covariance
+        return None if covariance is None else np.asarray(covariance)
+
+
+class GaussianHurdle(_OLSPositiveHurdle):
+    """Logit hurdle with a working Gaussian OLS positive component.
+
+    The positive observations are regressed directly on ``exog``. Since an
+    untruncated Gaussian distribution is not confined to ``(0, infinity)``,
+    this is reported as a quasi-likelihood two-part model rather than a fully
+    normalized positive-response likelihood.
+    """
+
+    is_quasi_likelihood = True
+    _positive_distribution_name = 'Gaussian'
+
+    def _quasi_likelihood_footer(self):
+        """Explain why positive-response Gaussian OLS is a working model."""
+        return (
+            'The positive component uses an untruncated Gaussian OLS working '
+            'model on observations restricted to Y>0. It is therefore '
+            'reported as quasi-likelihood; likelihood-based AIC and BIC are '
+            'not reported.'
+        )
+
+
+class LognormalHurdle(_OLSPositiveHurdle):
+    """Logit hurdle with OLS for a lognormal positive response.
+
+    OLS is fitted to ``log(Y)`` for positive observations. If its fitted
+    residual variance is ``scale``, then the positive-response median is
+    ``exp(X beta)`` and its conditional mean is
+    ``exp(X beta + scale / 2)``.
+    """
+
+    _positive_distribution_name = 'Lognormal'
+
+    def _transform_positive_endog(self, endog):
+        """Return ``log(Y)`` for the positive observations."""
+        return np.log(np.asarray(endog, dtype=float))
+
+    def _positive_log_jacobian(self):
+        """Return the lognormal transformation Jacobian ``-log(Y)``."""
+        return -np.log(self.endog[self.is_positive])
+
+    def _positive_conditional_mean(self, params, exog):
+        """Return the lognormal arithmetic mean on the outcome scale."""
+        beta, _, scale = self._split_positive_params(params)
+        with np.errstate(over='ignore', invalid='ignore'):
+            return np.exp(exog @ beta + 0.5 * scale)
+
+
 class PoissonHurdle(HurdleModel):
     """Hurdle model with Bernoulli/logit zeros and positive Poisson counts.
 
@@ -1310,6 +1645,43 @@ class GammaHurdle(HurdleModel):
     @property
     def positive_link(self):
         """Return the configured Gamma positive-response link."""
+        return self._positive_link_instance
+
+
+class InverseGaussianHurdle(HurdleModel):
+    """Logit hurdle with an Inverse Gaussian/log GLM for positive responses.
+
+    The zero equation models ``P(Y=0 | Z)`` with a Bernoulli logit. Given a
+    positive response, the conditional mean is ``exp(X beta)`` and the
+    Inverse Gaussian variance is ``scale * mu**3``. The positive component is
+    estimated by the existing GLM IRLS implementation, with scale estimated
+    from the Pearson residuals.
+
+    Because the scale is Pearson-estimated rather than jointly maximized, the
+    combined result is reported as quasi-likelihood and omits AIC and BIC.
+    """
+
+    is_quasi_likelihood = True
+
+    def __init__(self, endog, exog, *args, positive_link=None, **kwargs):
+        """Initialize the Inverse Gaussian family with a log link by default."""
+        (
+            self._positive_family_instance,
+            self._positive_link_instance,
+        ) = _get_family_and_link(
+            InverseGaussianFamily(),
+            Log() if positive_link is None else positive_link,
+        )
+        super().__init__(endog, exog, *args, **kwargs)
+
+    @property
+    def positive_family(self):
+        """Return the Inverse Gaussian GLM family."""
+        return self._positive_family_instance
+
+    @property
+    def positive_link(self):
+        """Return the configured positive-response link."""
         return self._positive_link_instance
 
 
@@ -1455,7 +1827,10 @@ class NegativeBinomialPHurdle(HurdleModel):
 __all__ = [
     'HurdleModel',
     'HurdleModelResults',
+    'GaussianHurdle',
+    'LognormalHurdle',
     'PoissonHurdle',
     'GammaHurdle',
+    'InverseGaussianHurdle',
     'NegativeBinomialPHurdle',
 ]

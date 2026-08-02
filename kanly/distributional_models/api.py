@@ -25,8 +25,11 @@ from kanly.distributional_models.count_models import (
     ZeroInflatedPoisson,
 )
 from kanly.distributional_models.hurdle_models import (
+    GaussianHurdle,
     GammaHurdle,
     HurdleModel,
+    InverseGaussianHurdle,
+    LognormalHurdle,
     NegativeBinomialPHurdle,
     PoissonHurdle,
 )
@@ -106,6 +109,24 @@ _MODEL_ALIAS_GROUPS = (
     ),
     _ModelAliasGroup(
         'GammaHurdle', GammaHurdle, ('gamma hurdle', 'hurdle gamma')
+    ),
+    _ModelAliasGroup(
+        'GaussianHurdle', GaussianHurdle,
+        (
+            'gaussian hurdle', 'normal hurdle', 'hurdle gaussian',
+            'hurdle normal', 'gaussian', 'normal',
+        ),
+    ),
+    _ModelAliasGroup(
+        'LognormalHurdle', LognormalHurdle,
+        (
+            'lognormal hurdle', 'log normal hurdle', 'hurdle lognormal',
+            'lognormal', 'log normal',
+        ),
+    ),
+    _ModelAliasGroup(
+        'InverseGaussianHurdle', InverseGaussianHurdle,
+        ('inverse gaussian hurdle', 'inverse gaussian', 'ig hurdle', 'igh'),
     ),
     _ModelAliasGroup(
         'Gamma', Gamma, ('gamma',)
@@ -194,7 +215,8 @@ def _model_constructor_options(model_class, p, positive_link):
     if model_class in {GeneralizedPoisson, NegativeBinomialPHurdle}:
         if p is not None:
             options['p'] = p
-    if model_class is GammaHurdle and positive_link is not None:
+    if model_class in {GammaHurdle, InverseGaussianHurdle} and (
+            positive_link is not None):
         options['positive_link'] = positive_link
     return options
 
@@ -315,7 +337,8 @@ def distributional_model(
             one-part models.
         p: Generalized-Poisson or negative-binomial-P parameterization. Ignored
             by other models. Class defaults apply when omitted.
-        positive_link: Gamma-hurdle positive-response link. Ignored otherwise.
+        positive_link: Gamma- or Inverse-Gaussian-hurdle positive-response
+            link. Ignored otherwise.
         start_params: Optional full starting parameter vector.
         debug: Print API dispatch, formula construction, and fit diagnostics.
         cov_type: Distributional covariance estimator.
@@ -334,8 +357,11 @@ def distributional_model(
             test_level, compute_cov, store_convergence_path,
             line_search_fallback, pick_default_start, opt_method,
             prompt_user_for_more_iters: Shared component-GLM controls used by
-            Poisson and Gamma hurdles. For NB-P hurdles they apply only to the
-            logit component; they are ignored by direct one-part models.
+            Poisson, Gamma, and Inverse Gaussian hurdles. For NB-P hurdles
+            they apply only to the logit component. Gaussian and lognormal
+            positive components use OLS, so iterative controls apply only to
+            their logit component. These controls are ignored by direct
+            one-part models.
 
     Returns:
         A fitted :class:`DistributionalModelResults` object.
@@ -420,7 +446,8 @@ def DISTRIBUTIONAL_MODEL(
             constant without an explicit constant column.
         p: Generalized-Poisson or NB-P-hurdle parameterization; ignored by
             other models.
-        positive_link: Gamma-hurdle positive-response link; ignored otherwise.
+        positive_link: Gamma- or Inverse-Gaussian-hurdle positive-response
+            link; ignored otherwise.
         start_params: Optional full starting parameter vector.
         debug: Print API dispatch and fitting diagnostics.
         cov_type: Distributional covariance estimator.

@@ -10,12 +10,13 @@
 > experimental and should be validated carefully before use in production or
 > consequential statistical analysis.
 
-This package provides compact, likelihood-based regression models for counts
-and positive continuous outcomes. Unlike the IRLS generalized-linear-model
-implementation, direct models jointly optimize all parameters in their
-likelihood, including Gamma and negative-binomial dispersion parameters.
-Hurdle models deliberately retain separable component estimation. Poisson and
-Gamma positive components use GLMs; negative-binomial-P uses an exact
+This package provides compact likelihood and estimating-equation regression
+models for counts and positive continuous outcomes. Unlike the IRLS
+generalized-linear-model implementation, direct models jointly optimize all
+parameters in their likelihood, including Gamma and negative-binomial
+dispersion parameters. Hurdle models deliberately retain separable component
+estimation. Gaussian and lognormal positive components use OLS; Poisson,
+Gamma, and Inverse Gaussian use GLMs; negative-binomial-P uses an exact
 zero-truncated likelihood so its dispersion can be estimated.
 
 The public base class is `DistributionalModel`. Source files are organized by
@@ -31,8 +32,8 @@ response structure:
   zero-inflated, and negative-binomial likelihoods.
 - [`continuous_models.py`](continuous_models.py) contains the continuous
   `Gamma` likelihood model.
-- [`hurdle_models.py`](hurdle_models.py) contains Poisson, Gamma, and
-  negative-binomial-P hurdle models.
+- [`hurdle_models.py`](hurdle_models.py) contains Gaussian, lognormal,
+  Poisson, Gamma, Inverse Gaussian, and negative-binomial-P hurdle models.
 - [`results.py`](results.py) contains the shared fitted-results object.
 
 All public model classes can be imported directly from
@@ -47,9 +48,12 @@ from kanly.distributional_models import (
     DistributionalModel,
     DistributionalModelResults,
     TwoPartModel,
+    GaussianHurdle,
     Gamma,
     GammaHurdle,
     GeneralizedPoisson,
+    InverseGaussianHurdle,
+    LognormalHurdle,
     NegativeBinomial1,
     NegativeBinomial2,
     NegativeBinomialPHurdle,
@@ -107,10 +111,11 @@ Both functions return `DistributionalModelResults`. They are also exported by
 The two functions intentionally have broad, explicit signatures. An argument
 that is irrelevant to the selected model is ignored: for example,
 `exog_infl` does nothing for `Poisson`, `p` does nothing for `Gamma`, and
-`positive_link` does nothing outside `GammaHurdle`. The important exceptions
-are malformed arguments that actually apply to the selected model, which are
-validated normally. Formula weights continue to use the `$` extension;
-array weights use the explicit `weights` argument.
+`positive_link` does nothing outside `GammaHurdle` and
+`InverseGaussianHurdle`. The important exceptions are malformed arguments
+that actually apply to the selected model, which are validated normally.
+Formula weights continue to use the `$` extension; array weights use the
+explicit `weights` argument.
 
 ### Model-name lookup
 
@@ -134,6 +139,9 @@ separators. Consequently, `"ZeroInflatedPoisson"`,
 | `NegativeBinomialPHurdle` | `negative binomial 1 hurdle`, `nb1 hurdle`, `hurdle nb1` | `p=1` |
 | `NegativeBinomialPHurdle` | `negative binomial 2 hurdle`, `nb2 hurdle`, `hurdle nb2` | `p=2` |
 | `GammaHurdle` | `GammaHurdle`, `gamma hurdle`, `hurdle gamma` | — |
+| `GaussianHurdle` | `GaussianHurdle`, `gaussian hurdle`, `normal hurdle`, `hurdle gaussian`, `hurdle normal`, `gaussian`, `normal` | — |
+| `LognormalHurdle` | `LognormalHurdle`, `lognormal hurdle`, `log normal hurdle`, `hurdle lognormal`, `lognormal`, `log normal` | — |
+| `InverseGaussianHurdle` | `InverseGaussianHurdle`, `inverse gaussian hurdle`, `inverse gaussian`, `ig hurdle`, `igh` | — |
 | `Gamma` | `Gamma` | — |
 
 An explicit `p` may be supplied with the general `GeneralizedPoisson` and
@@ -160,6 +168,9 @@ mu_i = exp(eta_i)
 | `ZeroInflatedNegativeBinomial` | Structural-zero mixture with NB-2 counts | Mixture variance | Inflation coefficients and `log_alpha` |
 | `PoissonHurdle` | Logit zero hurdle plus zero-truncated Poisson GLM | Two-part model | Hurdle coefficients |
 | `GammaHurdle` | Logit zero hurdle plus Gamma/log GLM quasi-likelihood | Two-part model | Hurdle coefficients; Pearson GLM scale |
+| `GaussianHurdle` | Logit zero hurdle plus working Gaussian OLS on positive `Y` | Positive variance `scale` | Estimated `log_scale`; hurdle coefficients |
+| `LognormalHurdle` | Logit zero hurdle plus OLS on positive `log(Y)` | Positive log-variance `scale` | Estimated `log_scale`; hurdle coefficients |
+| `InverseGaussianHurdle` | Logit zero hurdle plus Inverse Gaussian/log GLM quasi-likelihood | Positive variance `scale * mu**3` | Hurdle coefficients; Pearson GLM scale |
 | `NegativeBinomialPHurdle(p=1 or 2)` | Logit zero hurdle plus exact zero-truncated NB-P likelihood | `mu + alpha * mu**p` before truncation | Estimated `log_alpha`; hurdle coefficients |
 
 For models reporting `log_alpha`, the positive dispersion is
@@ -170,8 +181,10 @@ NB1 and `p=2` selects NB2 (the default).
 
 `Gamma`, imported from `continuous_models.py`, is a continuous distribution;
 its outcome must be finite and strictly positive. Zero-inflation and hurdle
-probabilities use a logit. `GammaHurdle` uses a log positive-response link by
-default and permits another supported GLM link through `positive_link`.
+probabilities use a logit. `GammaHurdle` and `InverseGaussianHurdle` use a log
+positive-response link by default and permit another supported GLM link
+through `positive_link`. `GaussianHurdle` regresses positive `Y` directly;
+`LognormalHurdle` regresses `log(Y)`.
 
 ## Basic Formula API
 
@@ -300,12 +313,27 @@ P(Y_i = y), y > 0 = (1 - pi_i) * f_positive(y | x_i)
 
 Unlike a zero-inflated model, the positive distribution cannot generate a
 zero. `PoissonHurdle` uses the `ZeroTruncatedPoisson` GLM family for the
-positive counts. `GammaHurdle` uses the ordinary Gamma family because Gamma
-already has support on `(0, infinity)`; its positive conditional mean uses a
-log link by default. `NegativeBinomialPHurdle` maximizes an exact
-zero-truncated NB-P likelihood for the positive counts. It does not route that
-component through the GLM family API because `alpha` is estimated rather than
-fixed.
+positive counts. `GammaHurdle` and `InverseGaussianHurdle` use their ordinary
+GLM families because both already have support on `(0, infinity)`; each uses
+a log positive-mean link by default and is estimated by IRLS. The Inverse
+Gaussian positive component has `Var(Y | Y>0, X) = scale * mu**3`.
+`GaussianHurdle` and `LognormalHurdle` use kanly's weighted OLS solver. The
+former regresses positive `Y` directly. The latter regresses `log(Y)`, giving
+
+```text
+median(Y | Y>0, X) = exp(X beta)
+mean(Y | Y>0, X) = exp(X beta + scale / 2)
+scale = exp(log_scale)
+```
+
+The ordinary Gaussian density is not restricted to positive values, so
+`GaussianHurdle` is a working quasi-likelihood model and does not report AIC
+or BIC. `LognormalHurdle` is a normalized positive-response likelihood and
+reports them for unweighted fits. Both estimate `log_scale` and include it in
+the parameter score, covariance, and bootstrap draws.
+`NegativeBinomialPHurdle` maximizes an exact zero-truncated NB-P likelihood for
+the positive counts. It does not route that component through the GLM family
+API because `alpha` is estimated rather than fixed.
 
 ```python
 from kanly.distributional_models import PoissonHurdle
@@ -318,7 +346,7 @@ model = PoissonHurdle.build_model_from_formula(
 fit = model.fit(cov_type="SANDWICH")
 
 print(fit.summary_df())
-print(fit.positive_fit)  # positive-response GLM
+print(fit.positive_fit)  # positive-response GLM, OLS, or direct fit
 print(fit.hurdle_fit)    # Bernoulli/logit GLM for P(Y=0)
 ```
 
@@ -344,9 +372,11 @@ probability. Use `which="positive_mean"`, `"underlying_mean"`,
 The combined distributional-model API keeps `loglike_obs` and `score_obs`
 unweighted and applies observation weights only when aggregating them. During
 component estimation those importance weights multiply the corresponding
-component likelihood or estimating-equation contributions. `GammaHurdle`
-retains Pearson-estimated scale, so it is explicitly reported as
-quasi-likelihood and does not report AIC or BIC.
+component likelihood or estimating-equation contributions. `GammaHurdle` and
+`InverseGaussianHurdle` retain Pearson-estimated scale, so they are explicitly
+reported as quasi-likelihood and do not report AIC or BIC. `GaussianHurdle`
+is also explicitly quasi-likelihood because its untruncated normal working
+density is evaluated only over positive observations.
 
 ### Negative-binomial-P hurdle parameters
 
@@ -467,6 +497,9 @@ Automatic starting values contain exactly one entry for every name returned by
 | `ZeroInflatedNegativeBinomial` | ZIP starts plus an NB-2 moment `log_alpha` |
 | `PoissonHurdle` | Zero-truncated Poisson positive start plus empirical zero-logit start |
 | `GammaHurdle` | Gamma positive start plus empirical zero-logit start |
+| `GaussianHurdle` | Positive-response mean and variance starts plus empirical zero-logit start |
+| `LognormalHurdle` | Log-positive-response mean and variance starts plus empirical zero-logit start |
+| `InverseGaussianHurdle` | Inverse Gaussian positive start plus empirical zero-logit start |
 | `NegativeBinomialPHurdle` | Positive-count log-mean and moment `log_alpha` starts plus empirical zero-logit start |
 
 An explicit `start_params` vector remains supported and must follow this
@@ -483,6 +516,9 @@ parameter order:
 | `ZeroInflatedNegativeBinomial` | count `beta`, inflation `gamma`, `log_alpha` |
 | `PoissonHurdle` | positive `beta`, hurdle `gamma` |
 | `GammaHurdle` | positive `beta`, hurdle `gamma` |
+| `GaussianHurdle` | positive `beta`, `log_scale`, hurdle `gamma` |
+| `LognormalHurdle` | log-positive `beta`, `log_scale`, hurdle `gamma` |
+| `InverseGaussianHurdle` | positive `beta`, hurdle `gamma` |
 | `NegativeBinomialPHurdle` | positive `beta`, `log_alpha`, hurdle `gamma` |
 
 For a design matrix with `k` columns, a common initial value for a positive
@@ -646,8 +682,10 @@ print(fit.bse)
 - Poisson, generalized-Poisson, negative-binomial, and zero-inflated models
   require finite, non-negative outcomes.
 - `PoissonHurdle` and `NegativeBinomialPHurdle` additionally require integer
-  outcomes. Every hurdle sample needs a zero and a strictly positive outcome
-  with positive weight.
+  outcomes. `GammaHurdle`, `InverseGaussianHurdle`, `GaussianHurdle`, and
+  `LognormalHurdle` accept continuous positive outcomes alongside zeros.
+  Every hurdle sample needs a zero and a strictly positive outcome with
+  positive weight.
 - An all-zero zero-inflated sample is rejected as unidentified. A sample with
   no observed zeros is flagged as a boundary fit and inference is suppressed.
 - Count distributions have a literal probability-mass interpretation for
