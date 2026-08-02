@@ -50,7 +50,8 @@ for alpha_ in [.5, 1, 10]:
         print()
 
         res = bfgs_pqn(obj_func, [0.] * (p + 1), maxiter=5_000, xtol=1e-10, ftol=1e-20, gtol=1e-8,
-                       momentum=.1, onesided_fd=False, B0=1e6, dx_fd=1e-8,
+                       momentum=.1, onesided_fd=False,
+                       H0=np.eye(p + 1) * 1e-6, use_inv_hessian=True, dx_fd=1e-8,
                        )
 
         print(res.converged, res.xerr, res.fun)

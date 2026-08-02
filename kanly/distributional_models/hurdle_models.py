@@ -1,13 +1,15 @@
-"""Two-part hurdle models estimated through separate GLM components.
+"""Two-part hurdle models estimated through separable components.
 
 The zero hurdle is a Bernoulli GLM with a logit link for
 ``P(Y = 0 | exog_infl)``.  Conditional on crossing that hurdle, the response
-is modeled by a second GLM over the strictly positive observations.  Because
-the likelihood separates, the two GLMs are fitted independently and their
-coefficient vectors and covariance matrices are combined afterwards.
+is modeled over the strictly positive observations. Poisson and Gamma use
+GLMs; negative-binomial-P uses an exact zero-truncated likelihood so its
+dispersion can be estimated. Because the likelihood separates, the two
+components are fitted independently and their coefficient vectors and
+covariance matrices are combined afterwards.
 
 Parameter order follows the count-model convention used by the zero-inflated
-classes: positive-response coefficients first, followed by zero-process
+classes: all positive-response parameters first, followed by zero-process
 coefficients prefixed with ``hurdle_``.
 """
 
@@ -19,7 +21,7 @@ import time
 import warnings
 
 import numpy as np
-from scipy.special import expit
+from scipy.special import digamma, expit, gammaln
 
 from kanly.bootstrap.bootstrap import (
     DEFAULT_BB_ALPHA,
@@ -29,6 +31,7 @@ from kanly.bootstrap.bootstrap import (
     get_bootstrap_weights2,
 )
 from kanly.distributional_models.results import DistributionalModelResults
+from kanly.distributional_models.base import _NonnegativeDistributionalModel
 from kanly.distributional_models.two_part import TwoPartModel
 from kanly.regression.generalized_linear_models.families import (
     Bernoulli,
@@ -46,8 +49,219 @@ from kanly.regression.generalized_linear_models.model import (
 HurdleModelResults = DistributionalModelResults
 
 
+_POISSON_LIMIT_LOG_ALPHA = float(np.log(1e-8))
+
+
+class _ZeroTruncatedNegativeBinomialP(_NonnegativeDistributionalModel):
+    """Exact NB-P regression conditional on observing a positive count.
+
+    This private component model exists to support
+    :class:`NegativeBinomialPHurdle`. Its regression predictor defines the
+    mean ``mu = exp(X beta)`` of the *untruncated* NB-P distribution and its
+    variance is ``mu + alpha * mu**p``. The fitted positive-response mean is
+    therefore ``mu / (1 - P(Y=0))``. Parameter order is ``beta`` followed by
+    ``log_alpha``.
+    """
+
+    def __init__(self, endog, exog, *args, p=2, **kwargs):
+        """Validate ``p`` and initialize a positive-count component model."""
+        if isinstance(p, bool) or p not in (1, 2):
+            raise ValueError('p must be either 1 (NB1) or 2 (NB2)')
+        self.p = int(p)
+        self.negative_binomial_p = self.p
+        values = np.asarray(endog, dtype=float)
+        if (np.any(~np.isfinite(values)) or np.any(values <= 0.0)
+                or np.any(values != np.floor(values))):
+            raise ValueError(
+                'Zero-truncated negative-binomial outcomes must be finite '
+                'positive integers'
+            )
+        super().__init__(endog, exog, *args, **kwargs)
+
+    def get_param_names(self):
+        """Return regression coefficient names followed by ``log_alpha``."""
+        return self._get_regression_param_names() + ['log_alpha']
+
+    def get_start_params(self):
+        """Return stable log-mean and conservative dispersion starts."""
+        mean, variance = self._response_moments()
+        safe_mean = max(mean, 1.0 + 1e-6)
+        if self.p == 1:
+            alpha = (variance - safe_mean) / safe_mean
+        else:
+            alpha = (variance - safe_mean) / safe_mean ** 2
+        if not np.isfinite(alpha) or alpha <= 0.0:
+            alpha = 0.25
+        return np.append(
+            self._mean_regression_start(safe_mean),
+            self._log_dispersion_start(alpha),
+        )
+
+    @staticmethod
+    def _poisson_limit_terms(endog, eta):
+        """Return zero-truncated Poisson likelihood and score limits."""
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            mu = np.exp(eta)
+            log_survival = np.log(-np.expm1(-mu))
+            loglike = (
+                endog * eta - mu - gammaln(endog + 1.0)
+                - log_survival
+            )
+            zero_odds = 1.0 / np.expm1(mu)
+            d_eta = endog - mu - mu * zero_odds
+        valid = (
+            np.isfinite(eta) & np.isfinite(mu)
+            & np.isfinite(loglike) & np.isfinite(d_eta)
+        )
+        return (
+            np.where(valid, loglike, -np.inf),
+            np.where(valid, d_eta, np.nan),
+        )
+
+    def _distribution_terms(self, params):
+        """Return ordinary NB-P and zero-mass likelihood derivatives."""
+        params = np.asarray(params, dtype=float).reshape(-1)
+        if len(params) != len(self.param_names):
+            raise ValueError(
+                f'Expected {len(self.param_names)} parameters but received '
+                f'{len(params)}'
+            )
+        beta = params[:-1]
+        log_alpha = float(params[-1])
+        eta = self.exog @ beta
+
+        if log_alpha <= _POISSON_LIMIT_LOG_ALPHA:
+            loglike, d_eta = self._poisson_limit_terms(self.endog, eta)
+            zeros = np.zeros(self.nobs, dtype=float)
+            return loglike, d_eta, zeros
+
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            mu = np.exp(eta)
+            alpha = np.exp(log_alpha)
+            if self.p == 1:
+                size = np.exp(eta - log_alpha)
+                log_denom = np.logaddexp(0.0, log_alpha)
+                alpha_ratio = expit(log_alpha)
+                ordinary_loglike = (
+                    gammaln(self.endog + size)
+                    - gammaln(size)
+                    - gammaln(self.endog + 1.0)
+                    - size * log_denom
+                    + self.endog * (log_alpha - log_denom)
+                )
+                ordinary_d_eta = size * (
+                    digamma(self.endog + size)
+                    - digamma(size) - log_denom
+                )
+                ordinary_d_log_alpha = (
+                    -ordinary_d_eta
+                    + self.endog * (1.0 - alpha_ratio)
+                    - size * alpha_ratio
+                )
+                log_pzero = -size * log_denom
+                zero_d_eta = log_pzero
+                zero_d_log_alpha = size * (
+                    log_denom - alpha_ratio
+                )
+            else:
+                size = np.exp(-log_alpha)
+                z = eta + log_alpha
+                log_denom = np.logaddexp(0.0, z)
+                mean_ratio = expit(z)
+                ordinary_loglike = (
+                    gammaln(self.endog + size)
+                    - gammaln(size)
+                    - gammaln(self.endog + 1.0)
+                    - size * log_denom
+                    + self.endog * (z - log_denom)
+                )
+                ordinary_d_eta = (
+                    self.endog - (self.endog + size) * mean_ratio
+                )
+                ordinary_d_log_alpha = (
+                    ordinary_d_eta
+                    + size * (
+                        digamma(size) - digamma(self.endog + size)
+                        + log_denom
+                    )
+                )
+                log_pzero = -size * log_denom
+                zero_d_eta = -size * mean_ratio
+                zero_d_log_alpha = size * (
+                    log_denom - mean_ratio
+                )
+
+            log_survival = np.log(-np.expm1(log_pzero))
+            zero_odds = 1.0 / np.expm1(-log_pzero)
+            loglike = ordinary_loglike - log_survival
+            d_eta = ordinary_d_eta + zero_odds * zero_d_eta
+            d_log_alpha = (
+                ordinary_d_log_alpha
+                + zero_odds * zero_d_log_alpha
+            )
+
+        valid = (
+            np.isfinite(mu) & (mu > 0.0)
+            & np.isfinite(alpha) & (alpha > 0.0)
+            & np.isfinite(size) & (size > 0.0)
+            & np.isfinite(loglike)
+            & np.isfinite(d_eta) & np.isfinite(d_log_alpha)
+        )
+        return (
+            np.where(valid, loglike, -np.inf),
+            np.where(valid, d_eta, np.nan),
+            np.where(valid, d_log_alpha, np.nan),
+        )
+
+    def loglike_obs(self, params, *args, **kwargs):
+        """Return unweighted zero-truncated NB-P log likelihoods."""
+        del args, kwargs
+        return self._distribution_terms(params)[0]
+
+    def score_obs(self, params, *args, **kwargs):
+        """Return unweighted scores for ``beta`` and ``log_alpha``."""
+        del args, kwargs
+        _, d_eta, d_log_alpha = self._distribution_terms(params)
+        return np.column_stack((
+            self.exog * d_eta[:, None], d_log_alpha
+        ))
+
+    def score(self, params, *args, **kwargs):
+        """Return the importance-weighted analytical aggregate score."""
+        del args, kwargs
+        values = self.score_obs(params)
+        if self.is_weighted:
+            values *= self.weights[:, None]
+        return values.sum(axis=0)
+
+    def log_zero_probability(self, params, exog=None):
+        """Return the underlying NB-P log probability of a zero count."""
+        params = np.asarray(params, dtype=float).reshape(-1)
+        exog = self.exog if exog is None else np.asarray(exog, dtype=float)
+        eta = exog @ params[:-1]
+        log_alpha = float(params[-1])
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            mu = np.exp(eta)
+            if log_alpha <= _POISSON_LIMIT_LOG_ALPHA:
+                log_pzero = -mu
+            elif self.p == 1:
+                size = np.exp(eta - log_alpha)
+                log_pzero = -size * np.logaddexp(0.0, log_alpha)
+            else:
+                size = np.exp(-log_alpha)
+                log_pzero = -size * np.logaddexp(
+                    0.0, eta + log_alpha
+                )
+        return log_pzero
+
+    def zero_probability(self, params, exog=None):
+        """Return the underlying NB-P probability of a zero count."""
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            return np.exp(self.log_zero_probability(params, exog=exog))
+
+
 class HurdleModel(TwoPartModel):
-    """Base class for separable zero-hurdle and positive-response GLMs.
+    """Base class for separable zero-hurdle and positive-response models.
 
     ``exog`` controls the positive conditional response.  ``exog_infl``
     controls ``P(Y=0)`` through a Bernoulli/logit GLM and defaults to a single
@@ -55,9 +269,9 @@ class HurdleModel(TwoPartModel):
     equations as importance weights; the positive component receives the
     subset associated with positive responses.
 
-    Subclasses specify the positive GLM family and link.  The inherited
-    formula builder accepts ``exog_infl`` as a Patsy-style right-hand-side
-    formula and rejects instruments through the distributional-model parser.
+    Subclasses specify the positive component. The inherited formula builder
+    accepts ``exog_infl`` as a Patsy-style right-hand-side formula and rejects
+    instruments through the distributional-model parser.
     """
 
     _requires_both_outcome_parts = True
@@ -102,6 +316,81 @@ class HurdleModel(TwoPartModel):
         """Return the GLM link instance for positive responses."""
         raise NotImplementedError
 
+    def _get_positive_param_names(self):
+        """Return parameter names belonging to the positive component."""
+        return self._get_regression_param_names()
+
+    def _positive_component_description(self):
+        """Return a concise family/link description for diagnostics."""
+        return (
+            f'{self.positive_family.name()} / '
+            f'{self.positive_link.name()} GLM'
+        )
+
+    def _get_positive_start_params(self):
+        """Return family-aware starts for the positive component."""
+        positive_endog = self.endog[self.is_positive]
+        positive_weights = (
+            None if self.weights is None else self.weights[self.is_positive]
+        )
+        positive_intercept = self.positive_family.get_starting_intercept(
+            positive_endog,
+            var_weights=positive_weights,
+            link=self.positive_link,
+        )
+        return self._constant_predictor_start(
+            self.exog[self.is_positive], positive_intercept
+        )
+
+    def _positive_loglike_obs(self, params, positive_scale):
+        """Return positive-component likelihood contributions."""
+        positive_eta = self.exog[self.is_positive] @ params
+        positive_mu = self.positive_link.inverse_link(positive_eta)
+        positive_theta = self.positive_family.b_deriv_inv(positive_mu)
+        return self.positive_family.log_likelihood_obs(
+            self.endog[self.is_positive],
+            positive_theta,
+            scale=positive_scale,
+            var_weights=1.0,
+        )
+
+    def _positive_score_obs(self, params, positive_scale):
+        """Return positive-component observation scores."""
+        positive_eta = self.exog[self.is_positive] @ params
+        positive_mu = self.positive_link.inverse_link(positive_eta)
+        variance = self.positive_family.variance(positive_mu)
+        link_derivative = self.positive_link.deriv(positive_mu)
+        positive_factor = (
+            self.endog[self.is_positive] - positive_mu
+        ) / (positive_scale * variance * link_derivative)
+        return self.exog[self.is_positive] * positive_factor[:, None]
+
+    def _positive_conditional_mean(self, params, exog):
+        """Return ``E[Y | Y>0, X]`` for the positive component."""
+        return self.positive_link.inverse_link(exog @ params)
+
+    def _positive_underlying_mean(self, params, exog):
+        """Return the positive component's untruncated/reference mean."""
+        return self._positive_conditional_mean(params, exog)
+
+    def _fit_positive_component(
+            self, weights, start_params, fit_kwargs,
+            first_column_constant):
+        """Fit the default positive component as a GLM."""
+        return SparseGeneralizedLinearModel.GLM(
+            self.endog[self.is_positive],
+            self.exog[self.is_positive],
+            family=self.positive_family,
+            link=self.positive_link,
+            var_weights=weights,
+            exog_names=self._get_positive_param_names(),
+            endog_name=self.endog_name,
+            var_weights_name=self.weights_name,
+            start_params=start_params,
+            first_column_constant=first_column_constant,
+            **fit_kwargs,
+        )
+
     def _get_inflation_param_names(self):
         """Return hurdle-prefixed names for zero-logit coefficients."""
         if self.exog_infl_names is not None:
@@ -114,24 +403,13 @@ class HurdleModel(TwoPartModel):
     def get_param_names(self):
         """Return positive coefficients followed by hurdle coefficients."""
         return (
-            self._get_regression_param_names()
+            self._get_positive_param_names()
             + self._get_inflation_param_names()
         )
 
     def get_start_params(self):
         """Return family-aware positive and empirical hurdle starts."""
-        positive_endog = self.endog[self.is_positive]
-        positive_weights = (
-            None if self.weights is None else self.weights[self.is_positive]
-        )
-        positive_intercept = self.positive_family.get_starting_intercept(
-            positive_endog,
-            var_weights=positive_weights,
-            link=self.positive_link,
-        )
-        positive_start = self._constant_predictor_start(
-            self.exog[self.is_positive], positive_intercept
-        )
+        positive_start = self._get_positive_start_params()
 
         if self.weights is None:
             zero_probability = float(np.mean(self.is_zero))
@@ -151,8 +429,8 @@ class HurdleModel(TwoPartModel):
 
     @property
     def k_positive(self):
-        """Return the number of positive-response coefficients."""
-        return self.exog.shape[1]
+        """Return the number of positive-response parameters."""
+        return len(self._get_positive_param_names())
 
     @property
     def k_hurdle(self):
@@ -202,15 +480,8 @@ class HurdleModel(TwoPartModel):
             -np.logaddexp(0.0, hurdle_eta),
         )
 
-        positive_eta = self.exog[self.is_positive] @ positive_params
-        positive_mu = self.positive_link.inverse_link(positive_eta)
-        positive_theta = self.positive_family.b_deriv_inv(positive_mu)
-        positive_endog = self.endog[self.is_positive]
-        positive_loglike = self.positive_family.log_likelihood_obs(
-            positive_endog,
-            positive_theta,
-            scale=positive_scale,
-            var_weights=1.0,
+        positive_loglike = self._positive_loglike_obs(
+            positive_params, positive_scale
         )
         hurdle_loglike[self.is_positive] += positive_loglike
         return hurdle_loglike
@@ -240,15 +511,8 @@ class HurdleModel(TwoPartModel):
             self.exog_infl * hurdle_factor[:, None]
         )
 
-        positive_eta = self.exog[self.is_positive] @ positive_params
-        positive_mu = self.positive_link.inverse_link(positive_eta)
-        variance = self.positive_family.variance(positive_mu)
-        link_derivative = self.positive_link.deriv(positive_mu)
-        positive_factor = (
-            self.endog[self.is_positive] - positive_mu
-        ) / (positive_scale * variance * link_derivative)
         score_obs[self.is_positive, :self.k_positive] = (
-            self.exog[self.is_positive] * positive_factor[:, None]
+            self._positive_score_obs(positive_params, positive_scale)
         )
         return score_obs
 
@@ -310,10 +574,12 @@ class HurdleModel(TwoPartModel):
         return result
 
     def fit(
-            self, start_params=None, debug=False, cov_type='SANDWICH',
+            self, start_params=None, debug: bool = False,
+            cov_type='SANDWICH',
             cov_kwds=None, positive_fit_kwargs=None,
-            hurdle_fit_kwargs=None, **glm_fit_kwargs):
-        """Fit the positive and zero-hurdle GLMs separately and merge them.
+            hurdle_fit_kwargs=None,
+            **glm_fit_kwargs) -> DistributionalModelResults:
+        """Fit the positive and zero-hurdle components and merge them.
 
         Args:
             start_params: Optional combined starting vector in positive-then-
@@ -324,13 +590,18 @@ class HurdleModel(TwoPartModel):
                 covariance, ``'COMPONENT_HC1'`` for the historical block-
                 diagonal component estimator, or ``'BOOTSTRAP'``.
             cov_kwds: Hurdle-level covariance and bootstrap options.
-            positive_fit_kwargs: Overrides passed only to the positive GLM.
+            positive_fit_kwargs: Overrides passed only to the positive
+                component estimator.
             hurdle_fit_kwargs: Overrides passed only to the Bernoulli GLM.
             **glm_fit_kwargs: Additional options shared by both GLM fits.
 
         Returns:
             :class:`DistributionalModelResults` containing the two component
             fits and their combined parameters and covariance.
+
+        With ``debug=True``, component designs and starts are printed, verbose
+        diagnostics are passed to both point-estimate GLMs, and coherent
+        bootstrap refits are shown with a progress bar.
         """
         display_cov_type, component_cov_type = self._normalize_cov_type(
             cov_type
@@ -363,6 +634,14 @@ class HurdleModel(TwoPartModel):
 
         positive_start = positive_fit_kwargs.pop('start_params', None)
         hurdle_start = hurdle_fit_kwargs.pop('start_params', None)
+        used_default_start = (
+            start_params is None
+            and positive_start is None
+            and hurdle_start is None
+        )
+        used_component_starts = (
+            start_params is None and not used_default_start
+        )
         if (start_params is None and positive_start is None
                 and hurdle_start is None):
             start_params = self.get_start_params()
@@ -373,6 +652,58 @@ class HurdleModel(TwoPartModel):
                     'start_params, not both'
                 )
             positive_start, hurdle_start = self._split_params(start_params)
+
+        if debug:
+            if used_default_start:
+                start_description = 'automatic combined'
+            elif used_component_starts:
+                start_description = 'component-specific'
+            else:
+                start_description = 'user combined'
+            print('\n' + '=' * 50)
+            print('HURDLE MODEL FIT')
+            print('-' * 50)
+            print(f'* Model: {self.__class__.__name__}')
+            print(f'* Observations: {self.nobs}')
+            print(
+                f'* Outcome split: {self.nobs_zero} zero / '
+                f'{self.nobs_positive} positive'
+            )
+            print(f'* Positive exog shape: {self.exog.shape}')
+            print(f'* Zero-hurdle exog shape: {self.exog_infl.shape}')
+            print(
+                '* Positive component: '
+                f'{self._positive_component_description()}'
+            )
+            print('* Zero family/link: BERNOULLI / LOGIT')
+            print(f'* Covariance type: {display_cov_type}')
+            print(f'* Component covariance type: {component_cov_type}')
+            print(
+                '* Importance weights: '
+                f'{"provided" if self.is_weighted else "none"}'
+            )
+            print(f'* Starting-value source: {start_description}')
+            positive_start_string = (
+                None if positive_start is None
+                else np.array2string(
+                    np.asarray(positive_start), precision=6
+                )
+            )
+            hurdle_start_string = (
+                None if hurdle_start is None
+                else np.array2string(
+                    np.asarray(hurdle_start), precision=6
+                )
+            )
+            print(
+                '* Positive starts: '
+                f'{positive_start_string}'
+            )
+            print(
+                '* Hurdle starts: '
+                f'{hurdle_start_string}'
+            )
+            print('* Passing debug=True to both component estimators.')
 
         common_kwargs = dict(glm_fit_kwargs)
         common_kwargs.update({
@@ -397,23 +728,22 @@ class HurdleModel(TwoPartModel):
         )
         hurdle_kwargs['fit_intercept'] = hurdle_first_column_constant
 
-        def fit_components(component_weights, positive_x0, hurdle_x0):
+        def fit_components(
+                component_weights, positive_x0, hurdle_x0,
+                component_debug=False):
+            positive_call_kwargs = positive_kwargs.copy()
+            positive_call_kwargs['debug'] = component_debug
+            hurdle_call_kwargs = hurdle_kwargs.copy()
+            hurdle_call_kwargs['debug'] = component_debug
             positive_weights = (
                 None if component_weights is None
                 else component_weights[self.is_positive]
             )
-            positive_result = SparseGeneralizedLinearModel.GLM(
-                self.endog[self.is_positive],
-                self.exog[self.is_positive],
-                family=self.positive_family,
-                link=self.positive_link,
-                var_weights=positive_weights,
-                exog_names=self._get_regression_param_names(),
-                endog_name=self.endog_name,
-                var_weights_name=self.weights_name,
-                start_params=positive_x0,
-                first_column_constant=positive_first_column_constant,
-                **positive_kwargs,
+            positive_result = self._fit_positive_component(
+                positive_weights,
+                positive_x0,
+                positive_call_kwargs,
+                positive_first_column_constant,
             )
             hurdle_result = SparseGeneralizedLinearModel.GLM(
                 self.is_zero.astype(float),
@@ -430,13 +760,23 @@ class HurdleModel(TwoPartModel):
                 var_weights_name=self.weights_name,
                 start_params=hurdle_x0,
                 first_column_constant=hurdle_first_column_constant,
-                **hurdle_kwargs,
+                **hurdle_call_kwargs,
             )
             return positive_result, hurdle_result
 
         positive_fit, hurdle_fit = fit_components(
-            self.weights, positive_start, hurdle_start
+            self.weights, positive_start, hurdle_start,
+            component_debug=debug,
         )
+
+        if debug:
+            print('\nComponent-fit diagnostics:')
+            print(
+                '* Positive component converged: '
+                f'{positive_fit.converged}'
+            )
+            print(f'* Zero-hurdle GLM converged: {hurdle_fit.converged}')
+            print(f'* Positive scale: {float(positive_fit.scale):.6g}')
 
         self._positive_scale = float(positive_fit.scale)
         self.positive_model_fit = positive_fit
@@ -479,6 +819,10 @@ class HurdleModel(TwoPartModel):
                 'first-order condition.'
             )
 
+        if debug:
+            print(f'* Combined first-order validation: {first_order_valid}')
+            print(f'* Combined scaled maximum score: {normalized_score:.3e}')
+
         bread = None
         meat = None
         information = None
@@ -486,6 +830,10 @@ class HurdleModel(TwoPartModel):
         bootstrap_string = None
         bootstrap_cov_elapsed = 0.0
         covariance = component_covariance
+        if debug:
+            print('\nCovariance phase:')
+            print(f'* Requested estimator: {display_cov_type}')
+            print(f'* Component estimator: {component_cov_type}')
         if display_cov_type in {'SANDWICH', 'HC1'}:
             bread = component_covariance
             if bread is not None:
@@ -539,6 +887,32 @@ class HurdleModel(TwoPartModel):
                 seed=seed,
                 alpha=alpha,
             )
+            if debug:
+                from tqdm import tqdm
+
+                print('\n' + '=' * 50)
+                print('COHERENT HURDLE BAYESIAN BOOTSTRAP')
+                print('-' * 50)
+                print(f'* Requested repetitions: {n_samples}')
+                print(f'* Seed: {seed}')
+                print(f'* Dirichlet alpha: {alpha:.6g}')
+                print(f'* Minimum success rate: {min_success_rate:.3f}')
+                print(
+                    '* Original importance weights: '
+                    f'{"multiplied into each draw" if self.is_weighted else "none"}'
+                )
+                print(
+                    '* The same observation-weight draw is used for both '
+                    'component GLMs.'
+                )
+                print(
+                    '* Per-draw GLM output is suppressed; progress is shown.'
+                )
+                bootstrap_weights = tqdm(
+                    bootstrap_weights,
+                    total=n_samples,
+                    desc=f'{self.__class__.__name__} bootstrap',
+                )
             draws = []
             failure_reasons = Counter()
             point_positive = params[:self.k_positive]
@@ -549,7 +923,8 @@ class HurdleModel(TwoPartModel):
                 )
                 try:
                     draw_positive, draw_hurdle = fit_components(
-                        combined_weights, point_positive, point_hurdle
+                        combined_weights, point_positive, point_hurdle,
+                        component_debug=False,
                     )
                 except Exception as error:
                     failure_reasons[
@@ -644,6 +1019,15 @@ class HurdleModel(TwoPartModel):
                 f'bootstrap repetitions, alpha={alpha:.3f}.'
             )
             bootstrap_cov_elapsed = time.perf_counter() - bootstrap_start
+            if debug:
+                print('\nBootstrap diagnostics:')
+                print(
+                    '* Successful repetitions: '
+                    f'{len(bootstrapped_params)}'
+                )
+                print(f'* Failed repetitions: {n_failed}')
+                print(f'* Covariance correction: {use_correction}')
+                print('...Coherent hurdle bootstrap complete!\n')
 
         information_rank = None
         information_condition = None
@@ -698,10 +1082,29 @@ class HurdleModel(TwoPartModel):
             covariance = None
 
         message = (
-            'Both component GLMs converged.'
+            'Both hurdle components converged.'
             if converged
             else 'Hurdle fit diagnostics failed.'
         )
+        if debug:
+            print('\nFinal hurdle-fit diagnostics:')
+            print(f'* Public convergence: {converged}')
+            print(f'* Inference valid: {inference_valid}')
+            print(
+                '* Covariance available: '
+                f'{covariance is not None}'
+            )
+            if information_rank is not None:
+                print(
+                    f'* Information rank: {information_rank}/'
+                    f'{len(params)}'
+                )
+            if information_condition is not None:
+                print(
+                    '* Information condition number: '
+                    f'{information_condition:.3e}'
+                )
+            print('...Hurdle model fit complete!\n')
         if inference_issues:
             warnings.warn(
                 ' '.join(inference_issues), RuntimeWarning, stacklevel=2
@@ -727,7 +1130,7 @@ class HurdleModel(TwoPartModel):
                 )
             ),
             message=message,
-            method='SEPARATE GLMS',
+            method='SEPARATE COMPONENT FITS',
             positive_fit=positive_fit,
             hurdle_fit=hurdle_fit,
             cov_params=covariance,
@@ -752,7 +1155,16 @@ class HurdleModel(TwoPartModel):
                 + float(hurdle_fit.cov_elapsed)
                 + bootstrap_cov_elapsed
             ),
-            iterations=(positive_fit.num_iter, hurdle_fit.num_iter),
+            iterations=(
+                getattr(
+                    positive_fit, 'num_iter',
+                    getattr(positive_fit, 'iterations', None),
+                ),
+                getattr(
+                    hurdle_fit, 'num_iter',
+                    getattr(hurdle_fit, 'iterations', None),
+                ),
+            ),
             score_at_params=score_at_params,
             scale=positive_scale,
             loglike_kwargs={'positive_scale': positive_scale},
@@ -765,7 +1177,7 @@ class HurdleModel(TwoPartModel):
     def predict(
             self, params, exog=None, exog_infl=None, which='mean',
             data=None, index=None, debug=False):
-        """Predict hurdle probabilities and conditional or overall means.
+        """Predict hurdle probabilities and component or overall means.
 
         Args:
             params: Combined parameter vector.
@@ -775,7 +1187,11 @@ class HurdleModel(TwoPartModel):
             index: Optional positional row selector applied to ``data``.
             debug: Whether formula construction prints diagnostics.
             which: One of ``'mean'``, ``'positive_mean'``,
+                ``'underlying_mean'``, ``'linear_predictor'``,
                 ``'zero_probability'``, or ``'positive_probability'``.
+                ``positive_mean`` is conditional on ``Y>0``. For truncated
+                count components, ``underlying_mean`` is the mean before
+                conditioning away zeros.
         """
         if data is not None:
             if exog is not None or exog_infl is not None:
@@ -800,18 +1216,24 @@ class HurdleModel(TwoPartModel):
             raise ValueError(
                 'exog and exog_infl must contain the same number of rows'
             )
-        if exog.shape[1] != self.k_positive:
+        if exog.shape[1] != self.exog.shape[1]:
             raise ValueError('exog has the wrong number of columns')
         if exog_infl.shape[1] != self.k_hurdle:
             raise ValueError('exog_infl has the wrong number of columns')
 
-        positive_mean = self.positive_link.inverse_link(
-            exog @ positive_params
+        positive_mean = self._positive_conditional_mean(
+            positive_params, exog
         )
+        underlying_mean = self._positive_underlying_mean(
+            positive_params, exog
+        )
+        linear_predictor = exog @ positive_params[:self.exog.shape[1]]
         zero_probability = expit(exog_infl @ hurdle_params)
         predictions = {
             'mean': (1.0 - zero_probability) * positive_mean,
             'positive_mean': positive_mean,
+            'underlying_mean': underlying_mean,
+            'linear_predictor': linear_predictor,
             'zero_probability': zero_probability,
             'positive_probability': 1.0 - zero_probability,
         }
@@ -854,6 +1276,11 @@ class PoissonHurdle(HurdleModel):
         """Return the zero-truncated Poisson canonical link."""
         return self._positive_link_instance
 
+    def _positive_underlying_mean(self, params, exog):
+        """Return the underlying, untruncated Poisson rate ``exp(X beta)``."""
+        with np.errstate(over='ignore', invalid='ignore'):
+            return np.exp(exog @ params)
+
 
 class GammaHurdle(HurdleModel):
     """Hurdle model with Bernoulli/logit zeros and positive Gamma responses.
@@ -886,9 +1313,149 @@ class GammaHurdle(HurdleModel):
         return self._positive_link_instance
 
 
+class NegativeBinomialPHurdle(HurdleModel):
+    """Logit hurdle with an exact zero-truncated NB-P positive component.
+
+    The zero equation models ``P(Y=0 | Z) = logistic(Z gamma)``. Conditional
+    on a positive response, the count follows an NB-P distribution truncated
+    at zero. Its underlying, untruncated mean and variance are
+
+    ``mu = exp(X beta)`` and ``Var(Y | X) = mu + alpha * mu**p``.
+
+    ``p=1`` selects NB1 and ``p=2`` selects NB2. Dispersion is estimated as
+    ``alpha = exp(log_alpha)``. Parameter order is ``beta``, ``log_alpha``,
+    then the hurdle ``gamma`` coefficients. The positive conditional mean is
+    ``mu / (1 - P_NBP(Y=0))``; it is not ``mu``.
+    """
+
+    def __init__(self, endog, exog, *args, p=2, **kwargs):
+        """Validate count support and initialize an NB1 or NB2 hurdle."""
+        if isinstance(p, bool) or p not in (1, 2):
+            raise ValueError('p must be either 1 (NB1) or 2 (NB2)')
+        self.p = int(p)
+        self.negative_binomial_p = self.p
+        values = np.asarray(endog, dtype=float)
+        if (np.any(~np.isfinite(values)) or np.any(values < 0.0)
+                or np.any(values != np.floor(values))):
+            raise ValueError(
+                'NegativeBinomialPHurdle outcomes must be finite '
+                'non-negative integers'
+            )
+        super().__init__(endog, exog, *args, **kwargs)
+        self._positive_component_model = self._make_positive_model(
+            None if self.weights is None else self.weights[self.is_positive]
+        )
+
+    @property
+    def positive_family(self):
+        """Return ``None`` because the positive model is exact MLE, not GLM."""
+        return None
+
+    @property
+    def positive_link(self):
+        """Return ``None`` because ``X beta`` directly models ``log(mu)``."""
+        return None
+
+    def _get_positive_param_names(self):
+        """Return positive regression names followed by ``log_alpha``."""
+        return self._get_regression_param_names() + ['log_alpha']
+
+    def _positive_component_description(self):
+        """Describe the exact truncated NB-P likelihood used for positives."""
+        return f'ZERO-TRUNCATED NB{self.p} / LOG-MEAN MLE'
+
+    def _make_positive_model(self, positive_weights):
+        """Construct an aligned exact-likelihood positive component model."""
+        return _ZeroTruncatedNegativeBinomialP(
+            self.endog[self.is_positive],
+            self.exog[self.is_positive],
+            weights=positive_weights,
+            p=self.p,
+            endog_name=self.endog_name,
+            exog_names=self._get_regression_param_names(),
+            weights_name=self.weights_name,
+            has_intercept=self.has_intercept,
+            has_implicit_constant=self.has_implicit_constant,
+        )
+
+    def _get_positive_start_params(self):
+        """Return NB-P mean-regression and log-dispersion starts."""
+        component = self._make_positive_model(
+            None if self.weights is None else self.weights[self.is_positive]
+        )
+        return component.get_start_params()
+
+    def _positive_loglike_obs(self, params, positive_scale):
+        """Return exact zero-truncated NB-P positive log likelihoods."""
+        del positive_scale
+        return self._positive_component_model.loglike_obs(params)
+
+    def _positive_score_obs(self, params, positive_scale):
+        """Return exact zero-truncated NB-P positive scores."""
+        del positive_scale
+        return self._positive_component_model.score_obs(params)
+
+    def _positive_underlying_mean(self, params, exog):
+        """Return ``mu = exp(X beta)`` before truncating away zeros."""
+        with np.errstate(over='ignore', invalid='ignore'):
+            return np.exp(exog @ params[:-1])
+
+    def _positive_conditional_mean(self, params, exog):
+        """Return ``E[Y | Y>0, X]`` under the fitted NB-P component."""
+        underlying_mean = self._positive_underlying_mean(params, exog)
+        log_zero_probability = (
+            self._positive_component_model.log_zero_probability(
+                params, exog=exog
+            )
+        )
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return underlying_mean / (-np.expm1(log_zero_probability))
+
+    def _fit_positive_component(
+            self, weights, start_params, fit_kwargs,
+            first_column_constant):
+        """Fit the exact truncated NB-P likelihood, including dispersion."""
+        del first_column_constant
+        fit_kwargs = dict(fit_kwargs)
+        debug = bool(fit_kwargs.pop('debug', False))
+        requested_cov_type = str(
+            fit_kwargs.pop('cov_type', 'NONROBUST')
+        ).upper()
+        fit_kwargs.pop('cov_kwds', None)
+        fit_kwargs.pop('fit_intercept', None)
+        if fit_kwargs:
+            unsupported = ', '.join(sorted(fit_kwargs))
+            raise TypeError(
+                'The exact zero-truncated NB-P component does not accept '
+                f'these GLM fit options: {unsupported}'
+            )
+
+        component = self._make_positive_model(weights)
+        component_cov_type = (
+            'SANDWICH' if requested_cov_type == 'HC1'
+            else requested_cov_type
+        )
+        result = component.fit(
+            start_params=start_params,
+            debug=debug,
+            cov_type=component_cov_type,
+            cov_kwds={},
+        )
+        if requested_cov_type == 'HC1' and result.did_compute_var_covar():
+            correction = component.nobs / max(
+                component.nobs - len(result.params), 1
+            )
+            result.set_cov_params(
+                np.asarray(result.cov_params()) * correction,
+                cov_type='HC1',
+            )
+        return result
+
+
 __all__ = [
     'HurdleModel',
     'HurdleModelResults',
     'PoissonHurdle',
     'GammaHurdle',
+    'NegativeBinomialPHurdle',
 ]

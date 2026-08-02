@@ -245,8 +245,8 @@ def get_sarimax_start_params(start_params, ar_lags, ma_lags, sar_lags, sma_lags,
         trend_offset: Starting offset for deterministic trend time indices.
         trend_scale: Scale used to normalize deterministic trend time indices.
         do_hannan_rissanen: Whether to estimate starting ARMA parameters with Hannan-Rissanen.
-        enforce_stationarity: Whether to transform AR parameters into the stationary region.
-        enforce_invertibility: Whether to transform MA parameters into the invertible region.
+        enforce_stationarity: Whether to repair nonstationary automatically generated AR starts.
+        enforce_invertibility: Whether to repair noninvertible automatically generated MA starts.
         concentrate_scale: Whether to optimize with innovation variance concentrated out.
         debug: Whether to print fitting diagnostics.
 

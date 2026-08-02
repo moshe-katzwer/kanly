@@ -13,7 +13,7 @@ y = y + 3.2 * x + .02 * np.arange(n)
 t = np.arange(0, n)
 
 # fit an ARMAX model
-fit = SARIMAX(y, exog=x.reshape((-1, 1)), order=(2, 0, (3,)), trend='ct', B0=1, gtol=1e-8, ftol=1e-12, xtol=1e-8,
+fit = SARIMAX(y, exog=x.reshape((-1, 1)), order=(2, 0, (3,)), trend='ct', H0=1, gtol=1e-8, ftol=1e-12, xtol=1e-8,
               do_hannan_rissanen=True,
               concentrate_scale=False)
 print(fit)

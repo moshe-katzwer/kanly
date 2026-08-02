@@ -6,7 +6,7 @@ from scipy.linalg import solve_toeplitz, lstsq
 from kanly.time_series.sarimax.constants import DEFAULT_SARIMAX_ENFORCE_STATIONARITY, \
     DEFAULT_SARIMAX_ENFORCE_INVERTIBILITY, DEFAULT_SARIMAX_CONCENTRATE_SCALE
 from kanly.time_series.sarimax.difference import difference
-from kanly.time_series.sarimax.handle_params import handle_params
+from kanly.time_series.sarimax.handle_params import stabilize_arma_starts
 from kanly.time_series.auto_correlation_function import auto_correlation_function
 
 
@@ -96,8 +96,9 @@ def hannan_rissanen(endog, ar_lags=None, ma_lags=None, sar_lags=None, sma_lags=N
     before returning so the packed output matches the parameter order expected
     by ``split_params`` and ``sarimax_internal``.
 
-    If stationarity or invertibility enforcement is requested, the initial AR
-    and MA blocks are transformed through ``handle_params`` before being packed.
+    If stationarity or invertibility enforcement is requested, invalid initial
+    AR and MA blocks are repaired before being packed. Valid Hannan--Rissanen
+    estimates are retained unchanged.
     If ``concentrate_scale`` is true, the innovation variance is omitted because
     the likelihood optimizer estimates it after optimizing the remaining
     parameters.
@@ -121,8 +122,8 @@ def hannan_rissanen(endog, ar_lags=None, ma_lags=None, sar_lags=None, sma_lags=N
         debug: Whether to print diagnostic information.
         trend_offset: Starting offset for deterministic trend indices.
         trend_scale: Scale for deterministic trend indices.
-        enforce_stationarity: Whether to transform AR starting values.
-        enforce_invertibility: Whether to transform MA starting values.
+        enforce_stationarity: Whether to repair nonstationary AR starting values.
+        enforce_invertibility: Whether to repair noninvertible MA starting values.
         concentrate_scale: Whether to omit ``sigma2`` from the returned vector.
 
     Returns:
@@ -232,7 +233,13 @@ def hannan_rissanen(endog, ar_lags=None, ma_lags=None, sar_lags=None, sma_lags=N
             if l % s == 0 and l // s in sma_lags:
                 sma.append(v)
 
-        ar, ma, sar, sma = handle_params(ar, ma, sar, sma, enforce_stationarity, enforce_invertibility)
+        ar, ma, sar, sma = stabilize_arma_starts(
+            ar, ma, sar, sma,
+            ar_lags=ar_lags, ma_lags=ma_lags,
+            sar_lags=sar_lags, sma_lags=sma_lags,
+            enforce_stationarity=enforce_stationarity,
+            enforce_invertibility=enforce_invertibility,
+        )
         return np.hstack([exog_coef, ar, ma, sar, sma,
                           [] if concentrate_scale else residue/(T-ar_order_initial)])
 
@@ -251,5 +258,13 @@ def hannan_rissanen(endog, ar_lags=None, ma_lags=None, sar_lags=None, sma_lags=N
                 ar.append(v)
             if l % s == 0 and l // s in sar_lags:
                 sar.append(v)
+
+        ar, _, sar, _ = stabilize_arma_starts(
+            ar, [], sar, [],
+            ar_lags=ar_lags, ma_lags=[],
+            sar_lags=sar_lags, sma_lags=[],
+            enforce_stationarity=enforce_stationarity,
+            enforce_invertibility=False,
+        )
 
         return np.hstack([exog_coef, ar, sar, [] if concentrate_scale else [residue / (T_eff - max(ar_lags_mult))]])

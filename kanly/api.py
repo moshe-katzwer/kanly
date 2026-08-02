@@ -14,6 +14,10 @@ from kanly.bayes.mcmc.adaptive_metropolis.adaptive_metropolis_mcmc import amha
 from kanly.bayes.mcmc.coordinate_mala.coordinate_mala_mcmc import mala
 from kanly.bootstrap.bootstrap import get_joint_bootstrapped_distribution
 from kanly.dill_object import read, save
+from kanly.distributional_models.api import (
+    DISTRIBUTIONAL_MODEL,
+    distributional_model,
+)
 from kanly.formula.add_constant import add_constant
 from kanly.formula.data_getter import SparseDataGetter
 from kanly.general_models.general_model_fit import fit_general_model_callable
@@ -400,3 +404,10 @@ clear_timers = clear_timers
 # ################# #
 
 SparseDataFrame = SparseDataFrame
+
+# ##################### #
+# DISTRIBUTIONAL MODELS #
+# ##################### #
+
+DISTRIBUTIONAL_MODEL = DISTRIBUTIONAL_MODEL
+distributional_model = distributional_model

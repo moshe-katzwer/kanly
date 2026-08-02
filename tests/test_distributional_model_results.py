@@ -1,5 +1,7 @@
 """Tests for the shared distributional regression-results object."""
 
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import unittest
 import warnings
 
@@ -21,6 +23,37 @@ from kanly.distributional_models import (
 
 class TestDistributionalModelResults(unittest.TestCase):
     """Exercise direct-MLE result metadata, inference, and prediction."""
+
+    def test_debug_diagnostics_cover_formula_fit_and_bootstrap(self):
+        """Propagate debug output through parsing, BFGS, and bootstrap."""
+        rng = np.random.default_rng(810)
+        x = rng.normal(size=100)
+        endog = rng.poisson(np.exp(0.1 + 0.2 * x))
+        output = io.StringIO()
+
+        with redirect_stdout(output), redirect_stderr(output):
+            model = Poisson.build_model_from_formula(
+                'y ~ x', {'y': endog, 'x': x}, debug=True
+            )
+            fit = model.fit(
+                cov_type='BOOTSTRAP',
+                cov_kwds={
+                    'n_samples': 3,
+                    'seed': 7,
+                    'min_success_rate': 0.5,
+                },
+                debug=True,
+            )
+
+        debug_output = output.getvalue()
+        self.assertIn('DISTRIBUTIONAL FORMULA MODEL', debug_output)
+        self.assertIn('DISTRIBUTIONAL MODEL FIT', debug_output)
+        self.assertIn('BFGS OPTIONS', debug_output)
+        self.assertIn('BAYESIAN BOOTSTRAP', debug_output)
+        self.assertIn('Bootstrap diagnostics:', debug_output)
+        self.assertIn('Final fit diagnostics:', debug_output)
+        self.assertTrue(fit.converged)
+        self.assertTrue(fit.inference_valid)
 
     def test_poisson_returns_full_regression_results(self):
         """Expose named inference, summaries, predictions, and raw optimizer."""

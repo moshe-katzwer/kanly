@@ -77,7 +77,7 @@ class BayesianModelMaximizationResult(DillObject):
 
 
 def maximize_function(function, model: BayesianModel, x0, fixed_params=None, use_transformed_scale=True,
-                      onesided_fd=None, maxiter=200, B0=1.0, xtol=1e-8, ftol=1e-8, gtol=1e-4, dx_fd=1e-6, momentum=.05,
+                      onesided_fd=None, maxiter=200, H0=1.0, xtol=1e-8, ftol=1e-8, gtol=1e-4, dx_fd=1e-6, momentum=.05,
                       seed=0, debug=False, user_prompt_for_more_iters=False, pbar_update_cadence=.3,
                       return_inv_2nd_derivatives=True,
                       ) -> BayesianModelMaximizationResult:
@@ -93,7 +93,8 @@ def maximize_function(function, model: BayesianModel, x0, fixed_params=None, use
         use_transformed_scale: If True, optimize in unconstrained transformed space.
         onesided_fd: Optional finite-difference strategy flag for optimizer.
         maxiter: Maximum optimizer iterations.
-        B0: Initial inverse-Hessian scaling for quasi-Newton updates.
+        H0: Initial inverse-Hessian approximation for quasi-Newton updates. A
+            scalar is expanded to that multiple of the identity matrix.
         xtol: Parameter-change convergence tolerance.
         ftol: Objective-change convergence tolerance.
         gtol: Gradient-norm convergence tolerance.
@@ -129,8 +130,15 @@ def maximize_function(function, model: BayesianModel, x0, fixed_params=None, use
     else:
         bounds = None
 
+    initial_inverse_hessian = H0
+    if np.isscalar(initial_inverse_hessian):
+        initial_inverse_hessian = np.eye(len(z0)) * initial_inverse_hessian
+    elif initial_inverse_hessian is not None:
+        initial_inverse_hessian = np.asarray(initial_inverse_hessian, dtype=float)
+
     result = bfgs_pqn(
-        function_frozen, z0, maxiter=maxiter, debug=debug, B0=B0,
+        function_frozen, z0, maxiter=maxiter, debug=debug,
+        H0=initial_inverse_hessian, use_inv_hessian=True,
         xtol=xtol, ftol=ftol, gtol=gtol, onesided_fd=onesided_fd,
         momentum=momentum, seed=seed, user_prompt_for_more_iters=user_prompt_for_more_iters,
         dx_fd=dx_fd,
@@ -182,7 +190,7 @@ def maximize_function(function, model: BayesianModel, x0, fixed_params=None, use
         optimization_result=result,
         optimizer_options=dict(
             onesided_fd=onesided_fd, maxiter=maxiter,
-            B0=B0, xtol=xtol, ftol=ftol, gtol=gtol, dx_fd=dx_fd,
+            H0=H0, xtol=xtol, ftol=ftol, gtol=gtol, dx_fd=dx_fd,
             momentum=momentum, seed=seed),
         minimand_function=function,
         minimand_function_frozen=function_frozen,
@@ -195,7 +203,7 @@ def maximize_function(function, model: BayesianModel, x0, fixed_params=None, use
 
 
 def mle(model: BayesianModel, x0, fixed_params=None, use_transformed_scale=True, onesided_fd=None,
-        maxiter=200, B0=1.0, xtol=1e-8, ftol=1e-8, gtol=1e-4, dx_fd=1e-6, momentum=.05, seed=0, debug=False,
+        maxiter=200, H0=1.0, xtol=1e-8, ftol=1e-8, gtol=1e-4, dx_fd=1e-6, momentum=.05, seed=0, debug=False,
         user_prompt_for_more_iters=False, pbar_update_cadence=.3, return_inv_2nd_derivatives=True,
         ) -> BayesianModelMaximizationResult:
     """Compute the maximum likelihood estimate via quasi-Newton optimization.
@@ -207,7 +215,8 @@ def mle(model: BayesianModel, x0, fixed_params=None, use_transformed_scale=True,
         use_transformed_scale: Whether to optimize in transformed coordinates.
         onesided_fd: Optional finite-difference strategy.
         maxiter: Maximum optimizer iterations.
-        B0: Initial inverse-Hessian scaling.
+        H0: Initial inverse-Hessian approximation. A scalar is expanded to
+            that multiple of the identity matrix.
         xtol: Parameter tolerance.
         ftol: Objective tolerance.
         gtol: Gradient tolerance.
@@ -225,7 +234,7 @@ def mle(model: BayesianModel, x0, fixed_params=None, use_transformed_scale=True,
         function = lambda x: -model.log_likelihood_function_transformed(x)
     return maximize_function(function, model, x0, fixed_params=fixed_params,
                              use_transformed_scale=use_transformed_scale,
-                             onesided_fd=onesided_fd, maxiter=maxiter, B0=B0, xtol=xtol, ftol=ftol, gtol=gtol,
+                             onesided_fd=onesided_fd, maxiter=maxiter, H0=H0, xtol=xtol, ftol=ftol, gtol=gtol,
                              dx_fd=dx_fd, momentum=momentum,
                              seed=seed, debug=debug, user_prompt_for_more_iters=user_prompt_for_more_iters,
                              pbar_update_cadence=pbar_update_cadence,
@@ -233,7 +242,7 @@ def mle(model: BayesianModel, x0, fixed_params=None, use_transformed_scale=True,
 
 
 def map(model: BayesianModel, x0, fixed_params=None, use_transformed_scale=True, onesided_fd=None,
-        maxiter=200, B0=1.0, xtol=1e-8, ftol=1e-8, gtol=1e-4, dx_fd=1e-6, momentum=.05, seed=0, debug=False,
+        maxiter=200, H0=1.0, xtol=1e-8, ftol=1e-8, gtol=1e-4, dx_fd=1e-6, momentum=.05, seed=0, debug=False,
         user_prompt_for_more_iters=False, return_inv_2nd_derivatives=True,
         ) -> BayesianModelMaximizationResult:
     """Compute the maximum a-posteriori estimate via quasi-Newton optimization.
@@ -245,7 +254,8 @@ def map(model: BayesianModel, x0, fixed_params=None, use_transformed_scale=True,
         use_transformed_scale: Whether to optimize in transformed coordinates.
         onesided_fd: Optional finite-difference strategy.
         maxiter: Maximum optimizer iterations.
-        B0: Initial inverse-Hessian scaling.
+        H0: Initial inverse-Hessian approximation. A scalar is expanded to
+            that multiple of the identity matrix.
         xtol: Parameter tolerance.
         ftol: Objective tolerance.
         gtol: Gradient tolerance.
@@ -263,7 +273,7 @@ def map(model: BayesianModel, x0, fixed_params=None, use_transformed_scale=True,
 
     return maximize_function(function, model, x0, fixed_params=fixed_params,
                              use_transformed_scale=use_transformed_scale,
-                             onesided_fd=onesided_fd, maxiter=maxiter, B0=B0, xtol=xtol, ftol=ftol, gtol=gtol,
+                             onesided_fd=onesided_fd, maxiter=maxiter, H0=H0, xtol=xtol, ftol=ftol, gtol=gtol,
                              dx_fd=dx_fd, momentum=momentum,
                              seed=seed, debug=debug, user_prompt_for_more_iters=user_prompt_for_more_iters,
                              return_inv_2nd_derivatives=return_inv_2nd_derivatives)
@@ -300,10 +310,10 @@ def map(model: BayesianModel, x0, fixed_params=None, use_transformed_scale=True,
 #     )
 #     print(model)
 #
-#     print(map(model, [.01, 3, 1, 1], use_transformed_scale=True, debug=True, B0=10000,
+#     print(map(model, [.01, 3, 1, 1], use_transformed_scale=True, debug=True, H0=.0001,
 #               fixed_params={'c': 5}
 #               ).x_map)
 #
-#     print(map(model, [.01, 3, 1, 1], use_transformed_scale=False, debug=True, B0=10000,
+#     print(map(model, [.01, 3, 1, 1], use_transformed_scale=False, debug=True, H0=.0001,
 #               fixed_params={'c': 5}
 #               ).x_map)

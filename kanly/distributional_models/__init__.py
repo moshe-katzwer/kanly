@@ -1,5 +1,10 @@
 """Likelihood-based count, continuous, zero-inflated, and hurdle models."""
 
+from kanly.distributional_models.api import (
+    DISTRIBUTIONAL_MODEL,
+    DISTRIBUTIONAL_MODEL_ALIASES,
+    distributional_model,
+)
 from kanly.distributional_models.base import DistributionalModel
 from kanly.distributional_models.continuous_models import Gamma
 from kanly.distributional_models.count_models import (
@@ -14,6 +19,7 @@ from kanly.distributional_models.hurdle_models import (
     GammaHurdle,
     HurdleModel,
     HurdleModelResults,
+    NegativeBinomialPHurdle,
     PoissonHurdle,
 )
 from kanly.distributional_models.results import DistributionalModelResults
@@ -21,6 +27,9 @@ from kanly.distributional_models.two_part import TwoPartModel
 
 
 __all__ = [
+    'distributional_model',
+    'DISTRIBUTIONAL_MODEL',
+    'DISTRIBUTIONAL_MODEL_ALIASES',
     'DistributionalModel',
     'TwoPartModel',
     'Poisson',
@@ -33,6 +42,7 @@ __all__ = [
     'HurdleModel',
     'PoissonHurdle',
     'GammaHurdle',
+    'NegativeBinomialPHurdle',
     'DistributionalModelResults',
     'HurdleModelResults',
 ]

@@ -1,5 +1,7 @@
 """Tests for GLM-composed Poisson and Gamma hurdle models."""
 
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import unittest
 
 import numpy as np
@@ -8,6 +10,7 @@ import pandas as pd
 from kanly.distributional_models import (
     DistributionalModelResults,
     GammaHurdle,
+    NegativeBinomialPHurdle,
     PoissonHurdle,
     TwoPartModel,
 )
@@ -25,6 +28,20 @@ def sample_zero_truncated_poisson(rng, rate):
     is_zero = counts == 0
     while np.any(is_zero):
         counts[is_zero] = rng.poisson(rate[is_zero])
+        is_zero = counts == 0
+    return counts
+
+
+def sample_zero_truncated_negative_binomial_p(rng, mean, alpha, p):
+    """Draw NB-P counts conditional on positivity for ``p`` equal to 1 or 2."""
+    size = mean ** (2 - p) / alpha
+    probability = size / (size + mean)
+    counts = rng.negative_binomial(size, probability)
+    is_zero = counts == 0
+    while np.any(is_zero):
+        counts[is_zero] = rng.negative_binomial(
+            size[is_zero], probability[is_zero]
+        )
         is_zero = counts == 0
     return counts
 
@@ -164,6 +181,123 @@ class TestHurdleModels(unittest.TestCase):
         )
         self.assertLess(np.max(np.abs(fit.score())), 1e-5)
 
+    def test_negative_binomial_p_hurdle_recovers_nb1_and_nb2(self):
+        """Estimate beta, dispersion, and logit coefficients for both NB-P forms."""
+        positive_params = np.array([0.35, -0.25])
+        hurdle_params = np.array([-0.5, 0.45])
+        alpha = 0.7
+
+        for p, seed in ((1, 931), (2, 932)):
+            with self.subTest(p=p):
+                rng = np.random.default_rng(seed)
+                nobs = 3000
+                _, _, exog, exog_infl = make_designs(rng, nobs)
+                underlying_mean = np.exp(exog @ positive_params)
+                endog = sample_zero_truncated_negative_binomial_p(
+                    rng, underlying_mean, alpha, p
+                )
+                zero_probability = 1.0 / (
+                    1.0 + np.exp(-(exog_infl @ hurdle_params))
+                )
+                endog[rng.random(nobs) < zero_probability] = 0
+
+                model = NegativeBinomialPHurdle(
+                    endog,
+                    exog,
+                    exog_infl=exog_infl,
+                    p=p,
+                    exog_names=['Intercept', 'x'],
+                    exog_infl_names=['Intercept', 'z'],
+                )
+                fit = model.fit(cov_type='NONROBUST')
+
+                self.assertIsInstance(fit, DistributionalModelResults)
+                self.assertTrue(fit.converged)
+                self.assertTrue(fit.inference_valid)
+                self.assertEqual(fit.negative_binomial_p, p)
+                self.assertEqual(
+                    fit.param_names,
+                    [
+                        'Intercept', 'x', 'log_alpha',
+                        'hurdle_Intercept', 'hurdle_z',
+                    ],
+                )
+                np.testing.assert_allclose(
+                    fit.params.iloc[:2], positive_params, atol=0.09
+                )
+                self.assertAlmostEqual(fit.dispersion, alpha, delta=0.12)
+                np.testing.assert_allclose(
+                    fit.params.iloc[3:], hurdle_params, atol=0.1
+                )
+                self.assertEqual(model.k_positive, 3)
+                self.assertEqual(fit.score_obs().shape, (nobs, 5))
+                self.assertLess(
+                    np.max(np.abs(fit.score())) / nobs, 1e-5
+                )
+
+                covariance = np.asarray(fit.cov_params())
+                np.testing.assert_array_equal(covariance[:3, 3:], 0.0)
+                np.testing.assert_array_equal(covariance[3:, :3], 0.0)
+                np.testing.assert_allclose(
+                    fit.llf,
+                    fit.positive_fit.llf + fit.hurdle_fit.llf,
+                    rtol=1e-12,
+                    atol=1e-10,
+                )
+
+                fitted_underlying = fit.predict(which='underlying_mean')
+                fitted_positive = fit.predict(which='positive_mean')
+                self.assertTrue(np.all(fitted_positive > fitted_underlying))
+                np.testing.assert_allclose(
+                    fit.fittedvalues,
+                    fit.positive_probability * fitted_positive,
+                )
+                footer = fit.get_footer_info()
+                self.assertIn(f'ZERO-TRUNCATED NB{p}', footer)
+                self.assertIn('alpha=exp(log_alpha)', footer)
+
+    def test_negative_binomial_p_hurdle_score_and_validation(self):
+        """Match the weighted exact score and reject invalid p or outcomes."""
+        rng = np.random.default_rng(133)
+        nobs = 200
+        _, _, exog, exog_infl = make_designs(rng, nobs)
+        endog = sample_zero_truncated_negative_binomial_p(
+            rng, np.exp(0.2 - 0.1 * exog[:, 1]), 0.5, 2
+        )
+        endog[:50] = 0
+        weights = rng.uniform(0.3, 1.8, nobs)
+        model = NegativeBinomialPHurdle(
+            endog, exog, exog_infl=exog_infl, weights=weights
+        )
+        self.assertEqual(model.p, 2)
+
+        params = np.array([0.2, -0.1, np.log(0.5), -0.8, 0.2])
+        analytical = model.score(params)
+        numerical = np.empty_like(params)
+        step = 1e-5
+        for column in range(len(params)):
+            low = params.copy()
+            high = params.copy()
+            low[column] -= step
+            high[column] += step
+            numerical[column] = (
+                model.loglike(high) - model.loglike(low)
+            ) / (2.0 * step)
+        np.testing.assert_allclose(
+            analytical, numerical, rtol=2e-7, atol=2e-7
+        )
+        np.testing.assert_allclose(
+            model.loglike(params),
+            np.dot(weights, model.loglike_obs(params)),
+        )
+
+        with self.assertRaisesRegex(ValueError, 'p must be either 1'):
+            NegativeBinomialPHurdle(endog, exog, p=3)
+        with self.assertRaisesRegex(ValueError, 'non-negative integers'):
+            NegativeBinomialPHurdle(
+                np.array([0.0, 1.0, 1.5, 2.0]), exog[:4]
+            )
+
     def test_weighted_loglike_and_score_are_consistent(self):
         """Match the analytical weighted score to likelihood differences."""
         rng = np.random.default_rng(77)
@@ -231,9 +365,15 @@ class TestHurdleModels(unittest.TestCase):
             {'y': endog, 'x': x, 'z': z, 'weight': weights}
         )
 
-        model = PoissonHurdle.build_model_from_formula(
-            'y ~ x $ weight', data, exog_infl='z'
-        )
+        debug_output = io.StringIO()
+        with redirect_stdout(debug_output), redirect_stderr(debug_output):
+            model = PoissonHurdle.build_model_from_formula(
+                'y ~ x $ weight', data, exog_infl='z', debug=True
+            )
+        debug_text = debug_output.getvalue()
+        self.assertIn('DISTRIBUTIONAL FORMULA MODEL', debug_text)
+        self.assertIn('Zero-process exog shape:', debug_text)
+        self.assertIn('Zero-process formula: z', debug_text)
         self.assertEqual(
             model.param_names,
             ['Intercept', 'x', 'hurdle_Intercept', 'hurdle_z'],
@@ -263,6 +403,18 @@ class TestHurdleModels(unittest.TestCase):
         )
         self.assertEqual(constant_model.param_names[-1], 'hurdle_const')
         np.testing.assert_array_equal(constant_model.exog_infl, 1.0)
+
+        nb1_model = NegativeBinomialPHurdle.build_model_from_formula(
+            'y ~ x $ weight', data, exog_infl='z', p=1
+        )
+        self.assertEqual(nb1_model.p, 1)
+        self.assertEqual(
+            nb1_model.param_names,
+            [
+                'Intercept', 'x', 'log_alpha',
+                'hurdle_Intercept', 'hurdle_z',
+            ],
+        )
 
         with self.assertRaises(Exception):
             PoissonHurdle.build_model_from_formula('y ~ x | z', data)
@@ -301,14 +453,22 @@ class TestHurdleModels(unittest.TestCase):
         self.assertIsNotNone(sandwich.bread)
         self.assertIsNotNone(sandwich.meat)
 
-        bootstrap = model.fit(
-            cov_type='BOOTSTRAP',
-            cov_kwds={
-                'n_samples': 4,
-                'seed': 44,
-                'min_success_rate': 0.5,
-            },
-        )
+        debug_output = io.StringIO()
+        with redirect_stdout(debug_output), redirect_stderr(debug_output):
+            bootstrap = model.fit(
+                cov_type='BOOTSTRAP',
+                cov_kwds={
+                    'n_samples': 4,
+                    'seed': 44,
+                    'min_success_rate': 0.5,
+                },
+                debug=True,
+            )
+        debug_text = debug_output.getvalue()
+        self.assertIn('HURDLE MODEL FIT', debug_text)
+        self.assertIn('COHERENT HURDLE BAYESIAN BOOTSTRAP', debug_text)
+        self.assertIn('Per-draw GLM output is suppressed', debug_text)
+        self.assertIn('Final hurdle-fit diagnostics:', debug_text)
         self.assertTrue(bootstrap.inference_valid)
         self.assertEqual(bootstrap.bootstrapped_params.shape, (4, 4))
         np.testing.assert_array_equal(

@@ -9,7 +9,7 @@ import warnings
 
 import numpy as np
 
-from kanly.api import bfgs_pqn
+from kanly.optimize.bfgs_bounded_quasi_newton import bfgs_pqn
 from kanly.bootstrap.bootstrap import (
     DEFAULT_BB_ALPHA, DEFAULT_BB_SEED, DEFAULT_BOOTSTRAP_N_SAMPLES,
     get_bayesian_bootstrap_weights, get_bootstrap_weights2,
@@ -161,7 +161,7 @@ class DistributionalModel(ABC):
 
     @classmethod
     def _get_formula_constructor_kwargs(
-            cls, formula, data, index=None, debug=False,
+            cls, formula, data, index=None, debug: bool = False,
             check_constant_cols=False, fail_on_missing=False,
             cache_intermediate=True, sum_to_n=False,
             test_formula_on_dummy=True, drop_1_for_FE=True):
@@ -236,11 +236,16 @@ class DistributionalModel(ABC):
 
     @classmethod
     def build_model_from_formula(
-            cls, formula, data, index=None, debug=False,
+            cls, formula, data, index=None, debug: bool = False,
             check_constant_cols=False, fail_on_missing=False,
             cache_intermediate=True, sum_to_n=False,
             test_formula_on_dummy=True, drop_1_for_FE=True, **model_kwargs):
-        """Build an unfitted model with constructor-owned formula metadata."""
+        """Build an unfitted model with constructor-owned formula metadata.
+
+        Set ``debug=True`` to show formula-parser output followed by a compact
+        summary of the retained response, regression design, names, weights,
+        and construction time.
+        """
         constructor_kwargs = cls._get_formula_constructor_kwargs(
             formula=formula,
             data=data,
@@ -271,7 +276,69 @@ class DistributionalModel(ABC):
                 f'Formula construction supplies these arguments: {duplicates}'
             )
 
-        return cls(**constructor_kwargs, **model_kwargs)
+        model = cls(**constructor_kwargs, **model_kwargs)
+        if debug:
+            model._print_formula_debug_summary()
+        return model
+
+    @staticmethod
+    def _format_debug_values(values, max_items=12):
+        """Format a short vector or name sequence for debug output."""
+        values = list(values)
+        displayed = values[:max_items]
+        suffix = (
+            f' ... ({len(values)} total)'
+            if len(values) > max_items else ''
+        )
+        return f'{displayed}{suffix}'
+
+    def _print_formula_debug_summary(self):
+        """Print aligned formula-model metadata after construction."""
+        print('\n' + '=' * 50)
+        print('DISTRIBUTIONAL FORMULA MODEL')
+        print('-' * 50)
+        print(f'* Model: {self.__class__.__name__}')
+        print(f'* Formula: {self.formula}')
+        print(f'* Outcome: {self.endog_name or "y"}')
+        print(f'* Retained observations: {self.nobs}')
+        dropped_rows = set()
+        for rows in self.null_rows_info_dict.values():
+            if rows is not None:
+                dropped_rows.update(int(row) for row in rows)
+        print(f'* Rows removed for missing data: {len(dropped_rows)}')
+        print(f'* Main exog shape: {self.exog.shape}')
+        print(
+            '* Main exog names: '
+            f'{self._format_debug_values(self._get_regression_param_names())}'
+        )
+        if hasattr(self, 'exog_infl'):
+            print(f'* Zero-process exog shape: {self.exog_infl.shape}')
+            inflation_names = (
+                self.exog_infl_names
+                if self.exog_infl_names is not None
+                else (
+                    self.exog_infl_term_names
+                    if self.exog_infl_term_names is not None
+                    else [f'x{i}' for i in range(self.exog_infl.shape[1])]
+                )
+            )
+            print(
+                '* Zero-process exog names: '
+                f'{self._format_debug_values(inflation_names)}'
+            )
+            print(
+                '* Zero-process formula: '
+                f'{self.exog_infl_formula or "constant only"}'
+            )
+        if self.is_weighted:
+            print(
+                f'* Importance weights: {self.weights_name or "provided"}; '
+                f'sum={np.sum(self.weights):.6g}'
+            )
+        else:
+            print('* Importance weights: none')
+        print(f'* Construction time: {self.model_elapsed:.3f} s')
+        print('...Distributional formula model complete!\n')
 
     def _apply_weights(self, values):
         """Multiply an observation array by stored weights in place.
@@ -538,7 +605,8 @@ class DistributionalModel(ABC):
 
         return (hess + hess.T) / 2.0
 
-    def _fit_internal(self, start_params, weights=None, debug=False):
+    def _fit_internal(
+            self, start_params, weights=None, debug: bool = False):
         """Optimize using explicit likelihood weights and no model mutation."""
         if weights is not None:
             weights = np.asarray(weights, dtype=float).reshape(-1)
@@ -564,7 +632,8 @@ class DistributionalModel(ABC):
             gradient_callable=gradient,
         )
 
-    def _bayesian_bootstrap(self, params, cov_kwds, debug=False):
+    def _bayesian_bootstrap(
+            self, params, cov_kwds, debug: bool = False):
         """Refit Bayesian-bootstrap likelihoods and return their covariance."""
         n_samples = cov_kwds.get(
             'n_samples', DEFAULT_BOOTSTRAP_N_SAMPLES
@@ -598,6 +667,27 @@ class DistributionalModel(ABC):
         sample_weights, _ = get_bayesian_bootstrap_weights(
             self.nobs, n_samples=n_samples, seed=seed, alpha=alpha
         )
+        if debug:
+            from tqdm import tqdm
+
+            print('\n' + '=' * 50)
+            print('BAYESIAN BOOTSTRAP')
+            print('-' * 50)
+            print(f'* Model: {self.__class__.__name__}')
+            print(f'* Requested repetitions: {n_samples}')
+            print(f'* Seed: {seed}')
+            print(f'* Dirichlet alpha: {alpha:.6g}')
+            print(f'* Minimum success rate: {min_success_rate:.3f}')
+            print(
+                '* Original importance weights: '
+                f'{"multiplied into each draw" if self.is_weighted else "none"}'
+            )
+            print('* Per-draw BFGS output is suppressed; progress is shown.')
+            sample_weights = tqdm(
+                sample_weights,
+                total=n_samples,
+                desc=f'{self.__class__.__name__} bootstrap',
+            )
         params = np.asarray(params, dtype=float)
         parameter_draws = []
         n_failed = 0
@@ -700,10 +790,17 @@ class DistributionalModel(ABC):
             'min_success_rate': float(min_success_rate),
             'failure_reasons': dict(failure_reasons),
         }
+        if debug:
+            print('\nBootstrap diagnostics:')
+            print(f'* Successful repetitions: {len(parameter_draws)}')
+            print(f'* Failed repetitions: {n_failed}')
+            print(f'* Covariance correction: {use_correction}')
+            print('...Bayesian bootstrap complete!\n')
         return cov_params, parameter_draws, bootstrap_kwds
 
-    def fit(self, start_params=None, debug=False, cov_type='SANDWICH',
-            cov_kwds=None):
+    def fit(self, start_params=None, debug: bool = False,
+            cov_type='SANDWICH',
+            cov_kwds=None) -> DistributionalModelResults:
         """Estimate parameters and a likelihood-based covariance matrix.
 
         When ``start_params`` is omitted, :meth:`get_start_params` supplies
@@ -714,6 +811,10 @@ class DistributionalModel(ABC):
         ``seed``, ``alpha``, and ``use_correction``.  Every Bayesian-bootstrap
         draw is multiplied by, rather than substituted for, any original
         observation weights.
+
+        Set ``debug=True`` to print model dimensions and starts, pass verbose
+        diagnostics to BFGS-PQN, describe covariance validation, and show
+        Bayesian-bootstrap progress when requested.
         """
         cov_type = str(cov_type).upper()
         if cov_type not in {'SANDWICH', 'NONROBUST', 'BOOTSTRAP'}:
@@ -722,7 +823,8 @@ class DistributionalModel(ABC):
             )
         cov_kwds = {} if cov_kwds is None else dict(cov_kwds)
 
-        if start_params is None:
+        used_default_start = start_params is None
+        if used_default_start:
             start_params = self.get_start_params()
         start_params = np.asarray(start_params, dtype=float).reshape(-1)
         if len(start_params) != len(self.param_names):
@@ -732,6 +834,37 @@ class DistributionalModel(ABC):
             )
         if np.any(~np.isfinite(start_params)):
             raise ValueError('start_params must contain only finite values')
+
+        if debug:
+            print('\n' + '=' * 50)
+            print('DISTRIBUTIONAL MODEL FIT')
+            print('-' * 50)
+            print(f'* Model: {self.__class__.__name__}')
+            print(f'* Observations: {self.nobs}')
+            print(f'* Main exog shape: {self.exog.shape}')
+            if hasattr(self, 'exog_infl'):
+                print(f'* Zero-process exog shape: {self.exog_infl.shape}')
+                print(
+                    '* Outcome split: '
+                    f'{np.count_nonzero(self.endog == 0.0)} zero / '
+                    f'{np.count_nonzero(self.endog > 0.0)} positive'
+                )
+            print(f'* Parameters: {len(self.param_names)}')
+            print(
+                '* Parameter names: '
+                f'{self._format_debug_values(self.param_names)}'
+            )
+            print(f'* Covariance type: {cov_type}')
+            print(
+                '* Importance weights: '
+                f'{"provided" if self.is_weighted else "none"}'
+            )
+            print(
+                '* Starting values '
+                f'({"automatic" if used_default_start else "user"}): '
+                f'{np.array2string(start_params, precision=6)}'
+            )
+            print('* Passing debug=True to BFGS-PQN.')
 
         fit_start = time.perf_counter()
         optimization_result = self._fit_internal(
@@ -782,6 +915,14 @@ class DistributionalModel(ABC):
         model_inference_issues = list(self._inference_issues(params))
         inference_issues = first_order_issues + model_inference_issues
 
+        if debug:
+            print('\nPoint-estimate diagnostics:')
+            print(f'* Optimizer converged: {optimizer_converged}')
+            print(f'* First-order validation: {first_order_valid}')
+            print(f'* Log likelihood: {llf:.8g}')
+            print(f'* Scaled maximum score: {normalized_score:.3e}')
+            print(f'* Fit elapsed: {fit_elapsed:.3f} s')
+
         bootstrapped_params = None
         bootstrap_string = None
         information = None
@@ -795,6 +936,10 @@ class DistributionalModel(ABC):
         inference_valid = False
         covariance_start = time.perf_counter()
         can_compute_inference = converged and not model_inference_issues
+        if debug:
+            print('\nCovariance phase:')
+            print(f'* Requested estimator: {cov_type}')
+            print(f'* Fit eligible for inference: {can_compute_inference}')
         if cov_type == 'BOOTSTRAP' and can_compute_inference:
             cov_params, bootstrapped_params, cov_kwds = (
                 self._bayesian_bootstrap(
@@ -906,6 +1051,24 @@ class DistributionalModel(ABC):
         elif cov_params is None:
             covariance_status = 'unavailable because covariance diagnostics failed'
         cov_elapsed = time.perf_counter() - covariance_start
+
+        if debug:
+            print('\nFinal fit diagnostics:')
+            print(f'* Public convergence: {converged}')
+            print(f'* Inference valid: {inference_valid}')
+            print(f'* Covariance status: {covariance_status}')
+            if information_rank is not None:
+                print(
+                    f'* Information rank: {information_rank}/'
+                    f'{len(params)}'
+                )
+            if information_condition is not None:
+                print(
+                    '* Information condition number: '
+                    f'{information_condition:.3e}'
+                )
+            print(f'* Covariance elapsed: {cov_elapsed:.3f} s')
+            print('...Distributional model fit complete!\n')
 
         if inference_issues:
             warnings.warn(

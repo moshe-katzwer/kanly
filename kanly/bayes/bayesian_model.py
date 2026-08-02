@@ -1823,7 +1823,7 @@ class BayesianModel(ParameterCollection):
         return temp_func, n_unfixed, fixed_param_ind, fixed_param_vals, unfixed_param_ind
 
     def map(self, start_params, fixed_params=None, use_transformed_scale=True, onesided_fd=None,
-            maxiter=200, B0=1.0, xtol=1e-8, ftol=1e-8, gtol=1e-4, dx_fd=1e-6, momentum=.05, seed=0, debug=False,
+            maxiter=200, H0=1.0, xtol=1e-8, ftol=1e-8, gtol=1e-4, dx_fd=1e-6, momentum=.05, seed=0, debug=False,
             user_prompt_for_more_iters=False,
             ) -> BayesianModelMaximizationResult:
         """Maximum a posteriori (MAP) estimate via bounded BFGS.
@@ -1840,7 +1840,7 @@ class BayesianModel(ParameterCollection):
             ``use_transformed_scale=False``.
         use_transformed_scale : bool, default True
             Optimize ``log_posterior_transformed`` in internal coordinates.
-        onesided_fd, maxiter, B0, xtol, ftol, gtol, dx_fd, momentum, seed, debug,
+        onesided_fd, maxiter, H0, xtol, ftol, gtol, dx_fd, momentum, seed, debug,
         user_prompt_for_more_iters
             Forwarded to :func:`~kanly.bayes.map.maximum_a_posteriori.bfgs_pqn`.
 
@@ -1855,11 +1855,11 @@ class BayesianModel(ParameterCollection):
         """
 
         return map(self, start_params, fixed_params=fixed_params, use_transformed_scale=use_transformed_scale, onesided_fd=onesided_fd,
-                   maxiter=maxiter, B0=B0, xtol=xtol, ftol=ftol, gtol=gtol, dx_fd=dx_fd, momentum=momentum, seed=seed,
+                   maxiter=maxiter, H0=H0, xtol=xtol, ftol=ftol, gtol=gtol, dx_fd=dx_fd, momentum=momentum, seed=seed,
                    debug=debug, user_prompt_for_more_iters=user_prompt_for_more_iters)
 
     def mle(self, start_params, fixed_params=None, use_transformed_scale=True, onesided_fd=None,
-            maxiter=200, B0=1.0, xtol=1e-8, ftol=1e-8, gtol=1e-4, dx_fd=1e-6, momentum=.05, seed=0, debug=False,
+            maxiter=200, H0=1.0, xtol=1e-8, ftol=1e-8, gtol=1e-4, dx_fd=1e-6, momentum=.05, seed=0, debug=False,
             user_prompt_for_more_iters=False, pbar_update_cadence=.3
             ) -> BayesianModelMaximizationResult:
         """Maximum likelihood estimate (flat prior on parameters).
@@ -1873,7 +1873,7 @@ class BayesianModel(ParameterCollection):
             On the original scale unless ``use_transformed_scale=False``.
         use_transformed_scale : bool, default True
             Optimize in transformed coordinates when bounds use reparameterization.
-        onesided_fd, maxiter, B0, xtol, ftol, gtol, dx_fd, momentum, seed, debug,
+        onesided_fd, maxiter, H0, xtol, ftol, gtol, dx_fd, momentum, seed, debug,
         user_prompt_for_more_iters, pbar_update_cadence
             Optimizer options (see :meth:`map`).
 
@@ -1887,7 +1887,7 @@ class BayesianModel(ParameterCollection):
         """
 
         return mle(self, start_params, fixed_params=fixed_params, use_transformed_scale=use_transformed_scale, onesided_fd=onesided_fd,
-                   maxiter=maxiter, B0=B0, xtol=xtol, ftol=ftol, gtol=gtol, dx_fd=dx_fd, momentum=momentum, seed=seed,
+                   maxiter=maxiter, H0=H0, xtol=xtol, ftol=ftol, gtol=gtol, dx_fd=dx_fd, momentum=momentum, seed=seed,
                    debug=debug, user_prompt_for_more_iters=user_prompt_for_more_iters,
                    pbar_update_cadence=pbar_update_cadence)
 

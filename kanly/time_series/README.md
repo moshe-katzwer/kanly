@@ -400,7 +400,7 @@ Notable options:
 - `simple_differencing=True` — difference data before filtering; when `False`, integration is in the state vector and initial observations are burned from likelihood summaries.
 - `concentrate_scale=True` — optimize all parameters except `sigma2`, then set `sigma2` from forecast errors.
 - `standardize_endog=True` — fit on a standardized scale and map parameters back.
-- `enforce_stationarity` / `enforce_invertibility` — Monahan-style transforms on AR/MA starts.
+- `enforce_stationarity` / `enforce_invertibility` — repair invalid automatically generated AR/MA starts before optimization.
 - `cov_type` — `"opg"`, `"approx"`, `"robust_approx"`, `"none"`.
 - `multiplicative=True` — not implemented in the current fit path.
 

@@ -41,7 +41,7 @@ model = build_data_model(
     nopython=True
 )
 model = model.to_bayesian_model()
-res = model.map([0, 0, 0, 0], B0=100, maxiter=1000, ftol=1e-12, gtol=1e-6, momentum=.1)
+res = model.map([0, 0, 0, 0], H0=.01, maxiter=1000, ftol=1e-12, gtol=1e-6, momentum=.1)
 
 res.x, res.optimization_result.ferr, res.optimization_result.iter
 print(pd.DataFrame({

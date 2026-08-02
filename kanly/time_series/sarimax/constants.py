@@ -18,7 +18,9 @@ DEFAULT_SARIMAX_MAXITER = 100
 
 DEFAULT_SARIMAX_STEADY_STATE_TOL = 1e-8
 
-DEFAULT_SARIMAX_BFGS_B0 = 100.0
+# The former B0 default was 100 * I as an initial Hessian. BFGS/PQN now
+# maintains its inverse by default, so the equivalent H0 is 0.01 * I.
+DEFAULT_SARIMAX_BFGS_H0 = 0.01
 
 DEFAULT_SARIMAX_ENFORCE_STATIONARITY = False
 DEFAULT_SARIMAX_ENFORCE_INVERTIBILITY = False

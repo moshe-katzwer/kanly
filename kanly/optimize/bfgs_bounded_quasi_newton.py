@@ -170,7 +170,7 @@ class BFGSPQNResults(OptimizationResult):
             grad: Gradient at the final iterate.
             grad_projected: Gradient with bound-blocked coordinates zeroed.
             hess: Final Hessian or BFGS Hessian approximation.
-            hess_inv: Final Inverse Hessian or Inverse BFGS Hessian approximation.
+            hess_inv: Final inverse Hessian or inverse-BFGS approximation.
             converged: Whether a stopping criterion was met.
             message: Human-readable convergence or failure message.
             time_elapsed: Wall-clock runtime in seconds.
@@ -179,7 +179,10 @@ class BFGSPQNResults(OptimizationResult):
             xerr: Final relative parameter-change diagnostic.
             gnorm: Final projected-gradient convergence diagnostic.
             iter: Number of quasi-Newton iterations completed.
-            H0: User-supplied initial Hessian approximation, if any.
+            H0: Original user-supplied initial curvature input, if any. A
+                matrix is a Hessian or inverse-Hessian approximation according
+                to ``use_inv_hessian``. In inverse-Hessian mode, a scalar is a
+                Hessian scale whose reciprocal initializes the inverse.
             ub_binding: Boolean mask for coordinates binding at upper bounds.
             lb_binding: Boolean mask for coordinates binding at lower bounds.
             bounds: Bounds used by the optimizer, or None for unbounded runs.
@@ -226,9 +229,13 @@ def bfgs_pqn(
         x0: Initial feasible parameter vector.
         bounds: Optional 2 x p array-like object. The first row contains lower
             bounds and the second row contains upper bounds.
-        H0: Optional initial Hessian approximation. A scalar is expanded to a
-            scaled identity matrix; an array is copied.  If `use_inv_hessian=True`,
-            this is the inverse Hessian, otherwise it is the Hessian.
+        H0: Optional initial curvature input. A matrix is copied and treated as
+            an inverse-Hessian approximation when ``use_inv_hessian=True`` or
+            as a Hessian approximation when it is False. A scalar always
+            denotes a Hessian scale: it initializes ``H0 * I`` in Hessian mode
+            and ``(1 / H0) * I`` in inverse-Hessian mode. If omitted, a
+            dimension-dependent Hessian scale is constructed and represented
+            in the selected mode.
         xtol: Convergence tolerance for relative parameter changes.
         ftol: Convergence tolerance for relative objective_function improvement.
         gtol: Convergence tolerance for the projected-gradient norm.
@@ -262,9 +269,12 @@ def bfgs_pqn(
             values are encountered.
         max_total_bfgs_calls: Maximum number of recursive restarts after
             non-finite values.
-        prior_bfgs_H0: Internal record of the previous restart's Hessian scale.
-        use_inv_hessian: Whether to maintain the Hessian (False) or inverse Hessian
-            (True).
+        prior_bfgs_H0: Internal record of the scalar Hessian scale used by the
+            previous restart.
+        use_inv_hessian: Whether BFGS updates maintain an inverse Hessian
+            (True) or a Hessian (False). When None, defaults to True unless an
+            analytical ``hessian_callable`` is supplied, in which case it
+            defaults to False.
 
     Returns:
         A ``BFGSPQNResults`` instance containing the final point, objective_function

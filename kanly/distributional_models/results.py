@@ -60,7 +60,8 @@ class DistributionalModelResults(RegressionResultsBase):
             iterations: Iteration count or component-iteration description.
             score_at_params: Aggregated score at the fitted parameters.
             scale: Distribution or positive-component scale shown in summaries.
-            positive_fit: Positive-response GLM result for hurdle models.
+            positive_fit: Positive-response component result for hurdle
+                models; either a GLM result or direct-likelihood result.
             hurdle_fit: Bernoulli/logit GLM result for hurdle models.
             component_cov_type: Native component covariance type for hurdles.
             specification_name: Optional summary title suffix.
@@ -297,7 +298,9 @@ class DistributionalModelResults(RegressionResultsBase):
             self.dispersion = None
             self.dispersion_name = None
 
-        if hasattr(self.model, 'p'):
+        if hasattr(self.model, 'negative_binomial_p'):
+            self.negative_binomial_p = self.model.negative_binomial_p
+        elif hasattr(self.model, 'p'):
             self.generalized_poisson_p = self.model.p
 
         if self.is_hurdle:
@@ -341,7 +344,7 @@ class DistributionalModelResults(RegressionResultsBase):
                 )
             return (
                 'Covariance is block diagonal; the positive-response and '
-                f'zero-hurdle blocks each use the component GLM '
+                f'zero-hurdle blocks each use the component '
                 f'{self.component_cov_type} estimator.'
             )
         descriptions = {
@@ -522,6 +525,8 @@ class DistributionalModelResults(RegressionResultsBase):
             header.append(('Dispersion:', '%.4e' % self.dispersion))
         if hasattr(self, 'generalized_poisson_p'):
             header.append(('GP p:', self.generalized_poisson_p))
+        if hasattr(self, 'negative_binomial_p'):
+            header.append(('NB p:', self.negative_binomial_p))
         if self.is_zero_inflated:
             header.extend([
                 ('Count Params:', self.model.exog.shape[1]),
@@ -541,16 +546,25 @@ class DistributionalModelResults(RegressionResultsBase):
         lines = []
         if self.is_hurdle:
             lines.append(
-                'The Bernoulli/logit zero hurdle and positive-response GLM '
+                'The Bernoulli/logit zero hurdle and positive-response model '
                 'were estimated separately.'
             )
-            lines.append(
-                f'Positive family/link: {self.positive_fit.family.name()} / '
-                f'{self.positive_fit.link.name()}.'
+            positive_description = getattr(
+                self.model, '_positive_component_description', None
             )
+            if positive_description is not None:
+                lines.append(
+                    f'Positive component: {positive_description()}.'
+                )
+            else:
+                lines.append(
+                    f'Positive family/link: '
+                    f'{self.positive_fit.family.name()} / '
+                    f'{self.positive_fit.link.name()}.'
+                )
             lines.append(
-                'Parameter order is positive-response coefficients followed '
-                'by hurdle coefficients.'
+                'Parameter order is all positive-response parameters '
+                'followed by hurdle coefficients.'
             )
             if self.is_quasi_likelihood:
                 lines.append(
@@ -581,6 +595,11 @@ class DistributionalModelResults(RegressionResultsBase):
             lines.append(
                 f'Generalized-Poisson parameterization: '
                 f'p={self.generalized_poisson_p:g}.'
+            )
+        if hasattr(self, 'negative_binomial_p'):
+            lines.append(
+                'Negative-binomial-P parameterization: '
+                f'p={self.negative_binomial_p:d}; alpha=exp(log_alpha).'
             )
         if self.is_weighted:
             lines.append(

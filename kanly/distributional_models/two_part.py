@@ -186,7 +186,8 @@ class TwoPartModel(_NonnegativeDistributionalModel):
 
     @classmethod
     def build_model_from_formula(
-            cls, formula, data, index=None, exog_infl=None, debug=False,
+            cls, formula, data, index=None, exog_infl=None,
+            debug: bool = False,
             check_constant_cols=False, fail_on_missing=False,
             cache_intermediate=True, sum_to_n=False,
             test_formula_on_dummy=True, drop_1_for_FE=True, **model_kwargs):
@@ -324,9 +325,12 @@ class TwoPartModel(_NonnegativeDistributionalModel):
                 f'Formula construction supplies these arguments: {duplicates}'
             )
 
-        return cls(
+        model = cls(
             **constructor_kwargs, **inflation_kwargs, **model_kwargs
         )
+        if debug:
+            model._print_formula_debug_summary()
+        return model
 
 
 __all__ = ['TwoPartModel']

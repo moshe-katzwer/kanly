@@ -14,7 +14,7 @@ from kanly.regression.model_base import ModelBase
 from kanly.time_series.sarimax.constants import (
     DEFAULT_SARIMAX_COV_TYPE, DEFAULT_SARIMAX_DO_HANNAN_RISSANEN, DEFAULT_SARIMAX_MAXITER,
     DEFAULT_SARIMAX_GTOL, DEFAULT_SARIMAX_FTOL, DEFAULT_SARIMAX_XTOL, DEFAULT_SARIMAX_STEADY_STATE_TOL,
-    DEFAULT_SARIMAX_BFGS_B0,
+    DEFAULT_SARIMAX_BFGS_H0,
     DEFAULT_SARIMAX_ENFORCE_STATIONARITY, DEFAULT_SARIMAX_ENFORCE_INVERTIBILITY,
     DEFAULT_SARIMAX_INITIAL_DIFFUSE_VARIANCE,
     DEFAULT_SARIMAX_CONCENTRATE_SCALE, DEFAULT_SARIMAX_SIMPLE_DIFFERENCING, DEFAULT_SARIMAX_MULTIPLICATIVE,
@@ -176,8 +176,8 @@ class SarimaxModel(ModelBase):
             exog_term_names: Formula term names associated with exogenous regressors.
             data: Data source used by formula parsing.
             specification_name: Optional display name for the model specification.
-            enforce_stationarity: Whether to transform AR parameters into the stationary region.
-            enforce_invertibility: Whether to transform MA parameters into the invertible region.
+            enforce_stationarity: Whether to repair nonstationary automatically generated AR starts.
+            enforce_invertibility: Whether to repair noninvertible automatically generated MA starts.
             simple_differencing: Whether to difference data before the state-space likelihood instead of integrating in the state.
             initial_diffuse_variance: Initial variance assigned to diffuse state components.
             multiplicative: Whether to request multiplicative seasonal dynamics.
@@ -294,7 +294,7 @@ class SarimaxModel(ModelBase):
                 maxiter=DEFAULT_SARIMAX_MAXITER, gtol=DEFAULT_SARIMAX_GTOL, ftol=DEFAULT_SARIMAX_FTOL,
                 xtol=DEFAULT_SARIMAX_XTOL,
                 cov_type=DEFAULT_SARIMAX_COV_TYPE,
-                do_hannan_rissanen=DEFAULT_SARIMAX_DO_HANNAN_RISSANEN, B0=DEFAULT_SARIMAX_BFGS_B0, do_numba=None,
+                do_hannan_rissanen=DEFAULT_SARIMAX_DO_HANNAN_RISSANEN, H0=DEFAULT_SARIMAX_BFGS_H0, do_numba=None,
                 enforce_stationarity=DEFAULT_SARIMAX_ENFORCE_STATIONARITY,
                 enforce_invertibility=DEFAULT_SARIMAX_ENFORCE_INVERTIBILITY,
                 concentrate_scale=DEFAULT_SARIMAX_CONCENTRATE_SCALE,
@@ -329,10 +329,11 @@ class SarimaxModel(ModelBase):
             xtol: Optimizer parameter-change tolerance.
             cov_type: Covariance estimator name.
             do_hannan_rissanen: Whether to estimate starting ARMA parameters with Hannan-Rissanen.
-            B0: Initial Hessian scale or approximation passed to BFGS/PQN.
+            H0: Initial inverse-Hessian approximation passed to BFGS/PQN. A
+                scalar is expanded to that multiple of the identity matrix.
             do_numba: Compatibility flag for numba execution paths.
-            enforce_stationarity: Whether to transform AR parameters into the stationary region.
-            enforce_invertibility: Whether to transform MA parameters into the invertible region.
+            enforce_stationarity: Whether to repair nonstationary automatically generated AR starts.
+            enforce_invertibility: Whether to repair noninvertible automatically generated MA starts.
             concentrate_scale: Whether to optimize with innovation variance concentrated out.
             simple_differencing: Whether to difference data before the state-space likelihood instead of integrating in the state.
             initial_diffuse_variance: Initial variance assigned to diffuse state components.
@@ -385,7 +386,7 @@ class SarimaxModel(ModelBase):
 
         fit = model.fit(start_params=start_params, do_hannan_rissanen=do_hannan_rissanen,
                         nlags=nlags, debug=debug, cov_type=cov_type,
-                        maxiter=maxiter, gtol=gtol, ftol=ftol, xtol=xtol, B0=B0, do_numba=do_numba,
+                        maxiter=maxiter, gtol=gtol, ftol=ftol, xtol=xtol, H0=H0, do_numba=do_numba,
                         concentrate_scale=concentrate_scale,
                         initial_diffuse_variance=initial_diffuse_variance,
                         standardize_endog=standardize_endog,
@@ -403,7 +404,7 @@ class SarimaxModel(ModelBase):
                 maxiter=DEFAULT_SARIMAX_MAXITER, gtol=DEFAULT_SARIMAX_GTOL, ftol=DEFAULT_SARIMAX_FTOL,
                 xtol=DEFAULT_SARIMAX_XTOL,
                 cov_type=DEFAULT_SARIMAX_COV_TYPE, do_hannan_rissanen=DEFAULT_SARIMAX_DO_HANNAN_RISSANEN,
-                B0=DEFAULT_SARIMAX_BFGS_B0,
+                H0=DEFAULT_SARIMAX_BFGS_H0,
                 do_numba=None,
                 concentrate_scale=DEFAULT_SARIMAX_CONCENTRATE_SCALE,
                 enforce_stationarity=DEFAULT_SARIMAX_ENFORCE_STATIONARITY,
@@ -439,11 +440,12 @@ class SarimaxModel(ModelBase):
             xtol: Optimizer parameter-change tolerance.
             cov_type: Covariance estimator name.
             do_hannan_rissanen: Whether to estimate starting ARMA parameters with Hannan-Rissanen.
-            B0: Initial Hessian scale or approximation passed to BFGS/PQN.
+            H0: Initial inverse-Hessian approximation passed to BFGS/PQN. A
+                scalar is expanded to that multiple of the identity matrix.
             do_numba: Compatibility flag for numba execution paths.
             concentrate_scale: Whether to optimize with innovation variance concentrated out.
-            enforce_stationarity: Whether to transform AR parameters into the stationary region.
-            enforce_invertibility: Whether to transform MA parameters into the invertible region.
+            enforce_stationarity: Whether to repair nonstationary automatically generated AR starts.
+            enforce_invertibility: Whether to repair noninvertible automatically generated MA starts.
             simple_differencing: Whether to difference data before the state-space likelihood instead of integrating in the state.
             initial_diffuse_variance: Initial variance assigned to diffuse state components.
             multiplicative: Whether to request multiplicative seasonal dynamics.
@@ -495,7 +497,7 @@ class SarimaxModel(ModelBase):
         fit = model.fit(start_params=start_params, do_hannan_rissanen=do_hannan_rissanen,
                         concentrate_scale=concentrate_scale,
                         nlags=nlags, debug=debug, cov_type=cov_type,
-                        maxiter=maxiter, gtol=gtol, ftol=ftol, xtol=xtol, B0=B0, do_numba=do_numba,
+                        maxiter=maxiter, gtol=gtol, ftol=ftol, xtol=xtol, H0=H0, do_numba=do_numba,
                         initial_diffuse_variance=initial_diffuse_variance,
                         standardize_endog=standardize_endog,
                         **kwargs)
@@ -503,7 +505,7 @@ class SarimaxModel(ModelBase):
 
     def fit(self, start_params=None, do_hannan_rissanen=DEFAULT_SARIMAX_DO_HANNAN_RISSANEN, debug=False, nlags=None,
             specification_name=None, cov_type=DEFAULT_SARIMAX_COV_TYPE, maxiter=DEFAULT_SARIMAX_MAXITER,
-            gtol=DEFAULT_SARIMAX_GTOL, ftol=DEFAULT_SARIMAX_FTOL, xtol=DEFAULT_SARIMAX_XTOL, B0=DEFAULT_SARIMAX_BFGS_B0,
+            gtol=DEFAULT_SARIMAX_GTOL, ftol=DEFAULT_SARIMAX_FTOL, xtol=DEFAULT_SARIMAX_XTOL, H0=DEFAULT_SARIMAX_BFGS_H0,
             do_numba=None,
             steady_state_tol=DEFAULT_SARIMAX_STEADY_STATE_TOL,
             initial_diffuse_variance=DEFAULT_SARIMAX_INITIAL_DIFFUSE_VARIANCE,
@@ -527,12 +529,13 @@ class SarimaxModel(ModelBase):
             gtol: Optimizer projected-gradient tolerance.
             ftol: Optimizer objective_function-change tolerance.
             xtol: Optimizer parameter-change tolerance.
-            B0: Initial Hessian scale or approximation passed to BFGS/PQN.
+            H0: Initial inverse-Hessian approximation passed to BFGS/PQN. A
+                scalar is expanded to that multiple of the identity matrix.
             do_numba: Compatibility flag for numba execution paths.
             steady_state_tol: Tolerance for detecting steady-state Kalman forecast error variance.
             initial_diffuse_variance: Initial variance assigned to diffuse state components.
-            enforce_stationarity: Whether to transform AR parameters into the stationary region.
-            enforce_invertibility: Whether to transform MA parameters into the invertible region.
+            enforce_stationarity: Whether to repair nonstationary automatically generated AR starts.
+            enforce_invertibility: Whether to repair noninvertible automatically generated MA starts.
             concentrate_scale: Whether to optimize with innovation variance concentrated out.
             standardize_endog: Whether to standardize endogenous data during optimization.
 
@@ -546,7 +549,7 @@ class SarimaxModel(ModelBase):
             debug=debug,
             maxiter=maxiter, gtol=gtol, ftol=ftol,
             xtol=xtol,
-            B0=B0,
+            H0=H0,
             start_params=start_params, do_hannan_rissanen=do_hannan_rissanen,
             steady_state_tol=steady_state_tol,
             initial_diffuse_variance=initial_diffuse_variance,
@@ -628,8 +631,8 @@ class SarimaxModel(ModelBase):
             check_constant_cols: Whether to check for constant columns in formula-built exog.
             specification_name: Optional display name for the model specification.
             drop_1_for_FE: Whether formula parsing drops singleton fixed-effect indicators.
-            enforce_stationarity: Whether to transform AR parameters into the stationary region.
-            enforce_invertibility: Whether to transform MA parameters into the invertible region.
+            enforce_stationarity: Whether to repair nonstationary automatically generated AR starts.
+            enforce_invertibility: Whether to repair noninvertible automatically generated MA starts.
             diffuse: Whether to use diffuse initialization for integrated state components.
 
         Returns:
@@ -730,8 +733,8 @@ class SarimaxModel(ModelBase):
             drop_1_for_FE: Whether formula parsing drops singleton fixed-effect indicators.
             priors: Parameter ``priors`` passed to the SARIMAX helper.
             bounds: Parameter ``bounds`` passed to the SARIMAX helper.
-            enforce_stationarity: Whether to transform AR parameters into the stationary region.
-            enforce_invertibility: Whether to transform MA parameters into the invertible region.
+            enforce_stationarity: Whether to repair nonstationary automatically generated AR starts.
+            enforce_invertibility: Whether to repair noninvertible automatically generated MA starts.
 
         Returns:
             Bayesian SARIMAX model representation.

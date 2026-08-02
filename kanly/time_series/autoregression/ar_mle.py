@@ -363,7 +363,7 @@ def ar_mle(y, lags=1, exact=True,
            xtol=1e-6,
            ftol=1e-8,
            gtol=1e-4,
-           B0=100,
+           H0=0.01,
            onesided_fd=True,
            x0=None,
            debug=False,
@@ -414,8 +414,11 @@ def ar_mle(y, lags=1, exact=True,
     gtol : float, default=1e-4
         Gradient convergence tolerance.
 
-    B0 : float, default=100
-        Initial Hessian scaling for the quasi-Newton optimizer.
+    H0 : float or array_like, default=0.01
+        Initial inverse-Hessian approximation for the quasi-Newton optimizer.
+        A scalar is expanded to that multiple of the identity matrix. The
+        former ``B0=100`` default represented a Hessian scale of 100, whose
+        equivalent inverse-Hessian scale is 0.01.
 
     x0 : array_like or None, default=None
         Optional starting values in unconstrained optimizer coordinates.
@@ -534,6 +537,12 @@ def ar_mle(y, lags=1, exact=True,
     else:
         x0 = np.asarray(x0)
 
+    initial_inverse_hessian = H0
+    if np.isscalar(initial_inverse_hessian):
+        initial_inverse_hessian = np.eye(len(x0)) * initial_inverse_hessian
+    elif initial_inverse_hessian is not None:
+        initial_inverse_hessian = np.asarray(initial_inverse_hessian, dtype=float)
+
     result: BFGSPQNResults = bfgs_pqn(
         obj_func,
         x0,
@@ -542,7 +551,8 @@ def ar_mle(y, lags=1, exact=True,
         xtol=xtol,
         ftol=ftol,
         gtol=gtol,
-        B0=B0,
+        H0=initial_inverse_hessian,
+        use_inv_hessian=True,
         onesided_fd=onesided_fd,
     )
 
@@ -695,7 +705,7 @@ def ar_mle(y, lags=1, exact=True,
             'xtol': xtol,
             'ftol': ftol,
             'gtol': gtol,
-            'B0': B0,
+            'H0': H0,
             'x0': x0,
         }
     }

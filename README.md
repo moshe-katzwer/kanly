@@ -26,7 +26,8 @@ Typical applications include:
   sandwich, or bootstrap covariance. This includes discrete, continuous, and
   mixed discrete/continuous response distributions. Import concrete models,
   the `DistributionalModel` base, and `DistributionalModelResults` from
-  `kanly.distributional_models`; see the
+  `kanly.distributional_models`, or use the one-shot formula/array APIs
+  `distributional_model` and `DISTRIBUTIONAL_MODEL` from `kanly.api`; see the
   [distributional models user guide](kanly/distributional_models/README.md).
 - **Robust and quantile regression** — M-estimation (IRLS) and quantile regression (IRLS with smooth check losses) at large scale.
 - **Penalized linear models** — Elastic net / LASSO / ridge via coordinate descent with optional OLS refit on selected support.
@@ -234,7 +235,7 @@ Trees such as `kanly/__sandbox__/`, `___to_delete/`, `to_delete2/`, and `wip/` u
 | `kanly/regression/generalized_method_of_moments/`     | `gmm`, `GMM`, `gmm_iv_linear`, `gmm_iv_nonlinear`, `gmm_mle`                                                       | [`kanly/regression/generalized_method_of_moments/README.md`](kanly/regression/generalized_method_of_moments/README.md)         |
 | `kanly/regression/nonlinear_least_squares/`           | `nlls`, `nlls_en`, …                                                                                               | [`kanly/regression/nonlinear_least_squares/README.md`](kanly/regression/nonlinear_least_squares/README.md)                     |
 | `kanly/regression/partial_least_squares/`             | `pls1`, `PLS1`, `PLS2`                                                                                             | [`kanly/regression/partial_least_squares/README.md`](kanly/regression/partial_least_squares/README.md)                         |
-| `kanly/distributional_models/`                        | `DistributionalModel`; Poisson, Gamma, negative-binomial, zero-inflated, and hurdle classes                        | [`kanly/distributional_models/README.md`](kanly/distributional_models/README.md)                                               |
+| `kanly/distributional_models/`                        | `distributional_model`, `DISTRIBUTIONAL_MODEL`; Poisson, Gamma, negative-binomial, zero-inflated, and hurdle classes | [`kanly/distributional_models/README.md`](kanly/distributional_models/README.md)                                               |
 | `kanly/bootstrap/`                                    | `cov_type='bootstrap'` on fits; `get_joint_bootstrapped_distribution`                                              | [`kanly/bootstrap/README.md`](kanly/bootstrap/README.md)                                                                       |
 | `kanly/time_series/` (SARIMAX in `sarimax/`)          | `SARIMAX`, `sarimax`, `ARIMA`, `arima`, `simulate_sarima`, `acf`, `pacf`                                           | [`kanly/time_series/README.md`](kanly/time_series/README.md) — package readme (not under `sarimax/`)                           |
 | `kanly/bayes/`                                        | `bmodel`, `DataModel`, `amha`, `mala`, `blm`, `bayes_lm_model`, …                                                  | [`kanly/bayes/README.md`](kanly/bayes/README.md)                                                                               |

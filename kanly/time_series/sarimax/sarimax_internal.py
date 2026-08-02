@@ -228,7 +228,7 @@ def get_loglike_function(endog, exog, trend, trend_offset, trend_scale,
 
 
 def sarimax_internal(endog, order, seasonal_order=None, exog=None, trend=None, trend_offset=1, trend_scale=1,
-                     debug=False, maxiter=100, gtol=1e-4, ftol=1e-15, xtol=1e-15, B0=1.0, do_numba=None,
+                     debug=False, maxiter=100, gtol=1e-4, ftol=1e-15, xtol=1e-15, H0=1.0, do_numba=None,
                      start_params=None, do_hannan_rissanen=True, steady_state_tol=DEFAULT_SARIMAX_STEADY_STATE_TOL,
                      enforce_stationarity=DEFAULT_SARIMAX_ENFORCE_STATIONARITY,
                      enforce_invertibility=DEFAULT_SARIMAX_ENFORCE_INVERTIBILITY,
@@ -277,13 +277,14 @@ def sarimax_internal(endog, order, seasonal_order=None, exog=None, trend=None, t
         gtol: Optimizer projected-gradient tolerance.
         ftol: Optimizer objective_function-change tolerance.
         xtol: Optimizer parameter-change tolerance.
-        B0: Initial Hessian scale or approximation passed to BFGS/PQN.
+        H0: Initial inverse-Hessian approximation passed to BFGS/PQN. A scalar
+            is expanded to that multiple of the identity matrix.
         do_numba: Compatibility flag for numba execution paths.
         start_params: Optional initial parameter vector.
         do_hannan_rissanen: Whether to estimate starting ARMA parameters with Hannan-Rissanen.
         steady_state_tol: Tolerance for detecting steady-state Kalman forecast error variance.
-        enforce_stationarity: Whether to transform AR parameters into the stationary region.
-        enforce_invertibility: Whether to transform MA parameters into the invertible region.
+        enforce_stationarity: Whether to repair nonstationary automatically generated AR starts.
+        enforce_invertibility: Whether to repair noninvertible automatically generated MA starts.
         concentrate_scale: Whether to optimize with innovation variance concentrated out.
         simple_differencing: Whether to difference data before the state-space likelihood instead of integrating in the state.
         initial_diffuse_variance: Initial variance assigned to diffuse state components.
@@ -319,7 +320,7 @@ def sarimax_internal(endog, order, seasonal_order=None, exog=None, trend=None, t
                sar_lags=sar_lags,
                sma_lags=sma_lags,
                maxiter=maxiter,
-               B0=B0,
+               H0=H0,
                xtol=xtol,
                ftol=ftol,
                gtol=gtol,
@@ -404,9 +405,17 @@ def sarimax_internal(endog, order, seasonal_order=None, exog=None, trend=None, t
         else:
             print()
 
-    optimization_result = bfgs_pqn(loglike, x0=start_params,
-                                   B0=B0, xtol=xtol, ftol=ftol, gtol=gtol, maxiter=maxiter, debug=debug,
-                                   maximize=True)
+    initial_inverse_hessian = H0
+    if np.isscalar(initial_inverse_hessian):
+        initial_inverse_hessian = np.eye(len(start_params)) * initial_inverse_hessian
+    elif initial_inverse_hessian is not None:
+        initial_inverse_hessian = np.asarray(initial_inverse_hessian, dtype=float)
+
+    optimization_result = bfgs_pqn(
+        loglike, x0=start_params,
+        H0=initial_inverse_hessian, use_inv_hessian=True,
+        xtol=xtol, ftol=ftol, gtol=gtol, maxiter=maxiter, debug=debug,
+        maximize=True)
 
     llf_call_full = loglike(optimization_result.x, return_type='all')
 
