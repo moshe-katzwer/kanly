@@ -6,6 +6,9 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import isspmatrix
 
+from kanly.distributional_models.marginal_effects import (
+    _get_marginal_effects,
+)
 from kanly.regression.regression_results_base import RegressionResultsBase
 
 
@@ -433,6 +436,53 @@ public result object themselves.
         return self.model.predict(
             np.asarray(params), exog=exog, exog_infl=exog_infl, which=which,
             data=data, index=index, debug=debug,
+        )
+
+    def get_marginal_effects(
+            self, at='overall', which='mean', effect_type='dydx',
+            dummy=True, dummy_method='secant', test_level=DEFAULT_TEST_LEVEL):
+        """Return importance-weighted response-scale marginal effects.
+
+        ``which='mean'`` always targets the unconditional response mean. For
+        two-part models, effects from the main and zero-process equations are
+        returned as separate rows using their fitted parameter names, such as
+        ``x`` and ``hurdle_x``. Their continuous effects may be added when the
+        columns represent the same underlying covariate; combined inference
+        must also use their covariance from ``margeff_cov``.
+
+        Args:
+            at: Evaluation setting. ``'overall'`` returns the
+                importance-weighted average effect, ``'mean'`` and
+                ``'median'`` use importance-weighted design summaries, and
+                ``'all'`` returns observation effects without inference.
+            which: Prediction to differentiate. One-part models support
+                ``'mean'`` and ``'linear_predictor'``. Zero-inflated models
+                additionally support ``'count_mean'``,
+                ``'inflation_probability'``, ``'zero_probability'``, and
+                ``'positive_probability'``. Hurdle models additionally
+                support ``'positive_mean'``, ``'underlying_mean'``,
+                ``'zero_probability'``, and ``'positive_probability'``.
+            effect_type: ``'dydx'``, ``'eydx'``, ``'eyex'``, or ``'dyex'``.
+            dummy: Whether nonconstant 0/1 columns use discrete changes for
+                ``dydx`` and ``eydx`` effects.
+            dummy_method: ``'secant'`` for a zero-to-one dummy change or
+                ``'tangent'`` for a continuous derivative.
+            test_level: Two-sided significance level for normal confidence
+                intervals.
+
+        Returns:
+            A ``DistributionalMarginalEffects`` result with named estimates,
+            delta-method covariance and inference when parameter covariance
+            is available, and ``summary``/``summary_df`` methods.
+        """
+        return _get_marginal_effects(
+            self,
+            at=at,
+            which=which,
+            effect_type=effect_type,
+            dummy=dummy,
+            dummy_method=dummy_method,
+            test_level=test_level,
         )
 
     def summary_df(self, test_level=DEFAULT_TEST_LEVEL):

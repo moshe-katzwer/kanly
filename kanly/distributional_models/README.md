@@ -34,6 +34,8 @@ response structure:
   `Gamma` likelihood model.
 - [`hurdle_models.py`](hurdle_models.py) contains Gaussian, lognormal,
   Poisson, Gamma, Inverse Gaussian, and negative-binomial-P hurdle models.
+- [`marginal_effects.py`](marginal_effects.py) computes importance-weighted
+  response-scale marginal effects and delta-method inference.
 - [`results.py`](results.py) contains the shared fitted-results object.
 
 All public model classes can be imported directly from
@@ -46,6 +48,7 @@ from kanly.distributional_models import (
     DISTRIBUTIONAL_MODEL,
     DISTRIBUTIONAL_MODEL_ALIASES,
     DistributionalModel,
+    DistributionalMarginalEffects,
     DistributionalModelResults,
     TwoPartModel,
     GaussianHurdle,
@@ -682,6 +685,7 @@ Every count, zero-inflated, Gamma, and hurdle fit returns a
 | `inference_valid` / `inference_issues` | Whether covariance inference passed diagnostics and any failure reasons |
 | `information_rank` / `information_condition` | Observed-information identification diagnostics |
 | `summary_df()` | Coefficient, standard error, z statistic, p-value, and CI table |
+| `get_marginal_effects()` | Importance-weighted response-scale marginal effects and delta-method inference |
 | `predict(data=...)` | Re-evaluate stored main and zero-process formulas on new DataFrame or dict-like data |
 | `llf` / `average_loglike` | Total and per-observation fitted log likelihood |
 | `aic` / `bic` | Information criteria for unweighted normalized-likelihood fits; otherwise `None` |
@@ -704,6 +708,97 @@ print(fit.summary_df())
 print(fit.params)
 print(fit.bse)
 ```
+
+## Marginal Effects
+
+Every `DistributionalModelResults` object implements
+`get_marginal_effects()`. The default target, `which="mean"`, always means the
+unconditional response mean represented by `fit.fittedvalues`:
+
+```python
+effects = fit.get_marginal_effects(
+    at="overall",
+    which="mean",
+    effect_type="dydx",
+    dummy=True,
+)
+
+print(effects.summary())
+print(effects.summary_df())
+print(effects.margeff)
+print(effects.margeff_se)
+```
+
+`at="overall"` averages observation effects using the model's normalized
+importance weights. `at="mean"` and `at="median"` evaluate effects at
+importance-weighted column means and medians. `at="all"` returns an
+observation-by-effect matrix and does not compute standard errors.
+
+The available effect types follow the GLM marginal-effects API:
+
+| `effect_type` | Quantity |
+|---|---|
+| `dydx` | `dy/dx`, the response-scale marginal effect |
+| `eydx` | `(dy/dx) / y`, a response semi-elasticity |
+| `eyex` | `(dy/dx) * x / y`, an elasticity |
+| `dyex` | `(dy/dx) * x`, a regressor semi-elasticity |
+
+With `dummy=True`, nonconstant 0/1 columns use an exact zero-to-one change for
+`dydx` and `eydx`. Set `dummy_method="tangent"` or `dummy=False` to treat
+them as continuous. Percent-change effects (`eyex` and `dyex`) always use the
+continuous interpretation because a percentage change in a 0/1 regressor is
+not well defined.
+
+### Prediction targets
+
+One-part models accept:
+
+- `mean`: response mean `exp(X beta)`.
+- `linear_predictor`: `X beta`.
+
+Zero-inflated models accept:
+
+- `mean`: unconditional response mean `(1 - pi) * count_mean`.
+- `count_mean`: mean of the count component.
+- `inflation_probability`: structural-zero probability `pi`.
+- `zero_probability`: total probability of observing zero.
+- `positive_probability`: probability of observing a positive response.
+
+Hurdle models accept:
+
+- `mean`: unconditional response mean `(1 - pi) * positive_mean`.
+- `positive_mean`: conditional mean given a positive response.
+- `underlying_mean`: mean before zero truncation for truncated count models.
+- `linear_predictor`: positive-component linear predictor.
+- `zero_probability`: hurdle probability `pi`.
+- `positive_probability`: probability of crossing the hurdle.
+
+Only equations that can affect the requested target receive rows. For the
+unconditional two-part mean, the table reports the main and zero-process
+effects separately using the fitted parameter names. For example, a covariate
+used unchanged in both equations appears as `x` and `hurdle_x` (or
+`inflate_x`). For a continuous `dydx`, their point estimates can be added to
+obtain the combined effect. Its variance must include their covariance:
+
+```text
+Var(x + hurdle_x)
+    = Var(x) + Var(hurdle_x) + 2 Cov(x, hurdle_x)
+```
+
+Use `effects.covariance_df()` to obtain the named effect covariance. Separate
+dummy secants do not generally add to the effect of changing both equations'
+dummy columns simultaneously.
+
+Marginal-effect covariance uses the delta method with the complete fitted
+parameter covariance, including cross-equation covariance and uncertainty in
+dispersion parameters when the selected mean depends on them:
+
+```text
+Cov(marginal effects) = J Cov(params) J'
+```
+
+If parameter covariance was not computed, point effects remain available but
+standard errors and other inference fields are `None`.
 
 ## Response Support and Interpretation
 
@@ -741,7 +836,7 @@ dispersion, zero inflation, or the complete weighted observation likelihood.
 
 Use the [GLM package](../regression/generalized_linear_models/README.md) when
 you need IRLS, its broader link/family system, fixed NB-2 overdispersion,
-regularization, instrumental-variable features, or GLM marginal effects.
+regularization, or instrumental-variable features.
 
 Important differences include:
 
@@ -753,4 +848,5 @@ Important differences include:
 | Weights | Complete likelihood weights | Variance weights |
 | Zero inflation | ZIP and ZINB | Not a registered GLM family |
 | Sparse designs and observation scores | Supported | Supported |
+| Response-scale marginal effects | Supported for fitted prediction targets | Supported for fitted means |
 | Instruments | Rejected | Supported for selected workflows |

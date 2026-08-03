@@ -25,6 +25,9 @@ from kanly.distributional_models.hurdle_models import (
     NegativeBinomialPHurdle,
     PoissonHurdle,
 )
+from kanly.distributional_models.marginal_effects import (
+    DistributionalMarginalEffects,
+)
 from kanly.distributional_models.results import DistributionalModelResults
 from kanly.distributional_models.two_part import TwoPartModel
 
@@ -49,6 +52,7 @@ __all__ = [
     'GammaHurdle',
     'InverseGaussianHurdle',
     'NegativeBinomialPHurdle',
+    'DistributionalMarginalEffects',
     'DistributionalModelResults',
     'HurdleModelResults',
 ]
