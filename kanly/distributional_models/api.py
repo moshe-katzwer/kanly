@@ -14,7 +14,9 @@ import difflib
 import re
 
 import numpy as np
+from scipy.sparse import csc_matrix, isspmatrix
 
+from kanly.distributional_models.base import _as_design_matrix
 from kanly.distributional_models.continuous_models import Gamma
 from kanly.distributional_models.count_models import (
     GeneralizedPoisson,
@@ -35,6 +37,7 @@ from kanly.distributional_models.hurdle_models import (
 )
 from kanly.distributional_models.results import DistributionalModelResults
 from kanly.distributional_models.two_part import TwoPartModel
+from kanly.utils.linalg_utils import DEFAULT_DENSE_THRESHOLD_MB
 
 
 @dataclass(frozen=True)
@@ -317,7 +320,8 @@ def distributional_model(
         cov_type='SANDWICH', cov_kwds=None, positive_fit_kwargs=None,
         hurdle_fit_kwargs=None, index=None, check_constant_cols=False,
         fail_on_missing=False, cache_intermediate=True, sum_to_n=False,
-        test_formula_on_dummy=True, drop_1_for_FE=True, tol=None,
+        test_formula_on_dummy=True, drop_1_for_FE=True,
+        dense_threshold_mb=DEFAULT_DENSE_THRESHOLD_MB, tol=None,
         max_iter=None, alpha=None, l1_ratio=None, L2_penalty_matrix=None,
         regularize_to_values=None, normalize=None, penalize_scale=None,
         use_t=None, test_level=None, compute_cov=None,
@@ -352,6 +356,9 @@ def distributional_model(
         sum_to_n: Normalize formula likelihood weights to retained sample size.
         test_formula_on_dummy: Prevalidate the formula on dummy data.
         drop_1_for_FE: Drop one categorical level in formula encoding.
+        dense_threshold_mb: Dense-memory threshold in MB. Formula designs are
+            built sparse first and converted to dense when their dense
+            footprint is at or below this threshold.
         tol, max_iter, alpha, l1_ratio, L2_penalty_matrix,
             regularize_to_values, normalize, penalize_scale, use_t,
             test_level, compute_cov, store_convergence_path,
@@ -389,6 +396,7 @@ def distributional_model(
         'sum_to_n': sum_to_n,
         'test_formula_on_dummy': test_formula_on_dummy,
         'drop_1_for_FE': drop_1_for_FE,
+        'dense_threshold_mb': dense_threshold_mb,
     }
     if uses_inflation:
         builder_options['exog_infl'] = exog_infl
@@ -476,12 +484,42 @@ def DISTRIBUTIONAL_MODEL(
         )
 
     if add_constant:
-        exog = np.asarray(exog, dtype=float)
-        if exog.ndim == 1:
-            exog = exog[:, None]
+        if not isspmatrix(exog):
+            exog = np.asarray(exog, dtype=float)
+            if exog.ndim == 1:
+                exog = exog[:, None]
         if exog.ndim != 2:
             raise ValueError('exog must be one- or two-dimensional')
-        exog = np.column_stack((np.ones(exog.shape[0]), exog))
+        if isspmatrix(exog):
+            exog = _as_design_matrix(exog)
+            nobs, nvars = exog.shape
+            total_nnz = nobs + exog.nnz
+            index_dtype = (
+                np.int64
+                if max(nobs, total_nnz) > np.iinfo(np.int32).max
+                else np.int32
+            )
+            data = np.empty(total_nnz, dtype=float)
+            indices = np.empty(total_nnz, dtype=index_dtype)
+            indptr = np.empty(nvars + 2, dtype=index_dtype)
+            data[:nobs] = 1.0
+            data[nobs:] = exog.data
+            indices[:nobs] = np.arange(nobs, dtype=index_dtype)
+            indices[nobs:] = exog.indices
+            indptr[0] = 0
+            np.add(exog.indptr, nobs, out=indptr[1:])
+            exog = csc_matrix(
+                (data, indices, indptr),
+                shape=(nobs, nvars + 1),
+                copy=False,
+            )
+        else:
+            with_constant = np.empty(
+                (exog.shape[0], exog.shape[1] + 1), dtype=float
+            )
+            with_constant[:, 0] = 1.0
+            with_constant[:, 1:] = exog
+            exog = with_constant
         if exog_names is not None:
             exog_names = ['Intercept'] + list(exog_names)
         has_intercept = True

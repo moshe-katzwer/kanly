@@ -5,10 +5,17 @@ from __future__ import absolute_import, print_function
 import warnings
 
 import numpy as np
+from scipy.sparse import isspmatrix
 
-from kanly.distributional_models.base import _NonnegativeDistributionalModel
+from kanly.distributional_models.base import (
+    _NonnegativeDistributionalModel,
+    _as_design_matrix,
+    _coerce_prediction_design,
+    _format_formula_design,
+)
 from kanly.formula.data_getter import SparseDataGetter
 from kanly.formula.exceptions import MissingDataException
+from kanly.utils.linalg_utils import DEFAULT_DENSE_THRESHOLD_MB
 from kanly.utils.util import dict_2_dataframe
 
 
@@ -60,16 +67,11 @@ class TwoPartModel(_NonnegativeDistributionalModel):
         if has_default_inflation:
             exog_infl = np.ones((len(endog), 1), dtype=float)
         else:
-            exog_infl = np.asarray(exog_infl, dtype=float)
-            if exog_infl.ndim == 1:
-                exog_infl = exog_infl[:, None]
+            exog_infl = _as_design_matrix(exog_infl, name='exog_infl')
         if exog_infl.ndim != 2 or exog_infl.shape[0] != len(endog):
             raise ValueError(
                 "exog_infl must be two-dimensional with one row per outcome"
             )
-        if np.any(~np.isfinite(exog_infl)):
-            raise ValueError("exog_infl must contain only finite values")
-
         if exog_infl_names is not None:
             exog_infl_names = [str(name) for name in exog_infl_names]
             if len(exog_infl_names) != exog_infl.shape[1]:
@@ -103,6 +105,9 @@ class TwoPartModel(_NonnegativeDistributionalModel):
             exog_names=exog_names,
             weights_name=weights_name,
             **model_metadata,
+        )
+        self.is_sparse_model = bool(
+            isspmatrix(self.exog) or isspmatrix(self.exog_infl)
         )
         self.identification_issues = []
         self._validate_two_part_sample()
@@ -171,9 +176,9 @@ class TwoPartModel(_NonnegativeDistributionalModel):
                     f'{missing_rows}!'
                 )
             values = inflation.values
-            if hasattr(values, 'toarray'):
-                values = values.toarray()
-            exog_infl = np.asarray(values, dtype=float)
+            exog_infl = _coerce_prediction_design(
+                values, sparse=isspmatrix(self.exog_infl), name='exog_infl'
+            )
             names = list(inflation.column_names)
             if (self.exog_infl_names is not None
                     and names != list(self.exog_infl_names)):
@@ -190,7 +195,8 @@ class TwoPartModel(_NonnegativeDistributionalModel):
             debug: bool = False,
             check_constant_cols=False, fail_on_missing=False,
             cache_intermediate=True, sum_to_n=False,
-            test_formula_on_dummy=True, drop_1_for_FE=True, **model_kwargs):
+            test_formula_on_dummy=True, drop_1_for_FE=True,
+            dense_threshold_mb=DEFAULT_DENSE_THRESHOLD_MB, **model_kwargs):
         """Build count and inflation equations from Patsy-style formulas.
 
         Args:
@@ -237,6 +243,10 @@ class TwoPartModel(_NonnegativeDistributionalModel):
             sum_to_n=False,
             test_formula_on_dummy=test_formula_on_dummy,
             drop_1_for_FE=drop_1_for_FE,
+            # Keep the main design sparse until inflation-specific missing
+            # rows have been aligned. Applying the caller's threshold before
+            # this point could allocate a dense matrix only to copy/slice it.
+            dense_threshold_mb=0,
         )
         inflation_kwargs = {}
 
@@ -263,34 +273,61 @@ class TwoPartModel(_NonnegativeDistributionalModel):
             main_valid_rows = np.asarray(
                 constructor_kwargs['valid_obs_rows'], dtype=int
             )
-            keep_main_rows = ~np.isin(
-                main_valid_rows, list(inflation_null_rows)
+            if inflation_null_rows:
+                inflation_null_array = np.fromiter(
+                    inflation_null_rows, dtype=int,
+                    count=len(inflation_null_rows),
+                )
+                keep_main_rows = ~np.isin(
+                    main_valid_rows, inflation_null_array
+                )
+            else:
+                keep_main_rows = None
+            drops_main_rows = (
+                keep_main_rows is not None
+                and not np.all(keep_main_rows)
             )
-            final_valid_rows = main_valid_rows[keep_main_rows]
+            if not drops_main_rows:
+                # Avoid copying endog, weights, and the potentially large
+                # sparse main design when inflation drops no additional rows.
+                final_valid_rows = main_valid_rows
+            else:
+                final_valid_rows = main_valid_rows[keep_main_rows]
             if len(final_valid_rows) == 0:
                 raise ValueError(
                     "No valid observations remain after aligning exog_infl"
                 )
 
-            constructor_kwargs['endog'] = (
-                constructor_kwargs['endog'][keep_main_rows]
-            )
-            constructor_kwargs['exog'] = (
-                constructor_kwargs['exog'][keep_main_rows]
-            )
-            if constructor_kwargs['weights'] is not None:
-                constructor_kwargs['weights'] = (
-                    constructor_kwargs['weights'][keep_main_rows]
+            if drops_main_rows:
+                constructor_kwargs['endog'] = (
+                    constructor_kwargs['endog'][keep_main_rows]
                 )
+                constructor_kwargs['exog'] = (
+                    constructor_kwargs['exog'][keep_main_rows]
+                )
+                if constructor_kwargs['weights'] is not None:
+                    constructor_kwargs['weights'] = (
+                        constructor_kwargs['weights'][keep_main_rows]
+                    )
 
             # Inflation values still refer to the original selected-row space.
-            inflation_obj.slice_null_rows(final_valid_rows)
+            inflation_nobs = inflation_obj.values.shape[0]
+            is_identity_rows = (
+                len(final_valid_rows) == inflation_nobs
+                and (
+                    inflation_nobs == 0
+                    or (
+                        final_valid_rows[0] == 0
+                        and final_valid_rows[-1] == inflation_nobs - 1
+                    )
+                )
+            )
+            if not is_identity_rows:
+                inflation_obj.slice_null_rows(final_valid_rows)
             exog_infl_values = inflation_obj.values
-            if hasattr(exog_infl_values, 'toarray'):
-                exog_infl_values = exog_infl_values.toarray()
-            exog_infl_values = np.asarray(exog_infl_values, dtype=float)
-            if exog_infl_values.ndim == 1:
-                exog_infl_values = exog_infl_values[:, None]
+            exog_infl_values = _format_formula_design(
+                exog_infl_values, dense_threshold_mb
+            )
 
             null_rows_info = constructor_kwargs['null_rows_info_dict'].copy()
             null_rows_info['EXOG_INFL'] = inflation_null_rows
@@ -305,6 +342,10 @@ class TwoPartModel(_NonnegativeDistributionalModel):
                     inflation_obj.var_2_col_indices
                 ),
             }
+
+        constructor_kwargs['exog'] = _format_formula_design(
+            constructor_kwargs['exog'], dense_threshold_mb
+        )
 
         if sum_to_n and constructor_kwargs['weights'] is not None:
             weights = constructor_kwargs['weights']

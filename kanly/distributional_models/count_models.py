@@ -16,6 +16,9 @@ from scipy.special import digamma, expit, gammaln
 from kanly.distributional_models.base import (
     DistributionalModel,
     _NonnegativeDistributionalModel,
+    _as_design_matrix,
+    _build_score_obs,
+    _is_constant_column,
 )
 from kanly.distributional_models.two_part import TwoPartModel
 
@@ -71,7 +74,7 @@ class Poisson(_NonnegativeDistributionalModel):
     def score_obs(self, params, *args, **kwargs):
         """Return unweighted Poisson scores with shape ``(nobs, n_params)``."""
         residual = _poisson_score_factor(self.endog, self.exog @ params)
-        return self.exog * residual[:, None]
+        return _build_score_obs(((self.exog, residual),))
 
     def loglike_obs(self, params, *args, **kwargs):
         """Return one unweighted Poisson log-likelihood value per row."""
@@ -86,7 +89,7 @@ class _ZeroInflatedModel(TwoPartModel):
         if self.exog_infl_names is not None:
             return [f'inflate_{name}' for name in self.exog_infl_names]
         if (self.k_inflate == 1
-                and np.allclose(self.exog_infl[:, 0], 1.0)):
+                and _is_constant_column(self.exog_infl, value=1.0)):
             return ['inflate_const']
         return [f'inflate_x{i}' for i in range(self.k_inflate)]
 
@@ -175,16 +178,12 @@ class _ZeroInflatedModel(TwoPartModel):
         params = np.asarray(params, dtype=float).reshape(-1)
         if len(params) != len(self.param_names):
             raise ValueError('params has the wrong length')
-        exog = self.exog if exog is None else np.asarray(exog, dtype=float)
+        exog = self.exog if exog is None else _as_design_matrix(exog)
         exog_infl = (
             self.exog_infl
             if exog_infl is None
-            else np.asarray(exog_infl, dtype=float)
+            else _as_design_matrix(exog_infl, name='exog_infl')
         )
-        if exog.ndim == 1:
-            exog = exog[None, :]
-        if exog_infl.ndim == 1:
-            exog_infl = exog_infl[None, :]
         if exog.ndim != 2 or exog.shape[1] != self.exog.shape[1]:
             raise ValueError('exog has the wrong number of columns')
         if (exog_infl.ndim != 2
@@ -341,9 +340,9 @@ class ZeroInflatedPoisson(_ZeroInflatedModel):
     def score_obs(self, params, *args, **kwargs):
         """Return unweighted zero-inflated Poisson observation scores."""
         d_count_eta, d_inflation_eta = self._score_factors(params)
-        return np.column_stack((
-            self.exog * d_count_eta[:, None],
-            self.exog_infl * d_inflation_eta[:, None],
+        return _build_score_obs((
+            (self.exog, d_count_eta),
+            (self.exog_infl, d_inflation_eta),
         ))
 
     def loglike_obs(self, params, *args, **kwargs):
@@ -553,10 +552,10 @@ class ZeroInflatedNegativeBinomial(_ZeroInflatedModel):
         d_count_eta, d_inflation_eta, d_log_alpha = (
             self._score_factors(params)
         )
-        return np.column_stack((
-            self.exog * d_count_eta[:, None],
-            self.exog_infl * d_inflation_eta[:, None],
-            d_log_alpha,
+        return _build_score_obs((
+            (self.exog, d_count_eta),
+            (self.exog_infl, d_inflation_eta),
+            (d_log_alpha, None),
         ))
 
     def loglike_obs(self, params, *args, **kwargs):
@@ -736,7 +735,10 @@ class GeneralizedPoisson(_NonnegativeDistributionalModel):
     def score_obs(self, params, *args, **kwargs):
         """Return unweighted generalized-Poisson observation scores."""
         d_eta, d_alpha = self._score_factors(params)
-        return np.column_stack((self.exog * d_eta[:, None], d_alpha))
+        return _build_score_obs((
+            (self.exog, d_eta),
+            (d_alpha, None),
+        ))
 
     def loglike_obs(self, params, *args, **kwargs):
         """Return unweighted generalized-Poisson likelihood contributions."""
@@ -831,7 +833,10 @@ class NegativeBinomial1(_NonnegativeDistributionalModel):
     def score_obs(self, params, *args, **kwargs):
         """Return unweighted NB-1 scores for every observation."""
         d_eta, d_log_alpha = self._score_factors(params)
-        return np.column_stack((self.exog * d_eta[:, None], d_log_alpha))
+        return _build_score_obs((
+            (self.exog, d_eta),
+            (d_log_alpha, None),
+        ))
 
     def loglike_obs(self, params, *args, **kwargs):
         """Return one unweighted NB-1 log-likelihood value per observation."""
@@ -922,7 +927,10 @@ class NegativeBinomial2(_NonnegativeDistributionalModel):
     def score_obs(self, params, *args, **kwargs):
         """Return unweighted NB-2 scores for every observation."""
         d_eta, d_log_alpha = self._score_factors(params)
-        return np.column_stack((self.exog * d_eta[:, None], d_log_alpha))
+        return _build_score_obs((
+            (self.exog, d_eta),
+            (d_log_alpha, None),
+        ))
 
     def loglike_obs(self, params, *args, **kwargs):
         """Return one unweighted NB-2 log-likelihood value per observation."""

@@ -4,6 +4,7 @@ from __future__ import absolute_import, print_function
 
 import numpy as np
 import pandas as pd
+from scipy.sparse import isspmatrix
 
 from kanly.regression.regression_results_base import RegressionResultsBase
 
@@ -266,11 +267,25 @@ public result object themselves.
     @staticmethod
     def _first_column_is_constant(exog):
         """Return whether an array starts with a constant column."""
+        if exog.ndim != 2 or exog.shape[1] == 0 or exog.shape[0] == 0:
+            return False
+        if isspmatrix(exog):
+            exog = exog.tocsc(copy=False)
+            start, stop = exog.indptr[:2]
+            rows = exog.indices[start:stop]
+            values = exog.data[start:stop]
+            if not len(values):
+                return True
+            minimum = float(np.min(values))
+            maximum = float(np.max(values))
+            if len(rows) < exog.shape[0]:
+                minimum = min(minimum, 0.0)
+                maximum = max(maximum, 0.0)
+            return bool(np.isclose(
+                minimum, maximum, rtol=1e-10, atol=1e-12
+            ))
         exog = np.asarray(exog)
-        return bool(
-            exog.ndim == 2 and exog.shape[1]
-            and np.allclose(exog[:, 0], exog[0, 0])
-        )
+        return bool(np.allclose(exog[:, 0], exog[0, 0]))
 
     @classmethod
     def _count_intercepts(cls, model):

@@ -214,6 +214,28 @@ Formula construction records column names and row-alignment metadata on the
 model. For example, `fit.param_names` uses formula names rather than generated
 names such as `x0` and `x1`.
 
+Formula designs are built as CSC sparse matrices first. Small designs are
+converted to NumPy arrays when their dense footprint is no larger than
+`dense_threshold_mb` (1024 MB by default), matching the crossover convention
+used by the linear-model modules. Set the threshold to `0` to keep every
+nonempty formula design sparse:
+
+```python
+model = NegativeBinomial2.build_model_from_formula(
+    "y ~ x + C(group)",
+    data=df,
+    dense_threshold_mb=0,
+)
+```
+
+The array API preserves the representation supplied by the caller: dense
+`exog` remains dense and a SciPy sparse design is normalized to CSC. In a
+two-part model, the main and zero-process designs may use different
+representations. `score_obs` returns a CSC sparse matrix when any underlying
+component design is sparse and a NumPy array when all component designs are
+dense. Responses, weights, parameters, likelihood values, aggregate scores,
+and predictions remain dense.
+
 Every concrete direct-likelihood model supplies automatic starting values, so
 `model.fit()` does not require `start_params`. Inspect them with
 `model.get_start_params()` or `model.default_start_params`. Passing an explicit
@@ -298,6 +320,9 @@ such as `inflate_Intercept`, `inflate_customer_age`, and
 
 A complete parameter-recovery simulation is available in
 [`example_zero_inflated_poisson.py`](../../examples/distributional_models/example_zero_inflated_poisson.py).
+The GP-2 simulation in
+[`example_generalized_poisson.py`](../../examples/distributional_models/example_generalized_poisson.py)
+also demonstrates sparse formula construction and a sparse observation score.
 
 ## Hurdle Models
 
@@ -444,6 +469,10 @@ Complete parameter-recovery examples are available for both
 [`PoissonHurdle`](../../examples/distributional_models/example_poisson_hurdle.py)
 and
 [`GammaHurdle`](../../examples/distributional_models/example_gamma_hurdle.py),
+as well as
+[`GaussianHurdle`](../../examples/distributional_models/example_gaussian_hurdle.py)
+and
+[`LognormalHurdle`](../../examples/distributional_models/example_lognormal_hurdle.py),
 with an NB2 example in
 [`example_negative_binomial_p_hurdle.py`](../../examples/distributional_models/example_negative_binomial_p_hurdle.py).
 
@@ -711,9 +740,8 @@ Use this package when you need joint maximum-likelihood estimation of
 dispersion, zero inflation, or the complete weighted observation likelihood.
 
 Use the [GLM package](../regression/generalized_linear_models/README.md) when
-you need IRLS, its broader link/family system, sparse high-dimensional design
-support, fixed NB-2 overdispersion, regularization, instrumental-variable
-features, or GLM marginal effects.
+you need IRLS, its broader link/family system, fixed NB-2 overdispersion,
+regularization, instrumental-variable features, or GLM marginal effects.
 
 Important differences include:
 
@@ -724,4 +752,5 @@ Important differences include:
 | Gamma dispersion | Estimated jointly | Pearson scale estimate |
 | Weights | Complete likelihood weights | Variance weights |
 | Zero inflation | ZIP and ZINB | Not a registered GLM family |
+| Sparse designs and observation scores | Supported | Supported |
 | Instruments | Rejected | Supported for selected workflows |

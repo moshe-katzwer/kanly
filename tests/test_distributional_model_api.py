@@ -234,7 +234,8 @@ class TestDistributionalModelAPI(unittest.TestCase):
                 'ZeroInflatedNegativeBinomial', 'NegativeBinomial1',
                 'NegativeBinomial2', 'GeneralizedPoisson',
                 'PoissonHurdle', 'NegativeBinomialPHurdle',
-                'GammaHurdle', 'Gamma',
+                'GammaHurdle', 'GaussianHurdle', 'LognormalHurdle',
+                'InverseGaussianHurdle', 'Gamma',
             },
         )
 

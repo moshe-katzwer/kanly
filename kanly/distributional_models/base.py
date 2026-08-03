@@ -8,6 +8,7 @@ import time
 import warnings
 
 import numpy as np
+from scipy.sparse import csc_matrix, isspmatrix
 
 from kanly.optimize.bfgs_bounded_quasi_newton import bfgs_pqn
 from kanly.bootstrap.bootstrap import (
@@ -21,11 +22,294 @@ from kanly.formula.keys import (
     VALID_OBS_ROWS_KEY, WEIGHTS_KEY,
 )
 from kanly.distributional_models.results import DistributionalModelResults
+from kanly.utils.linalg_utils import (
+    DEFAULT_DENSE_THRESHOLD_MB,
+    DenseThreshold,
+)
 from kanly.utils.util import dict_2_dataframe
 
 
 _MAX_INFORMATION_CONDITION = 1e12
 _SCALED_SCORE_TOLERANCE = 1e-5
+
+
+def _as_design_matrix(values, name='exog'):
+    """Return a finite two-dimensional dense array or CSC sparse matrix."""
+    if isspmatrix(values):
+        values = values.astype(float, copy=False).tocsc(copy=False)
+        if not values.has_canonical_format:
+            values = values.copy()
+            values.sum_duplicates()
+            values.sort_indices()
+        if values.ndim != 2:
+            raise ValueError(f'{name} must be two-dimensional')
+        if np.any(~np.isfinite(values.data)):
+            raise ValueError(f'{name} must contain only finite values')
+        return values
+
+    values = np.asarray(values, dtype=float)
+    if values.ndim == 1:
+        values = values[:, None]
+    if values.ndim != 2:
+        raise ValueError(f'{name} must be two-dimensional')
+    if np.any(~np.isfinite(values)):
+        raise ValueError(f'{name} must contain only finite values')
+    return values
+
+
+def _format_formula_design(values, dense_threshold_mb):
+    """Keep a formula design sparse unless its dense footprint is small."""
+    if isspmatrix(values):
+        values = values.astype(float, copy=False).tocsc(copy=False)
+        if not values.has_canonical_format:
+            values = values.copy()
+            values.sum_duplicates()
+            values.sort_indices()
+    else:
+        values = np.asarray(values, dtype=float)
+        if values.ndim == 1:
+            values = values[:, None]
+        if values.ndim != 2:
+            raise ValueError('Formula design must be two-dimensional')
+        if DenseThreshold.is_below_threshold(
+                values, dense_threshold_mb=dense_threshold_mb):
+            return values
+        values = csc_matrix(values)
+    if DenseThreshold.is_below_threshold(
+            values, dense_threshold_mb=dense_threshold_mb):
+        return values.toarray()
+    return values
+
+
+def _coerce_prediction_design(values, sparse, name='exog'):
+    """Validate a prediction design and match the fitted storage type."""
+    values = _as_design_matrix(values, name=name)
+    if sparse and not isspmatrix(values):
+        return csc_matrix(values)
+    if not sparse and isspmatrix(values):
+        return values.toarray()
+    return values
+
+
+def _build_score_obs(blocks, nobs=None, force_sparse=False):
+    """Build an observation-score matrix directly in parameter-column order.
+
+    Each block is ``(values, factors)`` or
+    ``(values, factors, output_rows)``. ``values`` is a design/score matrix
+    (a one-dimensional value is one parameter column), ``factors`` is either
+    ``None`` or a dense row multiplier, and ``output_rows`` maps a subset
+    block back to the returned matrix's observation rows.
+
+    Sparse output is assembled one column at a time into a single CSC
+    allocation. This avoids materializing row-scaled sparse blocks and then
+    copying them again during horizontal stacking.
+    """
+    prepared = []
+    output_nobs = None if nobs is None else int(nobs)
+    return_sparse = bool(force_sparse)
+    total_columns = 0
+
+    for block in blocks:
+        if len(block) not in (2, 3):
+            raise ValueError('Score blocks must have two or three entries')
+        values, factors = block[:2]
+        output_rows = None if len(block) == 2 else block[2]
+
+        if isspmatrix(values):
+            values = values.astype(float, copy=False).tocsc(copy=False)
+            return_sparse = True
+        else:
+            values = np.asarray(values, dtype=float)
+            if values.ndim == 1:
+                values = values[:, None]
+            if values.ndim != 2:
+                raise ValueError('Score block values must be two-dimensional')
+
+        local_nobs = values.shape[0]
+        if factors is not None:
+            factors = np.asarray(factors, dtype=float).reshape(-1)
+            if len(factors) != local_nobs:
+                raise ValueError('Score factors must align with block rows')
+
+        if output_rows is not None:
+            output_rows = np.asarray(output_rows, dtype=np.int64).reshape(-1)
+            if len(output_rows) != local_nobs:
+                raise ValueError('Score row mapping must align with block rows')
+            if output_nobs is None:
+                output_nobs = (
+                    int(output_rows.max()) + 1 if len(output_rows) else 0
+                )
+            if (np.any(output_rows < 0)
+                    or np.any(output_rows >= output_nobs)):
+                raise ValueError('Score row mapping is outside output rows')
+        elif output_nobs is None:
+            output_nobs = local_nobs
+        elif local_nobs != output_nobs:
+            raise ValueError('Score blocks must have aligned observation rows')
+
+        prepared.append((values, factors, output_rows))
+        total_columns += values.shape[1]
+
+    if output_nobs is None:
+        raise ValueError('At least one score block is required')
+
+    if not return_sparse:
+        result = np.zeros((output_nobs, total_columns), dtype=float)
+        output_column = 0
+        for values, factors, output_rows in prepared:
+            target_rows = slice(None) if output_rows is None else output_rows
+            for column in range(values.shape[1]):
+                column_values = values[:, column]
+                if factors is not None:
+                    column_values = column_values * factors
+                result[target_rows, output_column] = column_values
+                output_column += 1
+        return result
+
+    def get_column(values, factors, output_rows, column):
+        """Return nonzero output rows and data for one score column."""
+        if isspmatrix(values):
+            start, stop = values.indptr[column:column + 2]
+            local_rows = values.indices[start:stop]
+            column_values = values.data[start:stop]
+            if factors is not None:
+                column_values = column_values * factors[local_rows]
+            nonzero = column_values != 0.0
+            local_rows = local_rows[nonzero]
+            column_values = column_values[nonzero]
+        else:
+            column_values = values[:, column]
+            if factors is not None:
+                column_values = column_values * factors
+            local_rows = np.flatnonzero(column_values)
+            column_values = column_values[local_rows]
+        if output_rows is not None:
+            local_rows = output_rows[local_rows]
+        return local_rows, column_values
+
+    def count_column(values, factors, column):
+        """Count stored nonzeros without allocating row/data subsets."""
+        if isspmatrix(values):
+            start, stop = values.indptr[column:column + 2]
+            column_values = values.data[start:stop]
+            if factors is not None:
+                rows = values.indices[start:stop]
+                column_values = column_values * factors[rows]
+            return np.count_nonzero(column_values)
+        column_values = values[:, column]
+        if factors is not None:
+            column_values = column_values * factors
+        return np.count_nonzero(column_values)
+
+    column_nnz = np.empty(total_columns, dtype=np.int64)
+    output_column = 0
+    for values, factors, output_rows in prepared:
+        for column in range(values.shape[1]):
+            column_nnz[output_column] = count_column(
+                values, factors, column
+            )
+            output_column += 1
+
+    indptr64 = np.empty(total_columns + 1, dtype=np.int64)
+    indptr64[0] = 0
+    np.cumsum(column_nnz, out=indptr64[1:])
+    total_nnz = int(indptr64[-1])
+    index_dtype = (
+        np.int64
+        if max(output_nobs, total_nnz) > np.iinfo(np.int32).max
+        else np.int32
+    )
+    indices = np.empty(total_nnz, dtype=index_dtype)
+    data = np.empty(total_nnz, dtype=float)
+
+    output_column = 0
+    for values, factors, output_rows in prepared:
+        for column in range(values.shape[1]):
+            rows, column_values = get_column(
+                values, factors, output_rows, column
+            )
+            start = int(indptr64[output_column])
+            stop = int(indptr64[output_column + 1])
+            indices[start:stop] = rows
+            data[start:stop] = column_values
+            output_column += 1
+
+    return csc_matrix(
+        (data, indices, indptr64.astype(index_dtype, copy=False)),
+        shape=(output_nobs, total_columns),
+    )
+
+
+def _weight_score_obs(score_obs, weights):
+    """Weight a newly built score matrix in place to avoid a full copy."""
+    if weights is None:
+        return score_obs
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    if len(weights) != score_obs.shape[0]:
+        raise ValueError('Score weights must align with observation rows')
+    if isspmatrix(score_obs):
+        score_obs = score_obs.tocsc(copy=False)
+        for column in range(score_obs.shape[1]):
+            start, stop = score_obs.indptr[column:column + 2]
+            rows = score_obs.indices[start:stop]
+            score_obs.data[start:stop] *= weights[rows]
+        score_obs.eliminate_zeros()
+        return score_obs
+    np.multiply(score_obs, weights[:, None], out=score_obs)
+    return score_obs
+
+
+def _sum_score_obs(score_obs, weights=None):
+    """Return a flat dense score aggregate without a weighted-matrix copy."""
+    if weights is None:
+        values = score_obs.sum(axis=0)
+    else:
+        weights = np.asarray(weights, dtype=float).reshape(-1)
+        values = score_obs.T @ weights
+    return np.asarray(values).reshape(-1)
+
+
+def _score_meat(score_obs):
+    """Return the dense score cross-product used by covariance estimators."""
+    meat = score_obs.T @ score_obs
+    if isspmatrix(meat):
+        meat = meat.toarray()
+    return np.asarray(meat, dtype=float)
+
+
+def _is_constant_column(exog, column=0, value=None):
+    """Return whether a dense or sparse design column is constant."""
+    if exog.ndim != 2 or exog.shape[1] <= column or exog.shape[0] == 0:
+        return False
+    if isspmatrix(exog):
+        exog = exog.tocsc(copy=False)
+        start, stop = exog.indptr[column:column + 2]
+        rows = exog.indices[start:stop]
+        data = exog.data[start:stop]
+        first = (
+            float(data[0])
+            if len(rows) and rows[0] == 0
+            else 0.0
+        )
+        if len(data):
+            minimum = float(np.min(data))
+            maximum = float(np.max(data))
+            if len(rows) < exog.shape[0]:
+                minimum = min(minimum, 0.0)
+                maximum = max(maximum, 0.0)
+        else:
+            minimum = maximum = 0.0
+    else:
+        values = np.asarray(exog)[:, column]
+        minimum = float(np.min(values))
+        maximum = float(np.max(values))
+        first = float(values[0])
+    is_constant = bool(np.isclose(
+        minimum, maximum, rtol=1e-10, atol=1e-12
+    ))
+    if value is not None:
+        is_constant = is_constant and bool(np.isclose(first, value))
+    return is_constant
 
 
 class DistributionalModel(ABC):
@@ -80,20 +364,13 @@ class DistributionalModel(ABC):
             raise ValueError("endog must be one-dimensional")
         self._validate_endog(endog)
 
-        exog = np.asarray(exog, dtype=float)
-        if exog.ndim == 1:
-            exog = exog[:, None]
-        if exog.ndim != 2:
-            raise ValueError("exog must be two-dimensional")
+        exog = _as_design_matrix(exog)
         if exog.shape[0] != len(endog):
             raise ValueError("endog and exog must contain the same number of rows")
         if len(endog) == 0:
             raise ValueError("endog and exog must contain at least one row")
         if exog.shape[1] == 0:
             raise ValueError("exog must contain at least one column")
-        if np.any(~np.isfinite(exog)):
-            raise ValueError("exog must contain only finite values")
-
         if weights is not None:
             weights = np.asarray(weights, dtype=float).reshape(-1)
             if len(weights) != len(endog):
@@ -110,6 +387,7 @@ class DistributionalModel(ABC):
 
         self.endog = endog
         self.exog = exog
+        self.is_sparse_model = isspmatrix(self.exog)
         self.weights = weights
         self.is_weighted = self.weights is not None
         self.nobs = len(self.endog)
@@ -164,7 +442,8 @@ class DistributionalModel(ABC):
             cls, formula, data, index=None, debug: bool = False,
             check_constant_cols=False, fail_on_missing=False,
             cache_intermediate=True, sum_to_n=False,
-            test_formula_on_dummy=True, drop_1_for_FE=True):
+            test_formula_on_dummy=True, drop_1_for_FE=True,
+            dense_threshold_mb=DEFAULT_DENSE_THRESHOLD_MB):
         """Build aligned formula arrays and return constructor keywords.
 
         The ``$`` formula extension supplies optional likelihood weights.
@@ -193,10 +472,8 @@ class DistributionalModel(ABC):
         exog = exog_obj.values
         if hasattr(endog, 'toarray'):
             endog = endog.toarray()
-        if hasattr(exog, 'toarray'):
-            exog = exog.toarray()
         endog = np.asarray(endog)
-        exog = np.asarray(exog)
+        exog = _format_formula_design(exog, dense_threshold_mb)
         if endog.ndim != 2 or endog.shape[1] != 1:
             raise ValueError(
                 "Distributional models require exactly one outcome column"
@@ -239,7 +516,8 @@ class DistributionalModel(ABC):
             cls, formula, data, index=None, debug: bool = False,
             check_constant_cols=False, fail_on_missing=False,
             cache_intermediate=True, sum_to_n=False,
-            test_formula_on_dummy=True, drop_1_for_FE=True, **model_kwargs):
+            test_formula_on_dummy=True, drop_1_for_FE=True,
+            dense_threshold_mb=DEFAULT_DENSE_THRESHOLD_MB, **model_kwargs):
         """Build an unfitted model with constructor-owned formula metadata.
 
         Set ``debug=True`` to show formula-parser output followed by a compact
@@ -258,6 +536,7 @@ class DistributionalModel(ABC):
             sum_to_n=False,
             test_formula_on_dummy=test_formula_on_dummy,
             drop_1_for_FE=drop_1_for_FE,
+            dense_threshold_mb=dense_threshold_mb,
         )
         if sum_to_n and constructor_kwargs['weights'] is not None:
             weights = constructor_kwargs['weights']
@@ -397,21 +676,39 @@ class DistributionalModel(ABC):
     @staticmethod
     def _constant_predictor_start(exog, linear_predictor):
         """Represent a constant linear predictor when a constant exists."""
-        exog = np.asarray(exog, dtype=float)
+        exog = _as_design_matrix(exog)
         params = np.zeros(exog.shape[1], dtype=float)
         if exog.shape[1] == 0:
             return params
 
-        is_constant = np.all(
-            np.isclose(exog, exog[0:1, :], rtol=1e-10, atol=1e-12),
-            axis=0,
-        )
+        if isspmatrix(exog):
+            # A usable sparse constant must store the same nonzero value in
+            # every row. Scan CSC columns and stop at the first such column;
+            # do not compute dense min/max vectors for the whole design.
+            for column in range(exog.shape[1]):
+                start, stop = exog.indptr[column:column + 2]
+                if stop - start != exog.shape[0]:
+                    continue
+                values = exog.data[start:stop]
+                first = float(values[0])
+                if (abs(first) > np.finfo(float).eps
+                        and np.allclose(
+                            values, first, rtol=1e-10, atol=1e-12
+                        )):
+                    params[column] = linear_predictor / first
+                    break
+            return params
+
+        minimum = np.min(exog, axis=0)
+        maximum = np.max(exog, axis=0)
+        first_row = exog[0]
         usable = np.flatnonzero(
-            is_constant & (np.abs(exog[0, :]) > np.finfo(float).eps)
+            np.isclose(minimum, maximum, rtol=1e-10, atol=1e-12)
+            & (np.abs(first_row) > np.finfo(float).eps)
         )
         if len(usable):
             column = int(usable[0])
-            params[column] = linear_predictor / exog[0, column]
+            params[column] = linear_predictor / first_row[column]
         return params
 
     def _mean_regression_start(self, mean=None, exog=None):
@@ -457,9 +754,9 @@ class DistributionalModel(ABC):
             data_frame, fail_on_missing=True, debug=debug
         )[EXOG_KEY]
         values = design.values
-        if hasattr(values, 'toarray'):
-            values = values.toarray()
-        values = np.asarray(values, dtype=float)
+        values = _coerce_prediction_design(
+            values, sparse=isspmatrix(self.exog)
+        )
         names = list(design.column_names)
         if self.exog_names is not None and names != list(self.exog_names):
             raise ValueError(
@@ -492,9 +789,10 @@ class DistributionalModel(ABC):
                 data, index=index, debug=debug
             )
         params = np.asarray(params, dtype=float).reshape(-1)
-        exog = self.exog if exog is None else np.asarray(exog, dtype=float)
-        if exog.ndim == 1:
-            exog = exog[None, :]
+        exog = (
+            self.exog if exog is None
+            else _as_design_matrix(exog)
+        )
         if exog.ndim != 2 or exog.shape[1] != self.exog.shape[1]:
             raise ValueError('exog has the wrong number of columns')
         if len(params) != len(self.param_names):
@@ -553,14 +851,47 @@ class DistributionalModel(ABC):
         f0 = self.loglike_obs(params, *args, **kwargs)
         k = len(params)
         n = len(f0)
-        g = np.zeros((n, k))
+        if not self.is_sparse_model:
+            g = np.zeros((n, k))
+            for i in range(k):
+                step = dx * max(1.0, abs(params[i]))
+                paramsi = params.copy()
+                paramsi[i] += step
+                fi = self.loglike_obs(paramsi, *args, **kwargs)
+                g[:, i] = (fi - f0) / step
+            return g
+
+        # Numerical scores can be dense even when X is sparse. Use two passes
+        # so the CSC result is allocated exactly once instead of first
+        # materializing an nobs-by-parameters dense Jacobian.
+        column_nnz = np.empty(k, dtype=np.int64)
         for i in range(k):
             step = dx * max(1.0, abs(params[i]))
             paramsi = params.copy()
             paramsi[i] += step
-            fi = self.loglike_obs(paramsi, *args, **kwargs)
-            g[:, i] = (fi - f0) / step
-        return g
+            values = (
+                self.loglike_obs(paramsi, *args, **kwargs) - f0
+            ) / step
+            column_nnz[i] = np.count_nonzero(values)
+
+        indptr = np.empty(k + 1, dtype=np.int64)
+        indptr[0] = 0
+        np.cumsum(column_nnz, out=indptr[1:])
+        total_nnz = int(indptr[-1])
+        indices = np.empty(total_nnz, dtype=np.int64)
+        data = np.empty(total_nnz, dtype=float)
+        for i in range(k):
+            step = dx * max(1.0, abs(params[i]))
+            paramsi = params.copy()
+            paramsi[i] += step
+            values = (
+                self.loglike_obs(paramsi, *args, **kwargs) - f0
+            ) / step
+            rows = np.flatnonzero(values)
+            start, stop = int(indptr[i]), int(indptr[i + 1])
+            indices[start:stop] = rows
+            data[start:stop] = values[rows]
+        return csc_matrix((data, indices, indptr), shape=(n, k))
 
     def score(self, params, dx=None, *args, **kwargs):
         """Approximate the gradient of the aggregated log-likelihood."""
@@ -623,9 +954,7 @@ class DistributionalModel(ABC):
 
         def gradient(params):
             values = self.score_obs(params)
-            if weights is not None:
-                values = values * weights[:, None]
-            return values.sum(axis=0)
+            return _sum_score_obs(values, weights=weights)
 
         return bfgs_pqn(
             objective, start_params, maximize=True, debug=debug,
@@ -717,9 +1046,9 @@ class DistributionalModel(ABC):
                     combined_weights, self.loglike_obs(draw)
                 ))
                 draw_score_obs = self.score_obs(draw)
-                draw_score = (
-                    draw_score_obs * combined_weights[:, None]
-                ).sum(axis=0)
+                draw_score = _sum_score_obs(
+                    draw_score_obs, weights=combined_weights
+                )
                 draw_normalized_score = (
                     float(np.max(np.abs(draw_score)))
                     / max(float(np.sum(combined_weights)), 1.0)
@@ -1014,11 +1343,8 @@ class DistributionalModel(ABC):
 
             if bread is not None and cov_type == 'SANDWICH':
                 score_obs = self.score_obs(params)
-                if self.is_weighted:
-                    score_obs = (
-                        score_obs * np.asarray(self.weights)[:, None]
-                    )
-                meat = score_obs.T @ score_obs
+                score_obs = _weight_score_obs(score_obs, self.weights)
+                meat = _score_meat(score_obs)
                 cov_params = bread @ meat @ bread.T
                 cov_params = (cov_params + cov_params.T) / 2.0
             elif bread is not None:

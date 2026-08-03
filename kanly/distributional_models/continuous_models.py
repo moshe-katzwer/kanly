@@ -5,7 +5,10 @@ from __future__ import absolute_import, print_function
 import numpy as np
 from scipy.special import digamma, gammaln
 
-from kanly.distributional_models.base import DistributionalModel
+from kanly.distributional_models.base import (
+    DistributionalModel,
+    _build_score_obs,
+)
 
 
 class Gamma(DistributionalModel):
@@ -124,7 +127,10 @@ class Gamma(DistributionalModel):
     def score_obs(self, params, *args, **kwargs):
         """Return unweighted Gamma scores for every observation."""
         d_eta, d_log_alpha = self._score_factors(params)
-        return np.column_stack((self.exog * d_eta[:, None], d_log_alpha))
+        return _build_score_obs((
+            (self.exog, d_eta),
+            (d_log_alpha, None),
+        ))
 
     def loglike_obs(self, params, *args, **kwargs):
         """Return one unweighted Gamma log-density value per observation."""

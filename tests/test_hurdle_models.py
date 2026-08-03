@@ -467,7 +467,7 @@ class TestHurdleModels(unittest.TestCase):
         debug_text = debug_output.getvalue()
         self.assertIn('HURDLE MODEL FIT', debug_text)
         self.assertIn('COHERENT HURDLE BAYESIAN BOOTSTRAP', debug_text)
-        self.assertIn('Per-draw GLM output is suppressed', debug_text)
+        self.assertIn('Per-draw component output is suppressed', debug_text)
         self.assertIn('Final hurdle-fit diagnostics:', debug_text)
         self.assertTrue(bootstrap.inference_valid)
         self.assertEqual(bootstrap.bootstrapped_params.shape, (4, 4))

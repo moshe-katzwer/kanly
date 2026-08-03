@@ -22,6 +22,7 @@ import time
 import warnings
 
 import numpy as np
+from scipy.sparse import csc_matrix, isspmatrix
 from scipy.special import digamma, expit, gammaln
 
 from kanly.bootstrap.bootstrap import (
@@ -32,7 +33,15 @@ from kanly.bootstrap.bootstrap import (
     get_bootstrap_weights2,
 )
 from kanly.distributional_models.results import DistributionalModelResults
-from kanly.distributional_models.base import _NonnegativeDistributionalModel
+from kanly.distributional_models.base import (
+    _NonnegativeDistributionalModel,
+    _as_design_matrix,
+    _build_score_obs,
+    _is_constant_column,
+    _score_meat,
+    _sum_score_obs,
+    _weight_score_obs,
+)
 from kanly.distributional_models.two_part import TwoPartModel
 from kanly.regression.generalized_linear_models.families import (
     Bernoulli,
@@ -224,23 +233,26 @@ class _ZeroTruncatedNegativeBinomialP(_NonnegativeDistributionalModel):
     def score_obs(self, params, *args, **kwargs):
         """Return unweighted scores for ``beta`` and ``log_alpha``."""
         del args, kwargs
+        return _build_score_obs(self._score_blocks(params))
+
+    def _score_blocks(self, params):
+        """Return factorized blocks used to build score columns directly."""
         _, d_eta, d_log_alpha = self._distribution_terms(params)
-        return np.column_stack((
-            self.exog * d_eta[:, None], d_log_alpha
-        ))
+        return (
+            (self.exog, d_eta),
+            (d_log_alpha, None),
+        )
 
     def score(self, params, *args, **kwargs):
         """Return the importance-weighted analytical aggregate score."""
         del args, kwargs
         values = self.score_obs(params)
-        if self.is_weighted:
-            values *= self.weights[:, None]
-        return values.sum(axis=0)
+        return _sum_score_obs(values, weights=self.weights)
 
     def log_zero_probability(self, params, exog=None):
         """Return the underlying NB-P log probability of a zero count."""
         params = np.asarray(params, dtype=float).reshape(-1)
-        exog = self.exog if exog is None else np.asarray(exog, dtype=float)
+        exog = self.exog if exog is None else _as_design_matrix(exog)
         eta = exog @ params[:-1]
         log_alpha = float(params[-1])
         with np.errstate(over='ignore', under='ignore', invalid='ignore'):
@@ -294,18 +306,63 @@ class HurdleModel(TwoPartModel):
                 'positive outcome'
             )
         if self.is_weighted:
-            if self.weights[self.is_zero].sum() <= 0.0:
+            if np.dot(self.weights, self.is_zero) <= 0.0:
                 raise ValueError(
                     'Zero outcomes must have positive total weight'
                 )
-            if self.weights[self.is_positive].sum() <= 0.0:
+            if np.dot(self.weights, self.is_positive) <= 0.0:
                 raise ValueError(
                     'Positive outcomes must have positive total weight'
                 )
 
+        # Positive-row arrays are sliced lazily and cached. Component models
+        # receive these exact objects, so repeated likelihood evaluations,
+        # bootstrap refits, GLM fits, and LM fits do not reslice the parent
+        # design. GLM responses remain dense as required by the native GLM
+        # internals; the OLS subclass separately caches its sparse response.
+        self._positive_row_indices = np.flatnonzero(self.is_positive)
+        self.__positive_endog = None
+        self.__positive_exog = None
+        self.__positive_weights = None
+        self._zero_indicator = self.is_zero.astype(float)
         self._positive_scale = None
         self.positive_model_fit = None
         self.hurdle_model_fit = None
+
+    @property
+    def _positive_endog(self):
+        """Return one cached dense positive-response subset."""
+        if self.__positive_endog is None:
+            self.__positive_endog = self.endog[self._positive_row_indices]
+        return self.__positive_endog
+
+    @property
+    def _positive_exog(self):
+        """Return one cached positive-row design subset."""
+        if self.__positive_exog is None:
+            self.__positive_exog = self.exog[self._positive_row_indices]
+        return self.__positive_exog
+
+    @property
+    def _positive_weights(self):
+        """Return one cached positive-row weight subset."""
+        if self.weights is None:
+            return None
+        if self.__positive_weights is None:
+            self.__positive_weights = self.weights[
+                self._positive_row_indices
+            ]
+        return self.__positive_weights
+
+    @property
+    def _positive_component_endog(self):
+        """Return the cached dense response expected by GLM internals."""
+        return self._positive_endog
+
+    @property
+    def _hurdle_component_endog(self):
+        """Return the cached dense zero indicator expected by GLM internals."""
+        return self._zero_indicator
 
     @property
     @abstractmethod
@@ -332,41 +389,45 @@ class HurdleModel(TwoPartModel):
 
     def _get_positive_start_params(self):
         """Return family-aware starts for the positive component."""
-        positive_endog = self.endog[self.is_positive]
-        positive_weights = (
-            None if self.weights is None else self.weights[self.is_positive]
-        )
+        positive_endog = self._positive_endog
+        positive_weights = self._positive_weights
         positive_intercept = self.positive_family.get_starting_intercept(
             positive_endog,
             var_weights=positive_weights,
             link=self.positive_link,
         )
         return self._constant_predictor_start(
-            self.exog[self.is_positive], positive_intercept
+            self._positive_exog, positive_intercept
         )
 
     def _positive_loglike_obs(self, params, positive_scale):
         """Return positive-component likelihood contributions."""
-        positive_eta = self.exog[self.is_positive] @ params
+        positive_eta = self._positive_exog @ params
         positive_mu = self.positive_link.inverse_link(positive_eta)
         positive_theta = self.positive_family.b_deriv_inv(positive_mu)
         return self.positive_family.log_likelihood_obs(
-            self.endog[self.is_positive],
+            self._positive_endog,
             positive_theta,
             scale=positive_scale,
             var_weights=1.0,
         )
 
-    def _positive_score_obs(self, params, positive_scale):
-        """Return positive-component observation scores."""
-        positive_eta = self.exog[self.is_positive] @ params
+    def _positive_score_blocks(self, params, positive_scale):
+        """Return factorized positive-component score columns."""
+        positive_eta = self._positive_exog @ params
         positive_mu = self.positive_link.inverse_link(positive_eta)
         variance = self.positive_family.variance(positive_mu)
         link_derivative = self.positive_link.deriv(positive_mu)
         positive_factor = (
-            self.endog[self.is_positive] - positive_mu
+            self._positive_endog - positive_mu
         ) / (positive_scale * variance * link_derivative)
-        return self.exog[self.is_positive] * positive_factor[:, None]
+        return ((self._positive_exog, positive_factor),)
+
+    def _positive_score_obs(self, params, positive_scale):
+        """Return positive-component observation scores."""
+        return _build_score_obs(
+            self._positive_score_blocks(params, positive_scale)
+        )
 
     def _positive_conditional_mean(self, params, exog):
         """Return ``E[Y | Y>0, X]`` for the positive component."""
@@ -381,8 +442,8 @@ class HurdleModel(TwoPartModel):
             first_column_constant):
         """Fit the default positive component as a GLM."""
         return SparseGeneralizedLinearModel.GLM(
-            self.endog[self.is_positive],
-            self.exog[self.is_positive],
+            self._positive_component_endog,
+            self._positive_exog,
             family=self.positive_family,
             link=self.positive_link,
             var_weights=weights,
@@ -425,7 +486,7 @@ class HurdleModel(TwoPartModel):
         if self.exog_infl_names is not None:
             return [f'hurdle_{name}' for name in self.exog_infl_names]
         if (self.k_inflate == 1
-                and np.allclose(self.exog_infl[:, 0], 1.0)):
+                and _is_constant_column(self.exog_infl, value=1.0)):
             return ['hurdle_const']
         return [f'hurdle_x{i}' for i in range(self.k_inflate)]
 
@@ -444,7 +505,7 @@ class HurdleModel(TwoPartModel):
             zero_probability = float(np.mean(self.is_zero))
         else:
             zero_probability = float(
-                np.dot(self.weights, self.is_zero.astype(float))
+                np.dot(self.weights, self._zero_indicator)
                 / np.sum(self.weights)
             )
         zero_probability = float(np.clip(zero_probability, 1e-4, 1 - 1e-4))
@@ -531,38 +592,31 @@ class HurdleModel(TwoPartModel):
 
         hurdle_eta = self.exog_infl @ hurdle_params
         zero_probability = expit(hurdle_eta)
-        hurdle_factor = self.is_zero.astype(float) - zero_probability
+        hurdle_factor = self._zero_indicator - zero_probability
 
-        score_obs = np.zeros(
-            (self.nobs, self.k_positive + self.k_hurdle), dtype=float
+        positive_blocks = tuple(
+            (values, factors, self._positive_row_indices)
+            for values, factors in self._positive_score_blocks(
+                positive_params, positive_scale
+            )
         )
-        score_obs[:, self.k_positive:] = (
-            self.exog_infl * hurdle_factor[:, None]
+        return _build_score_obs(
+            positive_blocks + ((self.exog_infl, hurdle_factor),),
+            nobs=self.nobs,
+            force_sparse=self.is_sparse_model,
         )
-
-        score_obs[self.is_positive, :self.k_positive] = (
-            self._positive_score_obs(positive_params, positive_scale)
-        )
-        return score_obs
 
     def score(self, params, positive_scale=None, *args, **kwargs):
         """Return the likelihood-weighted combined score vector."""
         score_obs = self.score_obs(
             params, positive_scale=positive_scale, *args, **kwargs
         )
-        if self.is_weighted:
-            score_obs *= self.weights[:, None]
-        return score_obs.sum(axis=0)
+        return _sum_score_obs(score_obs, weights=self.weights)
 
     @staticmethod
     def _first_column_is_constant(exog):
         """Return whether a design matrix starts with a constant column."""
-        exog = np.asarray(exog)
-        return bool(
-            exog.ndim == 2
-            and exog.shape[1] > 0
-            and np.allclose(exog[:, 0], exog[0, 0])
-        )
+        return _is_constant_column(exog)
 
     @staticmethod
     def _normalize_cov_type(cov_type):
@@ -747,7 +801,7 @@ class HurdleModel(TwoPartModel):
         positive_kwargs.update(positive_fit_kwargs)
         positive_kwargs['cov_kwds'] = {}
         positive_first_column_constant = self._first_column_is_constant(
-            self.exog[self.is_positive]
+            self._positive_exog
         )
         positive_kwargs['fit_intercept'] = positive_first_column_constant
         hurdle_kwargs = common_kwargs.copy()
@@ -765,10 +819,14 @@ class HurdleModel(TwoPartModel):
             positive_call_kwargs['debug'] = component_debug
             hurdle_call_kwargs = hurdle_kwargs.copy()
             hurdle_call_kwargs['debug'] = component_debug
-            positive_weights = (
-                None if component_weights is None
-                else component_weights[self.is_positive]
-            )
+            if component_weights is None:
+                positive_weights = None
+            elif component_weights is self.weights:
+                positive_weights = self._positive_weights
+            else:
+                positive_weights = component_weights[
+                    self._positive_row_indices
+                ]
             positive_result = self._fit_positive_component(
                 positive_weights,
                 positive_x0,
@@ -776,7 +834,7 @@ class HurdleModel(TwoPartModel):
                 positive_first_column_constant,
             )
             hurdle_result = SparseGeneralizedLinearModel.GLM(
-                self.is_zero.astype(float),
+                self._hurdle_component_endog,
                 self.exog_infl,
                 family=Bernoulli(),
                 link=Logit(),
@@ -875,9 +933,8 @@ class HurdleModel(TwoPartModel):
                 score_obs = self.score_obs(
                     params, positive_scale=positive_scale
                 )
-                if self.weights is not None:
-                    score_obs = score_obs * self.weights[:, None]
-                meat = score_obs.T @ score_obs
+                score_obs = _weight_score_obs(score_obs, self.weights)
+                meat = _score_meat(score_obs)
                 covariance = bread @ meat @ bread.T
                 if display_cov_type == 'HC1':
                     covariance *= self.nobs / max(
@@ -983,9 +1040,9 @@ class HurdleModel(TwoPartModel):
                             draw_positive
                         ),
                     )
-                    draw_score = (
-                        draw_score_obs * combined_weights[:, None]
-                    ).sum(axis=0)
+                    draw_score = _sum_score_obs(
+                        draw_score_obs, weights=combined_weights
+                    )
                     draw_normalized_score = (
                         float(np.max(np.abs(draw_score)))
                         / max(float(np.sum(combined_weights)), 1.0)
@@ -1242,16 +1299,12 @@ class HurdleModel(TwoPartModel):
                 data, index=index, debug=debug
             )
         positive_params, hurdle_params = self._split_params(params)
-        exog = self.exog if exog is None else np.asarray(exog, dtype=float)
+        exog = self.exog if exog is None else _as_design_matrix(exog)
         exog_infl = (
             self.exog_infl
             if exog_infl is None
-            else np.asarray(exog_infl, dtype=float)
+            else _as_design_matrix(exog_infl, name='exog_infl')
         )
-        if exog.ndim == 1:
-            exog = exog[None, :]
-        if exog_infl.ndim == 1:
-            exog_infl = exog_infl[None, :]
         if exog.shape[0] != exog_infl.shape[0]:
             raise ValueError(
                 'exog and exog_infl must contain the same number of rows'
@@ -1299,6 +1352,32 @@ class _OLSPositiveHurdle(HurdleModel):
         'scale_design_matrix', 'test_level', 'use_t',
     }
 
+    def __init__(self, *args, **kwargs):
+        """Initialize lazy transformed-response caches before model setup."""
+        self.__positive_working_endog = None
+        self.__positive_linear_component_endog = None
+        super().__init__(*args, **kwargs)
+
+    @property
+    def _positive_working_endog(self):
+        """Return one cached transformed positive response."""
+        if self.__positive_working_endog is None:
+            self.__positive_working_endog = self._transform_positive_endog(
+                self._positive_endog
+            )
+        return self.__positive_working_endog
+
+    @property
+    def _positive_linear_component_endog(self):
+        """Return the transformed response in the OLS design's format."""
+        if not isspmatrix(self._positive_exog):
+            return self._positive_working_endog
+        if self.__positive_linear_component_endog is None:
+            self.__positive_linear_component_endog = csc_matrix(
+                self._positive_working_endog.reshape(-1, 1)
+            )
+        return self.__positive_linear_component_endog
+
     @property
     def positive_family(self):
         """Return ``None`` because the positive component is fitted by OLS."""
@@ -1344,21 +1423,23 @@ class _OLSPositiveHurdle(HurdleModel):
 
     def _get_positive_start_params(self):
         """Return weighted constant-mean and residual-variance starts."""
-        transformed = self._transform_positive_endog(
-            self.endog[self.is_positive]
-        )
-        weights = (
-            np.ones(self.nobs_positive, dtype=float)
-            if self.weights is None
-            else self.weights[self.is_positive]
-        )
-        weight_total = float(np.sum(weights))
-        mean = float(np.dot(weights, transformed) / weight_total)
+        transformed = self._positive_working_endog
+        weights = self._positive_weights
+        if weights is None:
+            weight_total = float(self.nobs_positive)
+            mean = float(np.mean(transformed))
+        else:
+            weight_total = float(np.sum(weights))
+            mean = float(np.dot(weights, transformed) / weight_total)
         beta = self._constant_predictor_start(
-            self.exog[self.is_positive], mean
+            self._positive_exog, mean
         )
-        residual = transformed - self.exog[self.is_positive] @ beta
-        scale = float(np.dot(weights, residual ** 2) / weight_total)
+        residual = transformed - self._positive_exog @ beta
+        scale = (
+            float(np.mean(residual ** 2))
+            if weights is None
+            else float(np.dot(weights, residual ** 2) / weight_total)
+        )
         scale = max(scale, np.finfo(float).eps)
         return np.concatenate((beta, [np.log(scale)]))
 
@@ -1366,10 +1447,8 @@ class _OLSPositiveHurdle(HurdleModel):
         """Return Gaussian working-density contributions on the fit scale."""
         beta, log_scale, scale = self._split_positive_params(params)
         del positive_scale
-        transformed = self._transform_positive_endog(
-            self.endog[self.is_positive]
-        )
-        residual = transformed - self.exog[self.is_positive] @ beta
+        transformed = self._positive_working_endog
+        residual = transformed - self._positive_exog @ beta
         return (
             -0.5 * (
                 np.log(2.0 * np.pi) + log_scale + residual ** 2 / scale
@@ -1377,19 +1456,17 @@ class _OLSPositiveHurdle(HurdleModel):
             + self._positive_log_jacobian()
         )
 
-    def _positive_score_obs(self, params, positive_scale):
-        """Return beta and log-variance likelihood scores."""
+    def _positive_score_blocks(self, params, positive_scale):
+        """Return factorized beta and log-variance score columns."""
         beta, _, scale = self._split_positive_params(params)
         del positive_scale
-        transformed = self._transform_positive_endog(
-            self.endog[self.is_positive]
-        )
-        residual = transformed - self.exog[self.is_positive] @ beta
-        beta_score = self.exog[self.is_positive] * (
-            residual / scale
-        )[:, None]
+        transformed = self._positive_working_endog
+        residual = transformed - self._positive_exog @ beta
         scale_score = 0.5 * (residual ** 2 / scale - 1.0)
-        return np.column_stack((beta_score, scale_score))
+        return (
+            (self._positive_exog, residual / scale),
+            (scale_score, None),
+        )
 
     def _positive_conditional_mean(self, params, exog):
         """Return the Gaussian positive-component working mean."""
@@ -1431,13 +1508,10 @@ class _OLSPositiveHurdle(HurdleModel):
                 "or 'HC1'"
             )
 
-        positive_endog = self._transform_positive_endog(
-            self.endog[self.is_positive]
-        )
-        positive_exog = self.exog[self.is_positive]
+        positive_endog = self._positive_working_endog
+        positive_exog = self._positive_exog
         positive_weights = (
-            np.ones(self.nobs_positive, dtype=float)
-            if weights is None else np.asarray(weights, dtype=float)
+            None if weights is None else np.asarray(weights, dtype=float)
         )
         positive_name = self.endog_name
         if (positive_name is not None
@@ -1447,9 +1521,9 @@ class _OLSPositiveHurdle(HurdleModel):
         # Covariance is assembled below using likelihood-importance weights,
         # so avoid duplicating kanly's native WLS covariance calculation.
         fit = SparseLinearModel.LM(
-            positive_endog,
+            self._positive_linear_component_endog,
             positive_exog,
-            weights=None if weights is None else positive_weights,
+            weights=positive_weights,
             has_constant=(
                 first_column_constant or self.has_implicit_constant
             ),
@@ -1465,9 +1539,17 @@ class _OLSPositiveHurdle(HurdleModel):
         )
         beta = np.asarray(fit.params, dtype=float).reshape(-1)
         residual = positive_endog - positive_exog @ beta
-        weight_total = float(np.sum(positive_weights))
-        scale = float(
-            np.dot(positive_weights, residual ** 2) / weight_total
+        weight_total = (
+            float(self.nobs_positive)
+            if positive_weights is None
+            else float(np.sum(positive_weights))
+        )
+        scale = (
+            float(np.mean(residual ** 2))
+            if positive_weights is None
+            else float(
+                np.dot(positive_weights, residual ** 2) / weight_total
+            )
         )
         if not np.isfinite(scale) or scale <= np.finfo(float).tiny:
             raise ValueError(
@@ -1491,11 +1573,15 @@ class _OLSPositiveHurdle(HurdleModel):
             if cov_type == 'NONROBUST':
                 full_covariance = bread
             else:
-                beta_score = positive_exog * (residual / scale)[:, None]
                 scale_score = 0.5 * (residual ** 2 / scale - 1.0)
-                score_obs = np.column_stack((beta_score, scale_score))
-                weighted_score = score_obs * positive_weights[:, None]
-                meat = weighted_score.T @ weighted_score
+                score_obs = _build_score_obs((
+                    (positive_exog, residual / scale),
+                    (scale_score, None),
+                ))
+                weighted_score = _weight_score_obs(
+                    score_obs, positive_weights
+                )
+                meat = _score_meat(weighted_score)
                 full_covariance = bread @ meat @ bread.T
                 full_covariance *= self.nobs_positive / max(
                     self.nobs_positive - (k_beta + 1), 1
@@ -1570,7 +1656,7 @@ class LognormalHurdle(_OLSPositiveHurdle):
 
     def _positive_log_jacobian(self):
         """Return the lognormal transformation Jacobian ``-log(Y)``."""
-        return -np.log(self.endog[self.is_positive])
+        return -self._positive_working_endog
 
     def _positive_conditional_mean(self, params, exog):
         """Return the lognormal arithmetic mean on the outcome scale."""
@@ -1715,7 +1801,7 @@ class NegativeBinomialPHurdle(HurdleModel):
             )
         super().__init__(endog, exog, *args, **kwargs)
         self._positive_component_model = self._make_positive_model(
-            None if self.weights is None else self.weights[self.is_positive]
+            self._positive_weights
         )
 
     @property
@@ -1739,8 +1825,8 @@ class NegativeBinomialPHurdle(HurdleModel):
     def _make_positive_model(self, positive_weights):
         """Construct an aligned exact-likelihood positive component model."""
         return _ZeroTruncatedNegativeBinomialP(
-            self.endog[self.is_positive],
-            self.exog[self.is_positive],
+            self._positive_endog,
+            self._positive_exog,
             weights=positive_weights,
             p=self.p,
             endog_name=self.endog_name,
@@ -1752,20 +1838,17 @@ class NegativeBinomialPHurdle(HurdleModel):
 
     def _get_positive_start_params(self):
         """Return NB-P mean-regression and log-dispersion starts."""
-        component = self._make_positive_model(
-            None if self.weights is None else self.weights[self.is_positive]
-        )
-        return component.get_start_params()
+        return self._positive_component_model.get_start_params()
 
     def _positive_loglike_obs(self, params, positive_scale):
         """Return exact zero-truncated NB-P positive log likelihoods."""
         del positive_scale
         return self._positive_component_model.loglike_obs(params)
 
-    def _positive_score_obs(self, params, positive_scale):
-        """Return exact zero-truncated NB-P positive scores."""
+    def _positive_score_blocks(self, params, positive_scale):
+        """Return factorized exact NB-P positive score columns."""
         del positive_scale
-        return self._positive_component_model.score_obs(params)
+        return self._positive_component_model._score_blocks(params)
 
     def _positive_underlying_mean(self, params, exog):
         """Return ``mu = exp(X beta)`` before truncating away zeros."""
@@ -1802,7 +1885,11 @@ class NegativeBinomialPHurdle(HurdleModel):
                 f'these GLM fit options: {unsupported}'
             )
 
-        component = self._make_positive_model(weights)
+        component = (
+            self._positive_component_model
+            if weights is self._positive_weights
+            else self._make_positive_model(weights)
+        )
         component_cov_type = (
             'SANDWICH' if requested_cov_type == 'HC1'
             else requested_cov_type
