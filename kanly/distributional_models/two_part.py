@@ -22,9 +22,9 @@ from kanly.utils.util import dict_2_dataframe
 class TwoPartModel(_NonnegativeDistributionalModel):
     """Shared data, formula, and identification handling for two-part models.
 
-    ``exog_infl`` controls the probability assigned to the zero process. Its
-    coefficients use a logit link in the current zero-inflated and hurdle
-    subclasses. When omitted, a single intercept column is used.
+    ``exog_infl`` controls the probability assigned to the zero process.
+    Zero-inflated subclasses use a logit; hurdle subclasses select their zero
+    process. When omitted, a single intercept column is used.
     """
 
     _requires_both_outcome_parts = False
@@ -41,7 +41,7 @@ class TwoPartModel(_NonnegativeDistributionalModel):
             endog: Finite non-negative response observations.
             exog: Design matrix for the conditional count mean.
             weights: Optional observation likelihood weights.
-            exog_infl: Optional design matrix for the structural-zero logit.
+            exog_infl: Optional design matrix for the zero-process equation.
                 Defaults to an intercept-only matrix.
             exog_infl_names: Optional names for columns of ``exog_infl``.
             endog_name: Optional response name.
@@ -204,9 +204,9 @@ class TwoPartModel(_NonnegativeDistributionalModel):
                 optional ``$`` likelihood-weight expression.
             data: DataFrame or dict-like object containing formula variables.
             index: Optional boolean or integer row selector.
-            exog_infl: Patsy-style right-hand-side formula for the
-                structural-zero logit, such as ``'z1 + C(group)'``.  ``None``
-                creates a single constant column.
+            exog_infl: Patsy-style right-hand-side formula for the zero-process
+                equation, such as ``'z1 + C(group)'``. ``None`` creates a
+                single constant column.
             debug: Whether to print formula-construction diagnostics.
             check_constant_cols: Whether to remove redundant constant columns.
             fail_on_missing: Raise instead of dropping rows with missing data.

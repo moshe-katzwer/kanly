@@ -1,13 +1,15 @@
 """Two-part hurdle models estimated through separable components.
 
-The zero hurdle is a Bernoulli GLM with a logit link for
-``P(Y = 0 | exog_infl)``.  Conditional on crossing that hurdle, the response
-is modeled over the strictly positive observations. Gaussian and lognormal
-components use OLS; Poisson, Gamma, and Inverse Gaussian use GLMs;
-negative-binomial-P uses an exact zero-truncated likelihood so its dispersion
-can be estimated. Because the likelihood separates, the two components are
-fitted independently and their coefficient vectors and covariance matrices
-are combined afterwards.
+The zero hurdle can use either a Bernoulli/logit model for
+``P(Y = 0 | exog_infl)`` or a statsmodels-compatible right-censored Poisson
+model. The latter is fitted through its equivalent Bernoulli complementary-
+log-log representation for ``P(Y > 0 | exog_infl)``. Conditional on crossing
+the hurdle, the response is modeled over the strictly positive observations.
+Gaussian and lognormal components use OLS; Poisson, Gamma, and Inverse
+Gaussian use GLMs; negative-binomial-P uses an exact zero-truncated likelihood
+so its dispersion can be estimated. Because the likelihood separates, the two
+components are fitted independently and their coefficient vectors and
+covariance matrices are combined afterwards.
 
 Parameter order follows the count-model convention used by the zero-inflated
 classes: all positive-response parameters first, followed by zero-process
@@ -50,7 +52,11 @@ from kanly.regression.generalized_linear_models.families import (
     ZeroTruncatedPoisson,
     _get_family_and_link,
 )
-from kanly.regression.generalized_linear_models.links import Log, Logit
+from kanly.regression.generalized_linear_models.links import (
+    CLogLog,
+    Log,
+    Logit,
+)
 from kanly.regression.generalized_linear_models.model import (
     SparseGeneralizedLinearModel,
 )
@@ -62,6 +68,27 @@ HurdleModelResults = DistributionalModelResults
 
 
 _POISSON_LIMIT_LOG_ALPHA = float(np.log(1e-8))
+_ZERO_MODEL_ALIASES = {
+    'logit': 'logit',
+    'logistic': 'logit',
+    'poisson': 'poisson',
+    'censoredpoisson': 'poisson',
+    'rightcensoredpoisson': 'poisson',
+}
+
+
+def _normalize_zero_model(zero_model):
+    """Return the canonical hurdle zero-model name."""
+    if not isinstance(zero_model, str):
+        raise TypeError('zero_model must be a string')
+    normalized = ''.join(
+        character for character in zero_model.lower()
+        if character.isalnum()
+    )
+    canonical = _ZERO_MODEL_ALIASES.get(normalized)
+    if canonical is None:
+        raise ValueError("zero_model must be 'logit' or 'poisson'")
+    return canonical
 
 
 class _ZeroTruncatedNegativeBinomialP(_NonnegativeDistributionalModel):
@@ -279,10 +306,13 @@ class HurdleModel(TwoPartModel):
     """Base class for separable zero-hurdle and positive-response models.
 
     ``exog`` controls the positive conditional response.  ``exog_infl``
-    controls ``P(Y=0)`` through a Bernoulli/logit GLM and defaults to a single
-    constant. Observation ``weights`` multiply the component estimating
-    equations as importance weights; the positive component receives the
-    subset associated with positive responses.
+    controls the zero hurdle and defaults to a single constant. By default it
+    models ``P(Y=0)`` through a Bernoulli/logit GLM. With
+    ``zero_model='poisson'``, it instead models a latent Poisson rate whose
+    zero probability is ``exp(-exp(exog_infl @ gamma))``. Observation
+    ``weights`` multiply the component estimating equations as importance
+    weights; the positive component receives the subset associated with
+    positive responses.
 
     Subclasses specify the positive component. The inherited formula builder
     accepts ``exog_infl`` as a Patsy-style right-hand-side formula and rejects
@@ -292,8 +322,12 @@ class HurdleModel(TwoPartModel):
     _requires_both_outcome_parts = True
     is_quasi_likelihood = False
 
-    def __init__(self, *args, **kwargs):
-        """Initialize aligned hurdle data and validate both response parts."""
+    def __init__(self, *args, zero_model='logit', **kwargs):
+        """Initialize aligned hurdle data and select the zero process."""
+        self.zero_model = _normalize_zero_model(zero_model)
+        self._hurdle_link_instance = (
+            Logit() if self.zero_model == 'logit' else CLogLog()
+        )
         super().__init__(*args, **kwargs)
         self.is_zero = self.endog == 0.0
         self.is_positive = ~self.is_zero
@@ -325,6 +359,7 @@ class HurdleModel(TwoPartModel):
         self.__positive_exog = None
         self.__positive_weights = None
         self._zero_indicator = self.is_zero.astype(float)
+        self._positive_indicator = self.is_positive.astype(float)
         self._positive_scale = None
         self.positive_model_fit = None
         self.hurdle_model_fit = None
@@ -361,8 +396,79 @@ class HurdleModel(TwoPartModel):
 
     @property
     def _hurdle_component_endog(self):
-        """Return the cached dense zero indicator expected by GLM internals."""
-        return self._zero_indicator
+        """Return the binary response used by the selected hurdle GLM."""
+        if self.zero_model == 'logit':
+            return self._zero_indicator
+        return self._positive_indicator
+
+    @property
+    def hurdle_link(self):
+        """Return the GLM link equivalent to the selected zero process."""
+        return self._hurdle_link_instance
+
+    def _hurdle_component_description(self):
+        """Return a concise description of the selected zero process."""
+        if self.zero_model == 'logit':
+            return 'BERNOULLI / LOGIT FOR P(Y=0)'
+        return (
+            'RIGHT-CENSORED POISSON '
+            '(BERNOULLI / CLOGLOG FOR P(Y>0))'
+        )
+
+    def _hurdle_component_endog_name(self):
+        """Return a response name matching the fitted binary orientation."""
+        if self.endog_name is None:
+            return None
+        suffix = 'is_zero' if self.zero_model == 'logit' else 'is_positive'
+        return f'{self.endog_name}_{suffix}'
+
+    def _hurdle_probabilities_from_eta(self, hurdle_eta):
+        """Return zero and positive probabilities from a hurdle predictor."""
+        hurdle_eta = np.asarray(hurdle_eta, dtype=float)
+        if self.zero_model == 'logit':
+            zero_probability = expit(hurdle_eta)
+            positive_probability = expit(-hurdle_eta)
+        else:
+            with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+                rate = np.exp(hurdle_eta)
+                zero_probability = np.exp(-rate)
+                positive_probability = -np.expm1(-rate)
+        return zero_probability, positive_probability
+
+    def _hurdle_loglike_from_eta(self, hurdle_eta):
+        """Return unweighted binary hurdle log-likelihood contributions."""
+        hurdle_eta = np.asarray(hurdle_eta, dtype=float)
+        if self.zero_model == 'logit':
+            return np.where(
+                self.is_zero,
+                -np.logaddexp(0.0, -hurdle_eta),
+                -np.logaddexp(0.0, hurdle_eta),
+            )
+
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            rate = np.exp(hurdle_eta)
+            log_positive_probability = np.log(-np.expm1(-rate))
+        return np.where(
+            self.is_zero, -rate, log_positive_probability
+        )
+
+    def _hurdle_score_factor(self, hurdle_eta):
+        """Return the hurdle log-likelihood derivative with respect to eta."""
+        hurdle_eta = np.asarray(hurdle_eta, dtype=float)
+        if self.zero_model == 'logit':
+            zero_probability, _ = self._hurdle_probabilities_from_eta(
+                hurdle_eta
+            )
+            return self._zero_indicator - zero_probability
+
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            rate = np.exp(hurdle_eta)
+            positive_factor = rate / np.expm1(rate)
+        positive_factor = np.where(rate == 0.0, 1.0, positive_factor)
+        positive_factor = np.where(
+            np.isposinf(rate), 0.0, positive_factor
+        )
+        return np.where(self.is_zero, -rate, positive_factor)
 
     @property
     @abstractmethod
@@ -482,7 +588,7 @@ class HurdleModel(TwoPartModel):
         )
 
     def _get_inflation_param_names(self):
-        """Return hurdle-prefixed names for zero-logit coefficients."""
+        """Return hurdle-prefixed names for zero-process coefficients."""
         if self.exog_infl_names is not None:
             return [f'hurdle_{name}' for name in self.exog_infl_names]
         if (self.k_inflate == 1
@@ -509,9 +615,12 @@ class HurdleModel(TwoPartModel):
                 / np.sum(self.weights)
             )
         zero_probability = float(np.clip(zero_probability, 1e-4, 1 - 1e-4))
-        hurdle_intercept = (
-            np.log(zero_probability) - np.log1p(-zero_probability)
-        )
+        if self.zero_model == 'logit':
+            hurdle_intercept = (
+                np.log(zero_probability) - np.log1p(-zero_probability)
+            )
+        else:
+            hurdle_intercept = np.log(-np.log(zero_probability))
         hurdle_start = self._constant_predictor_start(
             self.exog_infl, hurdle_intercept
         )
@@ -553,22 +662,18 @@ class HurdleModel(TwoPartModel):
     def loglike_obs(self, params, positive_scale=None, *args, **kwargs):
         """Return unweighted combined log-likelihood contributions.
 
-        For a zero response this is the Bernoulli log probability of zero.
-        For a positive response it is the Bernoulli log probability of
-        crossing the hurdle plus the positive-family log likelihood.  As with
-        other distributional models, estimation weights are applied only by
-        :meth:`loglike`, not to this observation-level return value.
+        For a zero response this includes the selected zero-process log
+        probability. For a positive response it includes the log probability
+        of crossing the hurdle plus the positive-family log likelihood. As
+        with other distributional models, estimation weights are applied only
+        by :meth:`loglike`, not to this observation-level return value.
         """
         del args, kwargs
         positive_params, hurdle_params = self._split_params(params)
         positive_scale = self._resolve_positive_scale(positive_scale)
 
         hurdle_eta = self.exog_infl @ hurdle_params
-        hurdle_loglike = np.where(
-            self.is_zero,
-            -np.logaddexp(0.0, -hurdle_eta),
-            -np.logaddexp(0.0, hurdle_eta),
-        )
+        hurdle_loglike = self._hurdle_loglike_from_eta(hurdle_eta)
 
         positive_loglike = self._positive_loglike_obs(
             positive_params, positive_scale
@@ -591,8 +696,7 @@ class HurdleModel(TwoPartModel):
         positive_scale = self._resolve_positive_scale(positive_scale)
 
         hurdle_eta = self.exog_infl @ hurdle_params
-        zero_probability = expit(hurdle_eta)
-        hurdle_factor = self._zero_indicator - zero_probability
+        hurdle_factor = self._hurdle_score_factor(hurdle_eta)
 
         positive_blocks = tuple(
             (values, factors, self._positive_row_indices)
@@ -675,9 +779,10 @@ class HurdleModel(TwoPartModel):
             cov_kwds: Hurdle-level covariance and bootstrap options.
             positive_fit_kwargs: Overrides passed only to the positive
                 component estimator.
-            hurdle_fit_kwargs: Overrides passed only to the Bernoulli GLM.
+            hurdle_fit_kwargs: Overrides passed only to the binary-equivalent
+                hurdle GLM.
             **glm_fit_kwargs: Additional options shared by both component
-                fits when supported. The zero hurdle is always a GLM.
+                fits when supported. Both zero-model choices use a GLM.
 
         Returns:
             :class:`DistributionalModelResults` containing the two component
@@ -759,7 +864,10 @@ class HurdleModel(TwoPartModel):
                 '* Positive component: '
                 f'{self._positive_component_description()}'
             )
-            print('* Zero family/link: BERNOULLI / LOGIT')
+            print(
+                '* Zero component: '
+                f'{self._hurdle_component_description()}'
+            )
             print(f'* Covariance type: {display_cov_type}')
             print(f'* Component covariance type: {component_cov_type}')
             print(
@@ -837,14 +945,10 @@ class HurdleModel(TwoPartModel):
                 self._hurdle_component_endog,
                 self.exog_infl,
                 family=Bernoulli(),
-                link=Logit(),
+                link=self.hurdle_link,
                 var_weights=component_weights,
                 exog_names=self._get_inflation_param_names(),
-                endog_name=(
-                    None
-                    if self.endog_name is None
-                    else f'{self.endog_name}_is_zero'
-                ),
+                endog_name=self._hurdle_component_endog_name(),
                 var_weights_name=self.weights_name,
                 start_params=hurdle_x0,
                 first_column_constant=hurdle_first_column_constant,
@@ -1321,14 +1425,18 @@ class HurdleModel(TwoPartModel):
             positive_params, exog
         )
         linear_predictor = exog @ positive_params[:self.exog.shape[1]]
-        zero_probability = expit(exog_infl @ hurdle_params)
+        zero_probability, positive_probability = (
+            self._hurdle_probabilities_from_eta(
+                exog_infl @ hurdle_params
+            )
+        )
         predictions = {
-            'mean': (1.0 - zero_probability) * positive_mean,
+            'mean': positive_probability * positive_mean,
             'positive_mean': positive_mean,
             'underlying_mean': underlying_mean,
             'linear_predictor': linear_predictor,
             'zero_probability': zero_probability,
-            'positive_probability': 1.0 - zero_probability,
+            'positive_probability': positive_probability,
         }
         which = str(which).lower()
         if which not in predictions:
@@ -1618,7 +1726,7 @@ class _OLSPositiveHurdle(HurdleModel):
 
 
 class GaussianHurdle(_OLSPositiveHurdle):
-    """Logit hurdle with a working Gaussian OLS positive component.
+    """Configurable zero hurdle with a Gaussian OLS positive component.
 
     The positive observations are regressed directly on ``exog``. Since an
     untruncated Gaussian distribution is not confined to ``(0, infinity)``,
@@ -1640,7 +1748,7 @@ class GaussianHurdle(_OLSPositiveHurdle):
 
 
 class LognormalHurdle(_OLSPositiveHurdle):
-    """Logit hurdle with OLS for a lognormal positive response.
+    """Configurable zero hurdle with a lognormal positive response.
 
     OLS is fitted to ``log(Y)`` for positive observations. If its fitted
     residual variance is ``scale``, then the positive-response median is
@@ -1666,7 +1774,7 @@ class LognormalHurdle(_OLSPositiveHurdle):
 
 
 class PoissonHurdle(HurdleModel):
-    """Hurdle model with Bernoulli/logit zeros and positive Poisson counts.
+    """Configurable zero hurdle with positive Poisson counts.
 
     The positive component uses the existing GLM
     :class:`ZeroTruncatedPoisson` family, whose linear predictor models the
@@ -1704,7 +1812,7 @@ class PoissonHurdle(HurdleModel):
 
 
 class GammaHurdle(HurdleModel):
-    """Hurdle model with Bernoulli/logit zeros and positive Gamma responses.
+    """Configurable zero hurdle with positive Gamma responses.
 
     Gamma already has support over ``(0, infinity)``, so no additional
     truncation normalization is needed.  The positive conditional mean uses a
@@ -1735,13 +1843,12 @@ class GammaHurdle(HurdleModel):
 
 
 class InverseGaussianHurdle(HurdleModel):
-    """Logit hurdle with an Inverse Gaussian/log GLM for positive responses.
+    """Configurable zero hurdle with an Inverse Gaussian positive response.
 
-    The zero equation models ``P(Y=0 | Z)`` with a Bernoulli logit. Given a
-    positive response, the conditional mean is ``exp(X beta)`` and the
-    Inverse Gaussian variance is ``scale * mu**3``. The positive component is
-    estimated by the existing GLM IRLS implementation, with scale estimated
-    from the Pearson residuals.
+    Given a positive response, the conditional mean is ``exp(X beta)`` and
+    the Inverse Gaussian variance is ``scale * mu**3``. The positive
+    component is estimated by the existing GLM IRLS implementation, with
+    scale estimated from the Pearson residuals.
 
     Because the scale is Pearson-estimated rather than jointly maximized, the
     combined result is reported as quasi-likelihood and omits AIC and BIC.
@@ -1772,11 +1879,11 @@ class InverseGaussianHurdle(HurdleModel):
 
 
 class NegativeBinomialPHurdle(HurdleModel):
-    """Logit hurdle with an exact zero-truncated NB-P positive component.
+    """Configurable zero hurdle with an exact truncated NB-P component.
 
-    The zero equation models ``P(Y=0 | Z) = logistic(Z gamma)``. Conditional
-    on a positive response, the count follows an NB-P distribution truncated
-    at zero. Its underlying, untruncated mean and variance are
+    Conditional on a positive response, the count follows an NB-P
+    distribution truncated at zero. Its underlying, untruncated mean and
+    variance are
 
     ``mu = exp(X beta)`` and ``Var(Y | X) = mu + alpha * mu**p``.
 

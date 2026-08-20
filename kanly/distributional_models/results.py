@@ -66,7 +66,7 @@ public result object themselves.
             scale: Distribution or positive-component scale shown in summaries.
             positive_fit: Positive-response component result for hurdle
                 models; an OLS, GLM, or direct-likelihood result.
-            hurdle_fit: Bernoulli/logit GLM result for hurdle models.
+            hurdle_fit: Binary-equivalent GLM result for hurdle models.
             component_cov_type: Native component covariance type for hurdles.
             specification_name: Optional summary title suffix.
             test_level: Significance level for inference.
@@ -219,6 +219,9 @@ public result object themselves.
         self.is_zero_inflated = (
             hasattr(model, 'k_inflate') and not self.is_hurdle
         )
+        self.zero_model = (
+            getattr(model, 'zero_model', None) if self.is_hurdle else None
+        )
         self.nobs_zero = int(np.count_nonzero(model.endog == 0.0))
         self.nobs_positive = int(self.nobs - self.nobs_zero)
         self.zero_fraction = self.nobs_zero / self.nobs
@@ -325,7 +328,9 @@ public result object themselves.
             self.zero_probability = self.model.predict(
                 self._params, which='zero_probability'
             )
-            self.positive_probability = 1.0 - self.zero_probability
+            self.positive_probability = self.model.predict(
+                self._params, which='positive_probability'
+            )
             self.positive_mean = self.model.predict(
                 self._params, which='positive_mean'
             )
@@ -601,6 +606,7 @@ public result object themselves.
             header.extend([
                 ('Positive Nobs:', self.nobs_positive),
                 ('Positive Scale:', '%.4e' % self.positive_scale),
+                ('Zero Model:', self.zero_model.upper()),
                 ('Component Cov:', self.component_cov_type),
             ])
         return header
@@ -610,10 +616,17 @@ public result object themselves.
         del args
         lines = []
         if self.is_hurdle:
-            lines.append(
-                'The Bernoulli/logit zero hurdle and positive-response model '
-                'were estimated separately.'
+            zero_description = getattr(
+                self.model, '_hurdle_component_description', None
             )
+            lines.append(
+                'The zero-hurdle and positive-response models were estimated '
+                'separately.'
+            )
+            if callable(zero_description):
+                lines.append(
+                    f'Zero component: {zero_description()}.'
+                )
             positive_description = getattr(
                 self.model, '_positive_component_description', None
             )

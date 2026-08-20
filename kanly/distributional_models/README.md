@@ -87,6 +87,7 @@ fit = distributional_model(
     model_name="negative binomial p hurdle",
     exog_infl="z + C(group)",
     p=2,
+    zero_model="poisson",
     cov_type="SANDWICH",
 )
 ```
@@ -115,10 +116,10 @@ The two functions intentionally have broad, explicit signatures. An argument
 that is irrelevant to the selected model is ignored: for example,
 `exog_infl` does nothing for `Poisson`, `p` does nothing for `Gamma`, and
 `positive_link` does nothing outside `GammaHurdle` and
-`InverseGaussianHurdle`. The important exceptions are malformed arguments
-that actually apply to the selected model, which are validated normally.
-Formula weights continue to use the `$` extension; array weights use the
-explicit `weights` argument.
+`InverseGaussianHurdle`. Likewise, `zero_model` is used only by hurdle
+models. The important exceptions are malformed arguments that actually apply
+to the selected model, which are validated normally. Formula weights continue
+to use the `$` extension; array weights use the explicit `weights` argument.
 
 ### Model-name lookup
 
@@ -169,12 +170,12 @@ mu_i = exp(eta_i)
 | `NegativeBinomial2` | NB-2 | `mu + alpha * mu**2` | `log_alpha` |
 | `ZeroInflatedPoisson` | Structural-zero mixture with Poisson counts | Mixture variance | Inflation coefficients |
 | `ZeroInflatedNegativeBinomial` | Structural-zero mixture with NB-2 counts | Mixture variance | Inflation coefficients and `log_alpha` |
-| `PoissonHurdle` | Logit zero hurdle plus zero-truncated Poisson GLM | Two-part model | Hurdle coefficients |
-| `GammaHurdle` | Logit zero hurdle plus Gamma/log GLM quasi-likelihood | Two-part model | Hurdle coefficients; Pearson GLM scale |
-| `GaussianHurdle` | Logit zero hurdle plus working Gaussian OLS on positive `Y` | Positive variance `scale` | Estimated `log_scale`; hurdle coefficients |
-| `LognormalHurdle` | Logit zero hurdle plus OLS on positive `log(Y)` | Positive log-variance `scale` | Estimated `log_scale`; hurdle coefficients |
-| `InverseGaussianHurdle` | Logit zero hurdle plus Inverse Gaussian/log GLM quasi-likelihood | Positive variance `scale * mu**3` | Hurdle coefficients; Pearson GLM scale |
-| `NegativeBinomialPHurdle(p=1 or 2)` | Logit zero hurdle plus exact zero-truncated NB-P likelihood | `mu + alpha * mu**p` before truncation | Estimated `log_alpha`; hurdle coefficients |
+| `PoissonHurdle` | Configurable zero hurdle plus zero-truncated Poisson GLM | Two-part model | Hurdle coefficients |
+| `GammaHurdle` | Configurable zero hurdle plus Gamma/log GLM quasi-likelihood | Two-part model | Hurdle coefficients; Pearson GLM scale |
+| `GaussianHurdle` | Configurable zero hurdle plus working Gaussian OLS on positive `Y` | Positive variance `scale` | Estimated `log_scale`; hurdle coefficients |
+| `LognormalHurdle` | Configurable zero hurdle plus OLS on positive `log(Y)` | Positive log-variance `scale` | Estimated `log_scale`; hurdle coefficients |
+| `InverseGaussianHurdle` | Configurable zero hurdle plus Inverse Gaussian/log GLM quasi-likelihood | Positive variance `scale * mu**3` | Hurdle coefficients; Pearson GLM scale |
+| `NegativeBinomialPHurdle(p=1 or 2)` | Configurable zero hurdle plus exact zero-truncated NB-P likelihood | `mu + alpha * mu**p` before truncation | Estimated `log_alpha`; hurdle coefficients |
 
 For models reporting `log_alpha`, the positive dispersion is
 `alpha = exp(log_alpha)`. Generalized Poisson estimates raw `alpha` because
@@ -183,11 +184,13 @@ valid negative values permit underdispersion. In `NegativeBinomialPHurdle`,
 NB1 and `p=2` selects NB2 (the default).
 
 `Gamma`, imported from `continuous_models.py`, is a continuous distribution;
-its outcome must be finite and strictly positive. Zero-inflation and hurdle
-probabilities use a logit. `GammaHurdle` and `InverseGaussianHurdle` use a log
-positive-response link by default and permit another supported GLM link
-through `positive_link`. `GaussianHurdle` regresses positive `Y` directly;
-`LognormalHurdle` regresses `log(Y)`.
+its outcome must be finite and strictly positive. Zero-inflation uses a logit.
+Hurdle models use a logit zero process by default and optionally use a
+right-censored Poisson process through `zero_model="poisson"`.
+`GammaHurdle` and `InverseGaussianHurdle` use a log positive-response link by
+default and permit another supported GLM link through `positive_link`.
+`GaussianHurdle` regresses positive `Y` directly; `LognormalHurdle` regresses
+`log(Y)`.
 
 ## Basic Formula API
 
@@ -329,11 +332,36 @@ also demonstrates sparse formula construction and a sparse observation score.
 
 ## Hurdle Models
 
-Hurdle models assign every zero to a Bernoulli/logit zero process and model
-the positive observations conditionally:
+Hurdle models assign every zero to the zero process and model the positive
+observations conditionally. The default `zero_model="logit"` preserves the
+original Bernoulli/logit specification:
 
 ```text
-pi_i = P(Y_i = 0) = expit(z_i' gamma)
+h_i = z_i' gamma
+pi_i = P(Y_i = 0) = expit(h_i)
+P(Y_i > 0) = 1 - pi_i
+```
+
+Set `zero_model="poisson"` to use the same right-censored Poisson zero
+component as statsmodels currently defaults to. If the latent count has rate
+`lambda_i = exp(z_i' gamma)`, only whether it is zero or positive is observed:
+
+```text
+lambda_i = exp(z_i' gamma)
+pi_i = P(Y_i = 0) = exp(-lambda_i)
+P(Y_i > 0) = 1 - exp(-lambda_i)
+```
+
+This censored-Poisson likelihood is fitted by the equivalent Bernoulli GLM
+for `I(Y_i > 0)` with a complementary-log-log link. Its coefficient
+orientation is therefore opposite to the default zero logit: a positive
+`gamma_j` raises the latent rate and the probability of crossing the hurdle,
+so it lowers the zero probability. Only Poisson is available as the optional
+zero distribution for now.
+
+For either zero model, the combined response distribution is:
+
+```text
 
 P(Y_i = 0) = pi_i
 P(Y_i = y), y > 0 = (1 - pi_i) * f_positive(y | x_i)
@@ -370,18 +398,31 @@ model = PoissonHurdle.build_model_from_formula(
     "orders ~ price + promotion $ weight",
     data=df,
     exog_infl="customer_age + C(region)",
+    zero_model="poisson",
 )
 fit = model.fit(cov_type="SANDWICH")
 
 print(fit.summary_df())
 print(fit.positive_fit)  # positive-response GLM, OLS, or direct fit
-print(fit.hurdle_fit)    # Bernoulli/logit GLM for P(Y=0)
+print(fit.hurdle_fit)    # binary-equivalent zero-component GLM
+print(fit.zero_model)    # "poisson"
 ```
 
 `exog_infl=None` creates an intercept-only zero hurdle. Instruments remain
 unsupported and are rejected by formula construction. Parameters are ordered
 as all positive-response parameters followed by coefficients named
-`hurdle_...`.
+`hurdle_...`. The `zero_model` option is accepted by every hurdle class and by
+both one-shot APIs. Direct construction uses the same keyword:
+
+```python
+model = PoissonHurdle(
+    endog=y,
+    exog=X,
+    exog_infl=Z,
+    weights=w,
+    zero_model="poisson",
+)
+```
 
 The objective separates, so `fit` estimates the two components rather
 than jointly optimizing the combined objective. `NONROBUST` returns the exact
@@ -409,7 +450,8 @@ density is evaluated only over positive observations.
 ### Negative-binomial-P hurdle parameters
 
 `NegativeBinomialPHurdle(endog, exog, exog_infl=Z, p=2)` has three distinct
-sets of quantities. They should not be conflated:
+sets of quantities. The following uses the default `zero_model="logit"`;
+they should not be conflated:
 
 ```text
 eta_i = x_i' beta
@@ -437,7 +479,9 @@ pi_i = P(Y_i=0 | z_i) = expit(h_i)
   reported names are prefixed with `hurdle_`. It controls the log odds of an
   observed zero: `log(pi_i / (1-pi_i)) = z_i' gamma`. Thus a positive
   `gamma_j` increases the probability of a zero and decreases the probability
-  of crossing the hurdle.
+  of crossing the hurdle under the default logit. With
+  `zero_model="poisson"`, it instead controls the log latent Poisson rate and
+  a positive coefficient increases the probability of crossing the hurdle.
 - `p` is fixed when the model is constructed and is not present in
   `fit.params`. `p=1` means NB1 and `p=2` means NB2; the default is `2`.
 
@@ -527,12 +571,18 @@ Automatic starting values contain exactly one entry for every name returned by
 | `NegativeBinomial2` | Log-mean regression start plus NB-2 moment `log_alpha` |
 | `ZeroInflatedPoisson` | Excess-zero logit and zero-adjusted count mean |
 | `ZeroInflatedNegativeBinomial` | ZIP starts plus an NB-2 moment `log_alpha` |
-| `PoissonHurdle` | Zero-truncated Poisson positive start plus empirical zero-logit start |
-| `GammaHurdle` | Gamma positive start plus empirical zero-logit start |
-| `GaussianHurdle` | Positive-response mean and variance starts plus empirical zero-logit start |
-| `LognormalHurdle` | Log-positive-response mean and variance starts plus empirical zero-logit start |
-| `InverseGaussianHurdle` | Inverse Gaussian positive start plus empirical zero-logit start |
-| `NegativeBinomialPHurdle` | Positive-count log-mean and moment `log_alpha` starts plus empirical zero-logit start |
+| `PoissonHurdle` | Zero-truncated Poisson positive start plus empirical zero-process start |
+| `GammaHurdle` | Gamma positive start plus empirical zero-process start |
+| `GaussianHurdle` | Positive-response mean and variance starts plus empirical zero-process start |
+| `LognormalHurdle` | Log-positive-response mean and variance starts plus empirical zero-process start |
+| `InverseGaussianHurdle` | Inverse Gaussian positive start plus empirical zero-process start |
+| `NegativeBinomialPHurdle` | Positive-count log-mean and moment `log_alpha` starts plus empirical zero-process start |
+
+For a weighted observed-zero fraction `q`, the default logit hurdle starts its
+intercept at `log(q / (1-q))`. The censored-Poisson hurdle starts it at
+`log(-log(q))`, because `q = exp(-exp(intercept))`. All other hurdle
+coefficients start at zero. The fraction `q` uses normalized model importance
+weights when weights were supplied.
 
 An explicit `start_params` vector remains supported and must follow this
 parameter order:
@@ -693,8 +743,9 @@ Every count, zero-inflated, Gamma, and hurdle fit returns a
 | `resid_zero` / `resid_positive` | Hurdle-component residuals for the zero indicator and positive response |
 | `dispersion` | Transformed dispersion for Gamma, NB-1, NB-2, and ZINB, or raw GP alpha |
 | `zero_probability` / `positive_probability` | Fitted outcome probabilities for two-part models |
+| `zero_model` | Hurdle zero-process choice: `"logit"` or `"poisson"`; `None` otherwise |
 | `inflation_probability` / `count_mean` | ZIP/ZINB structural-zero probability and count-component mean |
-| `positive_fit` / `hurdle_fit` | Original component results for hurdle models; NB-P uses direct MLE for `positive_fit` |
+| `positive_fit` / `hurdle_fit` | Original component results for hurdle models; censored Poisson uses a Bernoulli/CLogLog-equivalent `hurdle_fit`, and NB-P uses direct MLE for `positive_fit` |
 | `optimization_result` | Original BFGS-PQN result for direct-likelihood models |
 | `bread` | Inverse observed information for non-bootstrap covariance |
 | `meat` | Score cross-product for sandwich covariance |
@@ -772,6 +823,10 @@ Hurdle models accept:
 - `linear_predictor`: positive-component linear predictor.
 - `zero_probability`: hurdle probability `pi`.
 - `positive_probability`: probability of crossing the hurdle.
+
+Here `pi` always denotes the fitted probability of an observed zero. For a
+censored-Poisson hurdle it is `exp(-exp(Z gamma))`; marginal effects use this
+selected probability mapping rather than assuming a logit.
 
 Only equations that can affect the requested target receive rows. For the
 unconditional two-part mean, the table reports the main and zero-process

@@ -426,14 +426,16 @@ def _prediction_from_linear_predictors(
         positive_mean, underlying_mean = _hurdle_positive_means(
             fit, params, eta_main
         )
-        zero_probability = expit(eta_zero)
+        zero_probability, positive_probability = (
+            fit.model._hurdle_probabilities_from_eta(eta_zero)
+        )
         predictions = {
-            'mean': (1.0 - zero_probability) * positive_mean,
+            'mean': positive_probability * positive_mean,
             'positive_mean': positive_mean,
             'underlying_mean': underlying_mean,
             'linear_predictor': eta_main,
             'zero_probability': zero_probability,
-            'positive_probability': 1.0 - zero_probability,
+            'positive_probability': positive_probability,
         }
     elif fit.is_zero_inflated:
         with np.errstate(over='ignore', invalid='ignore'):

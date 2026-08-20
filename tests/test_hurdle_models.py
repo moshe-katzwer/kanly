@@ -19,7 +19,11 @@ from kanly.regression.generalized_linear_models.families import (
     Gamma,
     ZeroTruncatedPoisson,
 )
-from kanly.regression.generalized_linear_models.links import Log, Logit
+from kanly.regression.generalized_linear_models.links import (
+    CLogLog,
+    Log,
+    Logit,
+)
 
 
 def sample_zero_truncated_poisson(rng, rate):
@@ -118,6 +122,108 @@ class TestHurdleModels(unittest.TestCase):
             atol=1e-10,
         )
         self.assertLess(np.max(np.abs(fit.score())), 1e-6)
+
+    def test_poisson_zero_model_matches_censored_poisson_hurdle(self):
+        """Fit the statsmodels-compatible right-censored Poisson process."""
+        rng = np.random.default_rng(20260820)
+        nobs = 2500
+        _, _, exog, exog_infl = make_designs(rng, nobs)
+        positive_params = np.array([0.15, -0.25])
+        hurdle_params = np.array([-0.35, 0.5])
+        hurdle_rate = np.exp(exog_infl @ hurdle_params)
+        positive_probability = -np.expm1(-hurdle_rate)
+
+        endog = sample_zero_truncated_poisson(
+            rng, np.exp(exog @ positive_params)
+        )
+        endog[rng.random(nobs) >= positive_probability] = 0
+        weights = rng.uniform(0.5, 1.5, nobs)
+        model = PoissonHurdle(
+            endog,
+            exog,
+            exog_infl=exog_infl,
+            weights=weights,
+            zero_model='poisson',
+            exog_names=['Intercept', 'x'],
+            exog_infl_names=['Intercept', 'z'],
+        )
+        fit = model.fit(cov_type='NONROBUST')
+
+        self.assertEqual(model.zero_model, 'poisson')
+        self.assertEqual(fit.zero_model, 'poisson')
+        self.assertIsInstance(model.hurdle_link, CLogLog)
+        self.assertIsInstance(fit.hurdle_fit.link, CLogLog)
+        np.testing.assert_array_equal(
+            fit.hurdle_fit.model.endog, (endog > 0.0).astype(float)
+        )
+        np.testing.assert_allclose(
+            fit.params.iloc[:2], positive_params, atol=0.08
+        )
+        np.testing.assert_allclose(
+            fit.params.iloc[2:], hurdle_params, atol=0.1
+        )
+
+        fitted_rate = np.exp(exog_infl @ fit.params.iloc[2:].to_numpy())
+        expected_zero_probability = np.exp(-fitted_rate)
+        expected_positive_probability = -np.expm1(-fitted_rate)
+        np.testing.assert_allclose(
+            fit.zero_probability, expected_zero_probability
+        )
+        np.testing.assert_allclose(
+            fit.positive_probability, expected_positive_probability
+        )
+        np.testing.assert_allclose(
+            fit.fittedvalues,
+            expected_positive_probability * fit.positive_mean,
+        )
+        np.testing.assert_allclose(
+            fit.llf,
+            fit.positive_fit.llf + fit.hurdle_fit.llf,
+            rtol=1e-12,
+            atol=1e-10,
+        )
+
+        params = np.array([0.1, -0.2, -0.3, 0.4])
+        analytical_score = model.score(params)
+        numerical_score = np.empty_like(params)
+        step = 1e-6
+        for column in range(len(params)):
+            low = params.copy()
+            high = params.copy()
+            low[column] -= step
+            high[column] += step
+            numerical_score[column] = (
+                model.loglike(high) - model.loglike(low)
+            ) / (2.0 * step)
+        np.testing.assert_allclose(
+            analytical_score, numerical_score, rtol=2e-6, atol=2e-5
+        )
+
+        weighted_zero_fraction = np.dot(
+            weights, endog == 0.0
+        ) / weights.sum()
+        self.assertAlmostEqual(
+            model.get_start_params()[2],
+            np.log(-np.log(weighted_zero_fraction)),
+        )
+        effects = fit.get_marginal_effects(
+            which='zero_probability', dummy=False
+        )
+        expected_effect = np.average(
+            -fitted_rate * expected_zero_probability * fit.params.iloc[3],
+            weights=weights,
+        )
+        self.assertEqual(effects.effect_names, ['hurdle_z'])
+        self.assertAlmostEqual(effects.margeff[0], expected_effect, places=7)
+        self.assertIn('RIGHT-CENSORED POISSON', fit.summary())
+
+        default_model = PoissonHurdle(endog, exog, exog_infl=exog_infl)
+        self.assertEqual(default_model.zero_model, 'logit')
+        self.assertIsInstance(default_model.hurdle_link, Logit)
+        with self.assertRaisesRegex(ValueError, "'logit' or 'poisson'"):
+            PoissonHurdle(
+                endog, exog, exog_infl=exog_infl, zero_model='nbinom'
+            )
 
     def test_gamma_hurdle_uses_gamma_log_glm(self):
         """Fit positive Gamma outcomes through the existing Gamma GLM family."""

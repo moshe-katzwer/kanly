@@ -212,7 +212,7 @@ def _resolve_model(model_name, p):
     return group, effective_p
 
 
-def _model_constructor_options(model_class, p, positive_link):
+def _model_constructor_options(model_class, p, positive_link, zero_model):
     """Return only constructor options relevant to ``model_class``."""
     options = {}
     if model_class in {GeneralizedPoisson, NegativeBinomialPHurdle}:
@@ -221,6 +221,8 @@ def _model_constructor_options(model_class, p, positive_link):
     if model_class in {GammaHurdle, InverseGaussianHurdle} and (
             positive_link is not None):
         options['positive_link'] = positive_link
+    if issubclass(model_class, HurdleModel):
+        options['zero_model'] = zero_model
     return options
 
 
@@ -273,7 +275,8 @@ def _fit_selected_model(
 
     if isinstance(model, NegativeBinomialPHurdle):
         # The positive component is exact BFGS MLE rather than a GLM. Shared
-        # GLM controls therefore apply only to its Bernoulli hurdle component.
+        # GLM controls therefore apply only to its binary-equivalent hurdle
+        # component.
         hurdle_fit_kwargs = {
             **common_hurdle_fit_options,
             **({} if hurdle_fit_kwargs is None else hurdle_fit_kwargs),
@@ -327,7 +330,8 @@ def distributional_model(
         use_t=None, test_level=None, compute_cov=None,
         store_convergence_path=None, line_search_fallback=None,
         pick_default_start=None, opt_method=None,
-        prompt_user_for_more_iters=None) -> DistributionalModelResults:
+        prompt_user_for_more_iters=None,
+        zero_model='logit') -> DistributionalModelResults:
     """Build and fit a selected distributional model from a formula.
 
     Args:
@@ -343,6 +347,10 @@ def distributional_model(
             by other models. Class defaults apply when omitted.
         positive_link: Gamma- or Inverse-Gaussian-hurdle positive-response
             link. Ignored otherwise.
+        zero_model: Hurdle zero-process model. ``'logit'`` preserves the
+            default Bernoulli/logit model for ``P(Y=0)``; ``'poisson'`` uses
+            a statsmodels-compatible right-censored Poisson model. Ignored by
+            non-hurdle models.
         start_params: Optional full starting parameter vector.
         debug: Print API dispatch, formula construction, and fit diagnostics.
         cov_type: Distributional covariance estimator.
@@ -365,9 +373,9 @@ def distributional_model(
             line_search_fallback, pick_default_start, opt_method,
             prompt_user_for_more_iters: Shared component-GLM controls used by
             Poisson, Gamma, and Inverse Gaussian hurdles. For NB-P hurdles
-            they apply only to the logit component. Gaussian and lognormal
+            they apply only to the zero component. Gaussian and lognormal
             positive components use OLS, so iterative controls apply only to
-            their logit component. These controls are ignored by direct
+            their zero component. These controls are ignored by direct
             one-part models.
 
     Returns:
@@ -401,7 +409,7 @@ def distributional_model(
     if uses_inflation:
         builder_options['exog_infl'] = exog_infl
     builder_options.update(_model_constructor_options(
-        model_class, effective_p, positive_link
+        model_class, effective_p, positive_link, zero_model
     ))
     model = model_class.build_model_from_formula(
         formula, data, **builder_options
@@ -432,7 +440,8 @@ def DISTRIBUTIONAL_MODEL(
         penalize_scale=None, use_t=None, test_level=None, compute_cov=None,
         store_convergence_path=None, line_search_fallback=None,
         pick_default_start=None, opt_method=None,
-        prompt_user_for_more_iters=None) -> DistributionalModelResults:
+        prompt_user_for_more_iters=None,
+        zero_model='logit') -> DistributionalModelResults:
     """Build and fit a selected distributional model from arrays.
 
     Args:
@@ -456,6 +465,9 @@ def DISTRIBUTIONAL_MODEL(
             other models.
         positive_link: Gamma- or Inverse-Gaussian-hurdle positive-response
             link; ignored otherwise.
+        zero_model: Hurdle zero-process model. ``'logit'`` is the default;
+            ``'poisson'`` uses a statsmodels-compatible right-censored
+            Poisson model. Ignored by non-hurdle models.
         start_params: Optional full starting parameter vector.
         debug: Print API dispatch and fitting diagnostics.
         cov_type: Distributional covariance estimator.
@@ -539,7 +551,7 @@ def DISTRIBUTIONAL_MODEL(
             'exog_infl_names': exog_infl_names,
         })
     constructor_options.update(_model_constructor_options(
-        model_class, effective_p, positive_link
+        model_class, effective_p, positive_link, zero_model
     ))
     model = model_class(endog, exog, **constructor_options)
 

@@ -33,6 +33,7 @@ from kanly.distributional_models.hurdle_models import (
     NegativeBinomialPHurdle,
     PoissonHurdle,
 )
+from kanly.regression.generalized_linear_models.links import CLogLog
 
 
 def _sample_zero_truncated_poisson(rng, mean):
@@ -189,6 +190,33 @@ class TestDistributionalModelAPI(unittest.TestCase):
         )
         self.assertIsInstance(gp_fit.model, GeneralizedPoisson)
         self.assertEqual(gp_fit.model.p, 2)
+
+    def test_hurdle_zero_model_option_reaches_array_and_formula_models(self):
+        """Route the censored-Poisson zero process through both public APIs."""
+        array_fit = self._array_fit(
+            self.poisson_hurdle,
+            'poisson hurdle',
+            zero_model='poisson',
+        )
+        self.assertEqual(array_fit.model.zero_model, 'poisson')
+        self.assertEqual(array_fit.zero_model, 'poisson')
+        self.assertIsInstance(array_fit.hurdle_fit.link, CLogLog)
+
+        data = pd.DataFrame({
+            'y': self.poisson_hurdle,
+            'x': self.x,
+            'z': self.z,
+        })
+        formula_fit = distributional_model(
+            'y ~ x',
+            data,
+            model_name='poisson hurdle',
+            exog_infl='z',
+            zero_model='poisson',
+            cov_type='NONROBUST',
+        )
+        self.assertEqual(formula_fit.model.zero_model, 'poisson')
+        self.assertIsInstance(formula_fit.hurdle_fit.link, CLogLog)
 
     def test_array_add_constant_names_and_root_exports(self):
         """Add an intercept and expose identical entry points on ``kanly.api``."""
