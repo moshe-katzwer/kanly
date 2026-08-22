@@ -1,7 +1,6 @@
 from __future__ import absolute_import, print_function
 
 import time
-from typing import Dict, Optional
 
 import numpy as np
 from scipy.sparse import issparse
@@ -447,7 +446,11 @@ def _compute_pls_cov(y, X, W, sigma2_hat, beta, center):
     n_ = X.shape[0]
     p_ = X.shape[1]
     l = len(beta)
-    mu_X = X.mean(axis=0) if center else np.zeros(p_)
+    mu_X = (
+        np.asarray(X.mean(axis=0)).ravel()
+        if center
+        else np.zeros(p_)
+    )
 
     XpX = X.T @ X
     if issparse(XpX):
@@ -650,13 +653,18 @@ def pls1(formula, data, l, debug=False, index=None, check_constant_cols=False, f
 
 
 def PLS2(
-        Y: np.ndarray,
-        X: np.ndarray,
+        Y,
+        X,
         l: int,
         center: bool = True,
         max_iter: int = 100,
         tol: float = 1e-6,
-) -> Dict[str, Optional[np.ndarray]]:
+        specification_name=None,
+        test_level=.05,
+        endog_names=None,
+        exog_names=None,
+        model_elapsed=0.0,
+) -> PlsRegressionResults:
     """
     Partial Least Squares Regression (PLS2) with multiple response variables.
 
@@ -665,20 +673,32 @@ def PLS2(
 
     Parameters
     ----------
-    Y : np.ndarray
+    Y : array-like or scipy sparse matrix
         Response matrix of shape (n_samples, n_responses). Must be 2-dimensional.
-    X : np.ndarray
+    X : array-like or scipy sparse matrix
         Predictor matrix of shape (n_samples, n_features). Must be 2-dimensional.
     l : int
         Number of latent components to extract.
     center : bool, default=True
-        If True, center X and Y and compute intercept. If False, assume data
-        is already centered and set intercept to None.
+        If True, center X and Y and compute an intercept. If False, fit the
+        inputs as supplied and return a zero intercept.
+    max_iter : int, default=100
+        Maximum NIPALS power iterations per component.
+    tol : float, default=1e-6
+        Convergence tolerance for the component weight vectors.
+    specification_name : str, optional
+        Human-readable label used in the result summary.
+    test_level : float, default=0.05
+        Significance level used by the result summary.
+    endog_names : sequence of str, optional
+        Response names. Must contain one name per response column.
+    exog_names : sequence of str, optional
+        Predictor names. Must contain one name per predictor column.
 
     Returns
     -------
-    dict
-        Dictionary containing:
+    PlsRegressionResults
+        Fitted PLS2 result object containing:
         - 'T' : np.ndarray
             Score matrix (latent components) of shape (n_samples, l).
             These are the projections of X onto the latent space.
@@ -694,8 +714,13 @@ def PLS2(
         - 'coef' : np.ndarray
             Regression coefficients of shape (n_features, n_responses).
             Defines the relationship: Y = X @ coef + error
-        - 'intercept' : np.ndarray or None
-            Intercept vector of shape (n_responses,) if center=True, else None.
+        - 'intercept' : np.ndarray
+            Intercept vector of shape (n_responses,). It is zero when
+            ``center=False``.
+
+        Components are available as attributes (for example ``fit.T`` and
+        ``fit.coef``), and predictions use ``fit.predict(X_new)``. Legacy
+        dictionary-style access such as ``fit['coef']`` remains supported.
 
     Raises
     ------
@@ -725,8 +750,8 @@ def PLS2(
     >>> B = np.zeros((p, q))
     >>> B[0, 0] = 2.0; B[1, 1] = -1.5; B[2, 0] = 0.5
     >>> Y = X @ B + 0.3 * rng.normal(size=(n, q))
-    >>> out = PLS2(Y, X, l=2)                              # doctest: +SKIP
-    >>> out['coef'].round(2)                                # doctest: +SKIP
+    >>> fit = PLS2(Y, X, l=2)                              # doctest: +SKIP
+    >>> fit.coef.round(2)                                   # doctest: +SKIP
     array([[ 1.93,  0.01],
            [ 0.02, -1.46],
            [ 0.46,  0.04],
@@ -736,135 +761,65 @@ def PLS2(
     --------
     :func:`PLS1` : single-response PLS.
     """
-    # Validate input dimensions
-    if Y.ndim != 2:
-        raise ValueError(f"Y must be 2-dimensional, got shape {Y.shape}")
-    if X.ndim != 2:
-        raise ValueError(f"X must be 2-dimensional, got shape {X.shape}")
+    # Imported lazily to keep the sparse implementation independently usable.
+    from kanly.regression.partial_least_squares.sparse_pls2 import (
+        SPARSE_PLS2,
+        predict_pls2,
+    )
 
-    n_samples, n_features = X.shape
-    n_responses = Y.shape[1]
-
-    # Convert to float arrays to avoid integer division issues
-    X = X.astype(float)
-    Y = Y.astype(float)
-
-    # Store original means for computing intercept
-    if center:
-        X_mean = np.mean(X, axis=0)
-        Y_mean = np.mean(Y, axis=0)
-        X_centered = X - X_mean
-        Y_centered = Y - Y_mean
+    _time = time.time()
+    components = SPARSE_PLS2(
+        Y, X, l, center=center, max_iter=max_iter, tol=tol
+    )
+    fittedvalues = predict_pls2(components, X)
+    if issparse(Y):
+        Y_dense = Y.toarray()
     else:
-        X_mean = None
-        Y_mean = None
-        X_centered = X.copy()
-        Y_centered = Y.copy()
+        Y_dense = np.asarray(Y, dtype=float)
+    resid = Y_dense - fittedvalues
+    wssr = np.sum(resid ** 2, axis=0)
+    Y_baseline = Y_dense.mean(axis=0) if center else np.zeros(Y_dense.shape[1])
+    wsst = np.sum((Y_dense - Y_baseline) ** 2, axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rsquared = 1.0 - wssr / wsst
+    scale = np.mean(resid ** 2, axis=0)
+    fit_elapsed = time.time() - _time
 
-    # Initialize matrices to store results
-    T = np.zeros((n_samples, l))  # Scores (latent components)
-    P = np.zeros((n_features, l))  # X-loadings
-    Q = np.zeros((n_responses, l))  # Y-loadings
-    W = np.zeros((n_features, l))  # X-weights
-
-    # Working copies that will be deflated
-    X_work = X_centered.copy()
-    Y_work = Y_centered.copy()
-
-    # Extract l components using NIPALS algorithm
-    for component in range(l):
-        # Initialize weights as the first column of X'Y (dominant direction)
-        # This captures the direction of maximum covariance
-        w = X_work.T @ Y_work[:, 0]
-        w = w / np.linalg.norm(w)  # Normalize to unit length
-
-        # Iteratively refine weights until convergence
-        for iteration in range(max_iter):  # Max iterations to prevent infinite loops
-            w_old = w.copy()
-
-            # Compute scores: project X onto weight vector
-            t = X_work @ w
-
-            # Normalize scores
-            t_norm = np.linalg.norm(t)
-            t = t / t_norm
-
-            # Compute Y-loadings: regression of Y on scores
-            q = Y_work.T @ t
-
-            # Compute X-weights: use Y-loadings to find new direction
-            # This maximizes covariance between X and Y
-            w = X_work.T @ (Y_work @ q)
-            w = w / np.linalg.norm(w)
-
-            # Check convergence: if weights haven't changed much, stop
-            if np.allclose(w, w_old, atol=tol):
-                break
-
-        # Final scores with proper normalization
-        t = X_work @ w
-        t_norm = np.linalg.norm(t)
-        t = t / t_norm
-
-        # Adjust weight vector for the normalization
-        w = w * t_norm
-
-        # Compute X-loadings: regression of X on scores
-        p = X_work.T @ t
-
-        # Compute Y-loadings: regression of Y on scores
-        q = Y_work.T @ t
-
-        # def fix(xx):
-        #     if issparse(xx):
-        #         xx = t.toarray()
-        #     if np.ndim(t) > 1:
-        #         xx = t.flatten()
-        #     return xx
-        #
-        # t = fix(t)
-        # p = fix(p)
-        # q = fix(q)
-        # w = fix(w)
-
-        # Store results for this component
-        T[:, component] = t
-        P[:, component] = p
-        Q[:, component] = q
-        W[:, component] = w
-
-        # Deflate X and Y: remove the variance explained by this component
-        X_work = X_work - np.outer(t, p)
-        Y_work = Y_work - np.outer(t, q)
-
-    # Compute regression coefficients: coef = W @ (P.T @ W)^(-1) @ Q.T
-    # This transforms from latent space back to original predictor space
-    W_star = W @ np.linalg.inv(P.T @ W)
-    coef = W_star @ Q.T
-
-    # Compute intercept if centering was applied
-    if center:
-        intercept = Y_mean - X_mean @ coef
-    else:
-        intercept = np.zeros(Y.shape[1])
-
-    fittedvalues = X @ coef + intercept
-    resid = Y - fittedvalues
-
-    def predict(exog=None):
-        if exog is None:
-            return fittedvalues.copy()
-        else:
-            return exog @ coef + intercept
-
-    return {
-        'T': T,
-        'P': P,
-        'Q': Q,
-        'W': W,
-        'coef': coef,
-        'intercept': intercept,
-        'fittedvalues': fittedvalues,
-        'resid': resid,
-        'predict': predict,
-    }
+    X_results = X if issparse(X) else np.asarray(X, dtype=float)
+    fit = PlsRegressionResults(
+        components['T'],
+        components['P'],
+        components['Q'],
+        components['W'],
+        components['coef'],
+        components['intercept'],
+        X_results,
+        Y_dense,
+        None,
+        l,
+        center,
+        fittedvalues,
+        resid,
+        wssr,
+        wsst,
+        rsquared,
+        scale,
+        None,
+        exog_names=exog_names,
+        endog_name=endog_names,
+        test_level=test_level,
+        specification_name=specification_name,
+        model_elapsed=model_elapsed,
+        fit_elapsed=fit_elapsed,
+        cov_elapsed=0.0,
+        U=components['U'],
+        C=components['C'],
+        X_mean=components['X_mean'],
+        Y_mean=components['Y_mean'],
+        n_iter=components['n_iter'],
+        converged=components['converged'],
+        model_type="PLS2",
+    )
+    fit.max_iter = max_iter
+    fit.tol = tol
+    return fit

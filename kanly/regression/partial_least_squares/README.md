@@ -61,9 +61,15 @@ fit = PLS1(y, X, l=3, center=True,
            exog_names=[f'x{j}' for j in range(X.shape[1])])
 print(fit.coef, fit.intercept)
 
-# Multiple responses
-out = PLS2(Y, X, l=5, center=True, max_iter=100, tol=1e-6)
-# out contains T, P, Q, W, coef, intercept, etc.
+# Multiple responses; returns a PlsRegressionResults fit object
+fit = PLS2(Y, X, l=5, center=True, max_iter=100, tol=1e-6)
+print(fit.coef, fit.rsquared)
+Y_pred = fit.predict(X)
+
+# X and Y may independently be dense or SciPy sparse matrices
+from scipy.sparse import csr_matrix
+fit_sparse = PLS2(csr_matrix(Y), csr_matrix(X), l=5)
+Y_pred_sparse = fit_sparse.predict(csr_matrix(X))
 ```
 
 ### Parameters (common)
@@ -81,7 +87,7 @@ out = PLS2(Y, X, l=5, center=True, max_iter=100, tol=1e-6)
 
 ## Results (`PlsRegressionResults`)
 
-Key fields include `coef`, `intercept`, `fittedvalues`, `resid`, `rsquared`, `params`-style summaries via `summary()`, and optional `cov_params` when `compute_cov=True`.
+Both `PLS1` and `PLS2` return `PlsRegressionResults`. Key fields include `coef`, `intercept`, `fittedvalues`, `resid`, `rsquared`, latent components (`T`, `P`, `Q`, `W`), named `params`, `predict()`, and `summary()`. PLS2 stores one statistics value per response and exposes its parameter matrix as `params_by_response`. Covariance is currently available only for PLS1 when `compute_cov=True`.
 
 ---
 
@@ -89,11 +95,12 @@ Key fields include `coef`, `intercept`, `fittedvalues`, `resid`, `rsquared`, `pa
 
 - No instrumental-variables formulas.
 - No frequency weights in the formula path.
-- No dedicated scripts under `examples/` at present (use docstring examples in [`pls.py`](pls.py) or fit from notebooks).
+- See the runnable PLS1 and PLS2 scripts linked below for array, formula, dense, and sparse usage.
 
 ---
 
 ## Examples in this repo
 
-- None under `examples/regression/partial_least_squares/` yet.
+- [`example_pls1.py`](../../../examples/regression/partial_least_squares/example_pls1.py) — single-response PLS with sparse array and formula APIs.
+- [`example_pls2.py`](../../../examples/regression/partial_least_squares/example_pls2.py) — multi-response PLS with dense/CSR parity and held-out prediction.
 - See also the [root user guide](../../../README.md#partial_least_squares) PLS subsection.
