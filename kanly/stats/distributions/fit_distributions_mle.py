@@ -1,21 +1,47 @@
 """
 Generates (x,y) series for plotting distribution pdfs, logpdfs, and cdfs in
-Cartesian plane. Also fits a small set of scipy.stats-style distributions by
-closed-form estimates or numerical maximum likelihood.
+Cartesian plane. Also fits scipy.stats-style continuous distributions by
+maximum likelihood.
 """
 from __future__ import absolute_import, print_function
 
-from scipy.stats import norm, expon, lognorm, t
+from collections.abc import Mapping
+
+from scipy.stats import (
+    beta, cauchy, expon, gamma, laplace, logistic, lognorm, norm, pareto, t,
+    uniform, weibull_min,
+)
 import numpy as np
-from kanly.optimize.bfgs_bounded_quasi_newton import bfgs_pqn
-from kanly.stats.distributions.nopython_logpdf import logpdf_t, logpdf_lognorm
 
 NORM = 'norm'
 LOGNORM = 'lognorm'
 EXPON = 'expon'
 T = 't'
+GAMMA = 'gamma'
+WEIBULL_MIN = 'weibull_min'
+BETA = 'beta'
+LOGISTIC = 'logistic'
+LAPLACE = 'laplace'
+CAUCHY = 'cauchy'
+PARETO = 'pareto'
+UNIFORM = 'uniform'
 
-DISTRIBUTIONS = [NORM, LOGNORM, EXPON, T]
+_SCIPY_DISTRIBUTIONS = {
+    NORM: norm,
+    LOGNORM: lognorm,
+    EXPON: expon,
+    T: t,
+    GAMMA: gamma,
+    WEIBULL_MIN: weibull_min,
+    BETA: beta,
+    LOGISTIC: logistic,
+    LAPLACE: laplace,
+    CAUCHY: cauchy,
+    PARETO: pareto,
+    UNIFORM: uniform,
+}
+
+DISTRIBUTIONS = list(_SCIPY_DISTRIBUTIONS)
 
 PDF = 'pdf'
 CDF = 'cdf'
@@ -127,60 +153,76 @@ def get_normal_cdf_x_y_from_data(data, num_points=200, num_sigma=3.5):
     return get_normal_cdf_x_y(np.mean(data), np.std(data), num_points=num_points, num_sigma=num_sigma)
 
 
-def _fit_distribution_params_by_mle(data, dist=NORM):
-    """Fit supported distribution parameters by MLE-style estimates.
+def _as_valid_sample(data):
+    """Return *data* as a finite, non-degenerate one-dimensional sample."""
+    sample = np.asarray(data, dtype=float)
+    if sample.ndim != 1:
+        raise ValueError('data must be one-dimensional')
+    if sample.size < 2:
+        raise ValueError('data must contain at least two observations')
+    if not np.all(np.isfinite(sample)):
+        raise ValueError('data must contain only finite observations')
+    if np.ptp(sample) == 0:
+        raise ValueError('data must contain at least two distinct values')
+    return sample
+
+
+def _get_scipy_distribution(dist):
+    """Validate a distribution name and return its scipy implementation."""
+    if not isinstance(dist, str) or dist.lower() not in DISTRIBUTIONS:
+        raise ValueError(f'dist must be one of {DISTRIBUTIONS}')
+    return dist.lower(), _SCIPY_DISTRIBUTIONS[dist.lower()]
+
+
+def _fit_distribution_params_by_mle(data, dist=NORM, fit_kwargs=None):
+    """Fit supported distribution parameters by maximum likelihood.
 
     Args:
         data: One-dimensional sample of observations.
-        dist: Distribution name. Supported values are ``'norm'``,
-            ``'lognorm'``, ``'expon'``, and ``'t'``.
+        dist: Name in :data:`DISTRIBUTIONS`. Supported values are ``'norm'``,
+            ``'lognorm'``, ``'expon'``, ``'t'``, ``'gamma'``,
+            ``'weibull_min'``, ``'beta'``, ``'logistic'``, ``'laplace'``,
+            ``'cauchy'``, ``'pareto'``, and ``'uniform'``.
+        fit_kwargs: Optional keyword arguments passed to the distribution's
+            ``scipy.stats`` ``fit`` method. This is useful for fixing known
+            parameters, for example ``{'floc': 0}`` for an unshifted gamma or
+            ``{'floc': 0, 'fscale': 1}`` for proportions fit by a beta.
 
     Returns:
         Dictionary of parameters suitable for constructing the matching
         scipy.stats frozen distribution.
     """
-    dist = dist.lower()
-    if dist == NORM:
-        loc, scale = data.mean(), data.std()
-        return {'loc': loc, 'scale': scale}
-    elif dist == LOGNORM:
-        # estimates mu, sigma from https://en.wikipedia.org/wiki/Log-normal_distribution
-        # not params of scipy distribution (no closed form)
-        # ln_y = np.log(data)
-        # mu = np.mean(ln_y)
-        # sigma = np.sqrt(np.mean((ln_y - mu) ** 2))
-        # return {'loc': 0.0, 's': sigma, 'scale': np.exp(mu)}
-        data = np.asarray(data)
-        # scipy.stats.lognorm uses ``s`` for the shape parameter and ``scale``
-        # for exp(mu), so optimize directly in scipy's parameterization.
-        result = bfgs_pqn(
-            lambda params: logpdf_lognorm(data, loc=params[0], s=params[1], scale=params[2]).sum(),
-            x0=[0., 1., 1.],
-            maximize=True
-        )
-        return dict(zip(['loc', 's', 'scale'], result.x))
-    elif dist == EXPON:
-        return {'scale': np.mean(data)}  # scale, f(x) = scale * exp(-scale * x)
-    elif dist == T:
-        data = np.asarray(data)
-        # Student's t has no simple closed-form MLE for df, loc, and scale.
-        result = bfgs_pqn(
-            lambda params: logpdf_t(data, df=params[2], loc=params[0], scale=params[1]).sum(),
-            x0=[0.0, 1.0, 4.0],
-            maximize=True
-        )
-        return {'df': result.x[2], 'loc': result.x[0], 'scale': result.x[1]}
+    _, dist_scipy = _get_scipy_distribution(dist)
+    sample = _as_valid_sample(data)
+    if fit_kwargs is None:
+        fit_kwargs = {}
+    elif not isinstance(fit_kwargs, Mapping):
+        raise TypeError('fit_kwargs must be a mapping or None')
     else:
-        raise Exception(f'dist must be in {DISTRIBUTIONS}')
+        fit_kwargs = dict(fit_kwargs)
+    fitted = dist_scipy.fit(sample, **fit_kwargs)
+
+    shape_names = [] if dist_scipy.shapes is None else [
+        name.strip() for name in dist_scipy.shapes.split(',')
+    ]
+    parameter_names = shape_names + ['loc', 'scale']
+    params = dict(zip(parameter_names, fitted))
+    if len(params) != len(fitted) or not np.all(np.isfinite(fitted)):
+        raise RuntimeError(f'{dist_scipy.name}.fit returned invalid parameters: {fitted}')
+    if params['scale'] <= 0:
+        raise RuntimeError(f'{dist_scipy.name}.fit returned a non-positive scale')
+    return params
 
 
-def get_mle_distribution(data, dist=NORM):
+def get_mle_distribution(data, dist=NORM, fit_kwargs=None):
     """Fit and return a scipy.stats frozen distribution object.
 
     Args:
         data: One-dimensional sample of observations.
-        dist: Distribution name. Supported values are ``'norm'``,
-            ``'lognorm'``, ``'expon'``, and ``'t'``.
+        dist: Name in :data:`DISTRIBUTIONS`.
+        fit_kwargs: Optional keyword arguments passed to ``scipy.stats.fit``.
+            For example, pass ``{'floc': 0}`` to fit a positive distribution
+            whose lower support boundary is known to be zero.
 
     Returns:
         Tuple ``(dist_obj, params)`` where ``dist_obj`` is a frozen scipy
@@ -198,18 +240,8 @@ def get_mle_distribution(data, dist=NORM):
     >>> dist_obj.pdf(0.0).round(3)                                  # doctest: +SKIP
     0.379
     """
-    if dist.lower() not in DISTRIBUTIONS:
-        raise Exception(f'dist must be in {DISTRIBUTIONS}')
-
-    dist_scipy = {
-        NORM: norm,
-        LOGNORM: lognorm,
-        T: t,
-        EXPON: expon
-    }[dist.lower()]
-
-    params = _fit_distribution_params_by_mle(data, dist)
-    print(dist, params)
+    _, dist_scipy = _get_scipy_distribution(dist)
+    params = _fit_distribution_params_by_mle(data, dist, fit_kwargs=fit_kwargs)
     return dist_scipy(**params), params
 
 
@@ -230,14 +262,13 @@ def _coalesce(x, fill):
 
 
 def get_mle_x_y(data, dist=NORM, curve=PDF, num_points=201, left_quantile=None, right_quantile=None,
-                return_dist_obj=False):
+                return_dist_obj=False, fit_kwargs=None):
     """
     Fit a distribution and generate plotting coordinates.
 
     Args:
         data: One-dimensional sample of observations.
-        dist: Distribution name. Supported values are ``'norm'``,
-            ``'lognorm'``, ``'expon'``, and ``'t'``.
+        dist: Name in :data:`DISTRIBUTIONS`.
         curve: Curve type to evaluate. Supported values are ``'pdf'``,
             ``'cdf'``, and ``'logpdf'``.
         num_points: Number of x-values to generate between fitted quantiles.
@@ -247,6 +278,7 @@ def get_mle_x_y(data, dist=NORM, curve=PDF, num_points=201, left_quantile=None, 
             plotting range. Defaults depend on ``dist``.
         return_dist_obj: Whether to include the frozen distribution and fitted
             parameter dictionary in the return value.
+        fit_kwargs: Optional keyword arguments passed to ``scipy.stats.fit``.
 
     Returns: x,y values for plotting
 
@@ -265,23 +297,50 @@ def get_mle_x_y(data, dist=NORM, curve=PDF, num_points=201, left_quantile=None, 
     >>> x, y, dist_obj, params = get_mle_x_y(                   # doctest: +SKIP
     ...     data, dist='lognorm', curve='pdf', return_dist_obj=True)
     """
+    if not isinstance(curve, str) or curve.lower() not in ['cdf', 'pdf', 'logpdf']:
+        raise ValueError("curve must be one of ['cdf', 'pdf', 'logpdf']")
     curve = curve.lower()
-    assert curve in ['cdf', 'pdf', 'logpdf']
 
-    dist = dist.lower()
-    if dist in [NORM, T]:
+    dist, _ = _get_scipy_distribution(dist)
+    if (
+        not isinstance(num_points, (int, np.integer))
+        or isinstance(num_points, (bool, np.bool_))
+        or num_points < 2
+    ):
+        raise ValueError('num_points must be an integer greater than or equal to 2')
+    if dist in [NORM, T, LOGISTIC, LAPLACE, CAUCHY]:
         left_quantile = _coalesce(left_quantile, .005)
         right_quantile = _coalesce(right_quantile, .995)
-    elif dist in [EXPON, LOGNORM]:
+    elif dist in [EXPON, LOGNORM, GAMMA, WEIBULL_MIN, PARETO]:
         left_quantile = _coalesce(left_quantile, .00001)
         right_quantile = _coalesce(right_quantile, .99)
+    elif dist in [BETA, UNIFORM]:
+        left_quantile = _coalesce(left_quantile, .001)
+        right_quantile = _coalesce(right_quantile, .999)
     else:
-        raise Exception(f'dist must be in {DISTRIBUTIONS}')
+        raise ValueError(f'dist must be one of {DISTRIBUTIONS}')
 
-    dist_obj, params = get_mle_distribution(data, dist=dist)
+    try:
+        valid_quantiles = (
+            np.isscalar(left_quantile)
+            and np.isscalar(right_quantile)
+            and np.isfinite(left_quantile)
+            and np.isfinite(right_quantile)
+            and 0 < left_quantile < right_quantile < 1
+        )
+    except TypeError:
+        valid_quantiles = False
+    if not valid_quantiles:
+        raise ValueError('quantiles must satisfy 0 < left_quantile < right_quantile < 1')
+
+    dist_obj, params = get_mle_distribution(data, dist=dist, fit_kwargs=fit_kwargs)
     l, h = dist_obj.ppf([left_quantile, right_quantile])
+    if not np.all(np.isfinite([l, h])) or l >= h:
+        raise RuntimeError(f'fitted {dist} distribution produced an invalid plotting range')
     x = np.linspace(l, h, num_points)
     f_x = getattr(dist_obj, curve)(x)
+    if not np.all(np.isfinite(f_x)):
+        raise RuntimeError(f'fitted {dist} distribution produced non-finite {curve} values')
 
     if return_dist_obj:
         return x, f_x, dist_obj, params
