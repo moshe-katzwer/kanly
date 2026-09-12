@@ -355,7 +355,7 @@ def _LOWESS_INTERNAL(endog, exog, xvals, frac, delta, degree, it, weights=None, 
                 # Find the right set of nearby points
                 # -----------------------------------
                 while True:
-                    if right < n - 1:
+                    if right < n:
                         if xval > (exog[left] + exog[right]) / 2.0:
                             left += 1
                             right += 1
@@ -364,7 +364,7 @@ def _LOWESS_INTERNAL(endog, exog, xvals, frac, delta, degree, it, weights=None, 
                     else:
                         break
 
-                max_gap = max(abs(xval - exog[left]), abs(xval - exog[right])) * 1.005
+                max_gap = max(abs(xval - exog[left]), abs(xval - exog[right - 1])) * 1.005
                 if max_gap == 0:
                     max_gap = 1e-3
                 # Center x at the target value so the fitted intercept is the

@@ -185,28 +185,39 @@ Some utilities (for example `StatisticalTests`) are imported from their submodul
 
 ## Installation
 
-The package is built with **setuptools**; see [`setup.py`](setup.py). Dependencies are listed in **requirements.in** at the repository root (also included as package data when installed).
+The package is built with **setuptools**; see [`setup.py`](setup.py). Direct runtime dependencies are listed in **requirements.in** at the repository root.
 
 ### Recommended: editable install in a virtual environment
 
 ```bash
 python -m venv venv
 source venv/bin/activate   # Windows: venv\Scripts\activate
-pip install -U pip setuptools wheel
-pip install -r requirements.in
 pip install -e .
 ```
 
 `pip install -e .` installs the `kanly` package from the local tree in editable mode.
 
-### Notes
+### Tests and examples
 
-- `setup.py` reads dependencies via a `requirements()` helper. If dependencies are not picked up automatically by your setuptools version, run `pip install -r requirements.in` before `pip install -e .` (as shown above).
-- `requirements.in` pins `scipy == 1.10.1` and `numba-scipy == 0.4.0`; match those if you hit binary or API compatibility issues.
+Dependencies used only by the test suite and comparison scripts are available as optional extras:
+
+```bash
+pip install -e ".[test]"
+pip install -e ".[examples]"
+pip install -e ".[test,examples]"
+```
+
+The `test` extra installs pytest, scikit-learn, and statsmodels. The `examples` extra installs Jupyter and the comparison libraries. IPython is supplied transitively by Jupyter and therefore is not listed separately.
+
+Run the automated tests with:
+
+```bash
+pytest tests
+```
 
 ### Python version
 
-Use **Python 3** consistent with the stack in `requirements.in` (packages such as `numba`, `pandas 2.x`, and `scipy 1.10.1`).
+Use a Python version compatible with the minimum versions in `requirements.in`.
 
 ---
 
