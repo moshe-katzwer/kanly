@@ -681,6 +681,8 @@ def nlls_elastic_net_minimize_internal_coordinate_descent(
                 index_rng = np.arange(num_params)[diff_obj > 0]
                 if len(index_rng) == num_params:
                     full_update = True
+                elif len(index_rng) == 0:
+                    break
 
             if selection == 'greedy':
                 grad_sub = np.abs(grad[index_rng])
