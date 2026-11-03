@@ -207,7 +207,7 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
                                   fix_params_arg=None, diff_evolution_past_samples=None, diff_evolution_weight=None,
                                   diff_evolution_jump_cadence=np.inf,
                                   scalar_jitter_bounds=None,
-                                  position=0
+                                  position=0, use_ray_progress=False
                                   ) -> dict:
     """Run a single Adaptive Metropolis–Hastings chain (optionally with DE-MC jumps).
 
@@ -254,7 +254,7 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
             evaluated but discarded.
         pbar_update_cadence: Seconds between progress-bar updates (when ``debug=True``).
         do_adaptive: Whether to adapt the scalar at each iteration.
-        debug: Whether to show a ``tqdm`` progress bar via ``tqdm_ray``.
+        debug: Whether to show a progress bar.
         proposal_df: Degrees of freedom for the proposal distribution.
             Currently only ``np.inf`` (Gaussian) is implemented.
         bloc: Integer bloc/segment identifier appended to the result dict for
@@ -271,6 +271,8 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
         scalar_jitter_bounds: Optional ``(lo, hi)`` tuple for per-step random
             scaling of the proposal; provides extra exploration.
         position: ``tqdm`` bar position (for multi-chain parallel display).
+        use_ray_progress: Use Ray distributed progress bars in parallel workers.
+            Defaults to False so direct/serial calls never import Ray for progress.
 
     Returns:
         Dict with keys: ``'samples'`` (array of shape
@@ -296,8 +298,12 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
         assert 0 < scalar_jitter_bounds[0] < scalar_jitter_bounds[1]
 
     if debug:
-        from ray.experimental import tqdm_ray
-        pbar = tqdm_ray.tqdm(position=position, total=thinning * (n_samples + n_burnin))
+        if use_ray_progress:
+            from ray.experimental.tqdm_ray import tqdm
+        else:
+            from tqdm import tqdm
+        pbar = tqdm(position=position, total=thinning * (n_samples + n_burnin))
+        pbar_count = 0
 
     rand = np.random.RandomState(seed)
 
@@ -483,17 +489,19 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
 
         if debug and time.time() - last_update_time > pbar_update_cadence:
             last_update_time = time.time()
-            pbar.update((itr + 1) - itr0 - pbar._x)
+            pbar.update((itr + 1) - itr0 - pbar_count)
+            pbar_count = (itr + 1) - itr0
             if debug:
                 pbar_str = f'chain {chain_no:2d}, lp = {lp0:8.4e}, accept = {accepted_rate:5.2f}, ' \
                            f'accept_L200 = {np.mean(accepteds[-200:]):5.2f}, scaler = {scaler:6.2e}'
                 pbar.set_description(pbar_str)
 
     if debug:
-        pbar.update((itr + 1) - itr0 - pbar._x)
+        pbar.update((itr + 1) - itr0 - pbar_count)
         pbar_str = f'chain {chain_no:2d}, lp = {lp0:8.4e}, accept = {accepted_rate:5.2f}, ' \
                    f'accept_L200 = {np.mean(accepteds[-200:]):5.2f}, scaler = {scaler:6.2e}'
         pbar.set_description(pbar_str)
+        pbar.close()
 
     np.seterr(**err_settings)
 
@@ -1000,7 +1008,7 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
                 proposal_df, bloc, fix_params_arg,
                 diff_evolution_past_samples_id, diff_evolution_weight if diff_evolution_past_samples is not None else 0,
                 diff_evolution_jump_cadence, scalar_jitter_bounds,
-                position,
+                position, do_parallel,
             )
             for position, (seed, start_params, ch_num, step_cov) in enumerate(
                 zip(rand.randint(0, 100_000, n_chains), x0s_formatted, chain_nos, [step_cov.copy()] * n_chains)
@@ -1225,7 +1233,7 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
                     )]
                     for c in chain_results_master
                 ])
-                if ray.is_initialized():
+                if do_parallel and ray.is_initialized():
                     diff_evolution_past_samples_id = ray.put(diff_evolution_past_samples)
                 else:
                     diff_evolution_past_samples_id = diff_evolution_past_samples
@@ -1295,7 +1303,7 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
     mcmc_time = time.time() - _time_mcmc_draws - _wait_time
     total_time = time.time() - _time_master - _wait_time
 
-    if ray.is_initialized():
+    if do_parallel and ray.is_initialized():
         if debug:
             print('\nShutting down `ray`...', end='')
         ray.shutdown()
