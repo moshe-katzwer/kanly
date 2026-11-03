@@ -976,6 +976,10 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
 
     while True:
 
+        # Capture this block before subchain_cnt advances or a continuation resets it.
+        current_is_burnin = is_burnin_subchain[subchain_cnt]
+        allow_adaptation = current_is_burnin or not stop_adaptation_after_burnin
+
         if normalize_step_cov:
             # todo normalize by something else?
             step_cov_iter, _, _ = normalize_matrix_det(step_cov, not_fixed_param_index, 1.0)
@@ -990,7 +994,7 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
                 subchain_n_burnin_iters[subchain_cnt], subchain_n_samples_iters[subchain_cnt], itr0,
                 target_acceptance_rate, ch_num, draw_size, scaler0, min_scaler, max_scaler, scaler_adjust_rate,
                 scaler_adjust_denom_power, thinning, pbar_update_cadence,
-                do_adaptive and (is_burnin_subchain or not stop_adaptation_after_burnin),
+                do_adaptive and allow_adaptation,
                 debug,
                 # cov_update_frequency, min_unique_draws_for_cov, ridge_epsilon,
                 proposal_df, bloc, fix_params_arg,
@@ -1132,7 +1136,7 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
             window_start=cov_window_start)
 
         step_cov_old = step_cov
-        if is_burnin_subchain[0] or not stop_adaptation_after_burnin:
+        if allow_adaptation:
             # step_cov = step_cov_initial_samples * cov_new_master + (1.0 - step_cov_initial_samples) * step_cov_old
             n_draws = (n_samples_master + n_burnin_master) * n_chains
             # print("WE UPDATED!!!!!", (is_burnin_subchain, not stop_adaptation_after_burnin, 'n_draws', n_draws, step_cov_initial_samples))
@@ -1209,7 +1213,7 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
                 break
 
         if do_diff_evolution_mc:
-            if not stop_adaptation_after_burnin or is_burnin_subchain:
+            if allow_adaptation:
                 diff_evolution_past_samples = np.vstack([
                     c['samples'][rand.randint(
                         low=int(diff_evolution_frac_burnin * len(c['samples'])),
@@ -1238,7 +1242,8 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
         #             df_temp['past_samp'] = np.std(diff_evolution_past_samples, axis=0)
         #         print(df_temp.to_string())
 
-        scaler0 = np.mean([np.mean(c['scalers'][-100:]) for c in chain_results_master])
+        if allow_adaptation:
+            scaler0 = np.mean([np.mean(c['scalers'][-100:]) for c in chain_results_master])
         itr0 = chain_results_master[0]['itr']
 
     cov_params_unbndd, mean_params_unbndd = convert_samples_to_unbounded_space(
