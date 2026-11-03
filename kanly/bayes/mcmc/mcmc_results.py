@@ -281,9 +281,9 @@ class MCMCResults(DillObject):
                     R_hat[i] = np.nan
 
         self.R_hat = pd.Series(R_hat, index=self.param_names)
-        self.max_R_hat = np.nanmax(self.R_hat.max())
-        self.avg_R_hat = np.nanmean(self.R_hat.mean())
-        self.median_R_hat = np.nanmedian(self.R_hat.mean())
+        self.max_R_hat = np.nanmax(self.R_hat)
+        self.avg_R_hat = np.nanmean(self.R_hat)
+        self.median_R_hat = np.nanmedian(self.R_hat)
 
         with np.errstate(divide='ignore', invalid='ignore'):
             std_params = np.diag(self.cov_params) ** .5
