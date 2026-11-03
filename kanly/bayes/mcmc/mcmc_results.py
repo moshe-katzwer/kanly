@@ -1863,15 +1863,16 @@ class MCMCResults(DillObject):
         Returns:
             List of ``n_chains`` arrays, each of shape ``(n_samples, num_params)``.
         """
+        samples = self.sample_df.values
+        burnin_offset = 0 if include_burnin else self.n_burnin
+
         sample_refs = []
         for i in range(self.n_chains):
-            li, hi = (
-                (0 if include_burnin else (i + 1) * self.n_burnin),
-                self.n_iterations * (i + 1)
-            )
-            sample_refs.append(self.sample_df.values[li:hi])
-        if copy:
-            sample_refs = [c.copy() for c in sample_refs]
+            start = i * self.n_iterations + burnin_offset
+            end = (i + 1) * self.n_iterations
+            chain = samples[start:end]
+            sample_refs.append(chain.copy() if copy else chain)
+
         return sample_refs
 
     def geweke(self, frac1=.1, frac2=.5, bm_taus=None, debug=False):
