@@ -840,13 +840,15 @@ class BayesianModel(ParameterCollection):
         step_cov_initial_samples : int, optional
             Delay before first covariance update (defaults from ``n_burnin``).
         fix_params : dict, optional
-            Parameters held fixed at given values.
+            Parameters held fixed at given values, on the same scale as the
+            starting parameters.
         normalize_step_cov : bool
             Reserved; normalize proposal determinant.
         do_diff_evolution_mc : bool
             Mix DE direction proposals with Gaussian noise.
         diff_evolution_past_samples : ndarray, optional
-            Seed DE history (e.g. from MALA warmup in :meth:`sample`).
+            Joint draws in unbounded sampling coordinates, such as the pool
+            from MALA warmup in :meth:`sample`.
         diff_evolution_frac_burnin, diff_evolution_max_draws
             Which past draws enter the DE pool.
         diff_evolution_weight : float
@@ -864,7 +866,7 @@ class BayesianModel(ParameterCollection):
         -------
         MCMCResults
             Chains, acceptance rates, and diagnostics on the original parameter
-            scale after inverse transform.
+            scale after applying the forward transform to the unbounded draws.
 
         Notes
         -----
@@ -970,13 +972,13 @@ class BayesianModel(ParameterCollection):
         max_subchain_draws : int
             Draws before regrouping chains for adaptation.
         fix_params : dict, optional
-            Fixed coordinates.
+            Fixed coordinates supplied on the same scale as ``start_params``.
         specification_name : str, optional
             Run label.
         callback_function : callable, optional
             Per-draw callback.
         tau0 : array_like, optional
-            Initial per-coordinate step sizes.
+            Initial per-coordinate step sizes in unbounded sampling coordinates.
 
         Returns
         -------
@@ -1319,7 +1321,8 @@ class BayesianModel(ParameterCollection):
                                   not something to pay attention to.
             step_cov_initial_samples: if `do_adaptive=True`, the number of draws to wait for before adjusting the proposal
                                       distribution to avoid degeneracy.  Default is None, which resolves to `max(n_burnin // 100, 50)`.
-            fix_params: a dict keyed on parameter names, values as floats, for parameters to "fix" in the estimation, default None
+            fix_params: fixed values on the same scale as `start_params`. Returned
+                        draws and fixed-parameter metadata use the original model scale.
             normalize_step_cov: default False; not currently used, for normalizing determinant of proposal distribution
             do_diff_evolution_mc: default True; flag for whether to do Differential Evolution sampling (True) or straight
                                   Adaptive Metropolis Hastings (False).  With differential evolution, proposal steps are in
@@ -1479,26 +1482,28 @@ class BayesianModel(ParameterCollection):
                 print(fit_mala)
 
             start_params = np.array(fit_mala.get_last_sample(n_chains))
+            # MCMCResults exposes original-scale draws. Match the caller's
+            # scale before AMHA, preserving how fixed parameters are interpreted.
+            if not start_params_is_original_scale:
+                start_params = np.array([self.inv_transform(x) for x in start_params])
             self.check_bounds_satisfied(start_params, start_params_is_original_scale)
-            if do_diff_evolution_mc:
-                diff_evolution_past_samples, step_cov = fit_mala.get_inv_transform_draws(
-                    size=diff_evolution_max_draws, seed=seed)
-            else:
-                diff_evolution_past_samples = None
-                step_cov = fit_mala.other_info['cov_params_unbounded_space']
+            # Both proposals operate in sampling coordinates. Use the full
+            # retained warmup for covariance regardless of the DE pool budget.
+            step_cov = fit_mala.other_info['cov_params_unbounded_space']
+            diff_evolution_past_samples = None
+            if do_diff_evolution_mc and diff_evolution_max_draws >= 2:
+                diff_evolution_past_samples = fit_mala.get_inv_transform_draws(
+                    size=diff_evolution_max_draws, seed=seed, return_cov=False)
 
             if debug:
                 print('\nMALA Warmup fit completed...\n')
                 print('=' * 100)
 
-        if step_cov is not None and np.shape(step_cov) == tuple():
-            step_cov = np.array([[step_cov]])
-
         fit = self.amha(
             start_params, step_cov=step_cov, debug=debug, specification_name=specification_name, n_chains=n_chains,
             n_burnin=n_burnin, n_samples=n_samples, max_processes=max_processes,
             seed=seed, target_acceptance_rate=target_acceptance_rate, draw_size=draw_size,
-            scaler0=None, min_scaler=min_scaler, max_scaler=max_scaler,
+            scaler0=scaler0, min_scaler=min_scaler, max_scaler=max_scaler,
             scaler_adjust_rate=scaler_adjust_rate, thinning=thinning,
             scaler_adjust_denom_power=scaler_adjust_denom_power,
             # resample_k=DEFAULT_AM_RESAMPLE_K, # TODO remove
