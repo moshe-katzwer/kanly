@@ -12,11 +12,12 @@ an individual per-coordinate step size.  The Metropolis acceptance probability
 corrects for the asymmetry of the Langevin proposal kernel, yielding a valid
 reversible Markov chain.
 
-Each coordinate's tau is adapted after every iteration using a simple
+During warm-up, each coordinate's tau is adapted after its updates using a
 stochastic approximation rule aimed at ``target_acceptance_rate``::
 
     tau[coord] *= 1 + tau_adjust * (accepted - target_accept)
 
+Step sizes, DE scale, and the DE history pool are fixed for retained sampling.
 Optionally, periodic Differential Evolution (DE) jumps are applied at
 a cadence ``diff_evolution_step_cadence`` to help escape correlated or
 multimodal regions.
@@ -53,18 +54,19 @@ from kanly.bayes.mcmc.coordinate_mala.constants import (
 from kanly.bayes.mcmc.format_starting_point_for_mcmc import format_starting_point_for_mcmc
 from kanly.bayes.mcmc.diagnostics.diagnostics import get_diagnostic_update_message
 from kanly.bayes.mcmc.mcmc_results import MCMCResults
-from kanly.bayes.parameter_transformations import convert_samples_to_unbounded_space
+from kanly.bayes.parameter_transformations import convert_samples_to_original_space
 from kanly.utils.print_options import print_options
 from kanly.utils.user_prompt_for_more_iters import user_prompt_for_more_iters_method
 
 
+@np.errstate(all='ignore')
 def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=None,
                    thinning=DEFAULT_COORD_MALA_THINNING,
                    target_accept=DEFAULT_COORD_MALA_TARGET_ACCEPTANCE_RATE, do_cauchy=DEFAULT_COORD_MALA_DO_CAUCHY,
                    pbar_update_cadence=DEFAULT_COORD_MALA_P_BAR_UPDATE_CADENCE, do_mala=DEFAULT_COORD_MALA_DO_MALA,
                    debug=False, tau_adjust=DEFAULT_COORD_MALA_TAU_ADJUST, bloc=0, fix_param_set=None,
                    position=0, diff_evolution_step_cadence=DEFAULT_COORD_MALA_DIFF_EVOLUTION_STEP_CADENCE,
-                   past_samples=None, diff_evolution_scale=1.0):
+                   past_samples=None, diff_evolution_scale=1.0, n_warmup=0):
 
     """Run a single coordinate-wise MALA (or random-walk Metropolis) chain.
 
@@ -72,23 +74,24 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
     picks one coordinate at random (excluding fixed parameters), forms
     a Langevin-drift proposal in that coordinate, evaluates the
     Metropolis–Hastings acceptance probability (with the MALA correction
-    for proposal asymmetry), and updates ``tau[coord]`` to steer the
-    per-coordinate acceptance rate toward ``target_accept``.
+    for proposal asymmetry).  During the first ``n_warmup`` stored draws,
+    ``tau[coord]`` is updated to steer the per-coordinate acceptance rate
+    toward ``target_accept``.  Proposal tuning is fixed afterward.
 
     Optionally, every ``diff_evolution_step_cadence`` iterations a
     full-dimensional DE jump is attempted instead of a coordinate update.
 
     Args:
-        lp_func: Callable ``lp_func(x)`` → scalar log-posterior (including
-            Jacobian adjustment if supplied via ``lp_adj_func``).
+        lp_func: Log-posterior evaluated at the model parameters corresponding
+            to the unbounded vector x, before adding the Jacobian adjustment.
         lp_adj_func: Optional callable returning the Jacobian log-determinant
-            of the bounded→unbounded transform.  Treated as zero when ``None``.
+            of the map from unbounded x to the original model parameters.  Treated as zero when ``None``.
         x0_start: Starting parameter vector (1-D array-like).
         seed: Integer random seed for ``numpy.random.RandomState``.
         n_samples: Number of thinned draws to store.
         tau_start: Initial per-coordinate step sizes (1-D array of length
             ``num_params``).  Defaults to ``1e-4`` for all coordinates when ``None``.
-        thinning: Store every ``thinning``-th iteration.
+        thinning: Store after every ``thinning`` iterations.
         target_accept: Desired per-coordinate acceptance rate for adaptation.
         do_cauchy: Whether to use a Cauchy (instead of Gaussian) innovation;
             the Langevin correction is adjusted accordingly.
@@ -105,10 +108,13 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
             full-dimensional DE jump instead of a coordinate MALA step.
             ``None`` or ``0`` disables DE jumps.
         past_samples: Optional pre-supplied 2-D array of past draws used as
-            the DE gene pool.  When ``None``, draws from the current chain's
-            history are used.
+            a fixed DE gene pool.  When ``None``, only this call's warm-up
+            draws are used; retained draws never enter the pool.  DE is
+            skipped until at least two pool rows are available.
         diff_evolution_scale: Initial global scalar for the DE jump size;
-            adapted using a 0.234-target rule after each DE step.
+            adapted using a 0.234-target rule during warm-up only.
+        n_warmup: Number of the ``n_samples`` stored draws reserved for
+            adaptation.  Defaults to zero (fixed-proposal sampling).
 
     Returns:
         Dict with keys: ``'samples'`` (2-D array of shape ``(n_samples, p)``),
@@ -122,20 +128,40 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
     if lp_adj_func is None:
         lp_adj_func = lambda x: 0.0
 
-    err_settings = np.seterr()
-    np.seterr(all='ignore')
-
-    x0 = np.array(x0_start).astype(float)
+    x0 = np.array(x0_start, dtype=float, copy=True)
+    if x0.ndim != 1 or not len(x0) or not np.all(np.isfinite(x0)):
+        raise ValueError('x0_start must be a nonempty finite one-dimensional vector')
+    p = len(x0)
+    if not isinstance(n_samples, (int, np.integer)) or n_samples < 0:
+        raise ValueError('n_samples must be a nonnegative integer')
+    if not isinstance(thinning, (int, np.integer)) or thinning < 1:
+        raise ValueError('thinning must be a positive integer')
+    if not isinstance(n_warmup, (int, np.integer)) or not 0 <= n_warmup <= n_samples:
+        raise ValueError('n_warmup must be an integer between zero and n_samples')
+    tau = np.full(p, 1e-4) if tau_start is None else np.array(tau_start, dtype=float, copy=True)
+    if tau.shape != (p,) or not np.all(np.isfinite(tau)) or np.any(tau <= 0):
+        raise ValueError('tau_start must contain one positive finite step size per parameter')
+    if not np.isfinite(target_accept) or not 0 <= target_accept <= 1:
+        raise ValueError('target_accept must be between zero and one')
+    if not np.isfinite(tau_adjust) or tau_adjust < 0 or tau_adjust * target_accept >= 1:
+        raise ValueError('tau_adjust must be finite, nonnegative, and preserve positive step sizes')
+    if not np.isfinite(diff_evolution_scale) or diff_evolution_scale <= 0:
+        raise ValueError('diff_evolution_scale must be positive and finite')
+    if past_samples is not None:
+        past_samples = np.array(past_samples, dtype=float, copy=True)
+        if past_samples.ndim != 2 or past_samples.shape[1] != p or not np.all(np.isfinite(past_samples)):
+            raise ValueError('past_samples must be a finite two-dimensional array with one column per parameter')
 
     last_update_time = 0
 
     def deriv_lp(i, value, f0=None, dx=1e-6):
         """Compute the finite-difference partial derivative of the log-posterior at coordinate ``i``.
 
-        Uses a relative step size ``di = max(|value[i]| * dx, 1e-12)`` to
-        avoid numerical issues near zero.  The adjustment log-determinant is
-        included in the evaluation at ``value1`` so the gradient reflects the
-        full adjusted log-posterior.
+        Uses a forward difference where finite, a backward difference at a
+        support boundary, and zero drift if neither finite difference is
+        available.  This same deterministic rule is used in both proposal
+        densities of the Hastings correction.  The Jacobian adjustment is
+        included in every evaluation.
 
         Args:
             i: Coordinate index at which to differentiate.
@@ -148,16 +174,19 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
             Scalar finite-difference estimate of ``d/dx_i log_π(value)``.
         """
         if f0 is None:
-            f0 = lp_func(value)
+            f0 = lp_func(value) + lp_adj_func(value)
         di = max(min(np.abs(value[i]), 1.) * dx, 1e-12)
         value1 = np.array(value)
         value1[i] += di
         fi = lp_func(value1) + lp_adj_func(value1)
 
         val = (fi - f0) / di
-        return val
-
-    p = len(x0)
+        if np.isfinite(val):
+            return val
+        value1[i] = value[i] - di
+        fi = lp_func(value1) + lp_adj_func(value1)
+        val = (f0 - fi) / di
+        return val if np.isfinite(val) else 0.0
 
     rand = np.random.RandomState(seed)
     if fix_param_set:
@@ -173,16 +202,13 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
     else:
         rand_innovation = rand.randn(n_samples * thinning)
 
-    if tau_start is None:
-        tau = np.full(p, 1e-4)
-    else:
-        tau = np.array(tau_start, copy=True)
-
     draws = np.zeros((n_samples, p))
     log_posteriors = np.zeros(n_samples)
 
     lp0 = lp_func(x0)
     lp_adj0 = lp_adj_func(x0)
+    if not np.isfinite(lp0 + lp_adj0):
+        raise ValueError('Starting point must have a finite adjusted log-posterior')
 
     num_tries = np.zeros(p)
     num_accepted = np.zeros(p)
@@ -197,30 +223,32 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
 
     for itr, (coord, innov, log_uniform) in enumerate(zip(rand_coord, rand_innovation, rand_log_uniform)):
 
-        if diff_evolution_step_cadence and itr >= 100 and itr % diff_evolution_step_cadence == 0:
-            # differential evolution step:
+        adapting = itr < n_warmup * thinning
+        if past_samples is None:
+            # Only completed warm-up draws can enter the proposal pool.
+            # Once warm-up ends, both slice limits stay fixed.
+            history_end = min(itr // thinning, n_warmup)
+            de_pool = draws[history_end // 2:history_end]
+        else:
+            de_pool = past_samples
 
-            if past_samples is None:
-                rnd_draw_idx = rand.randint(int(1 / 2 * itr / thinning), itr // thinning, size=2)
-                direction = draws[rnd_draw_idx[0]] - draws[rnd_draw_idx[1]]
-            else:
-                draw_past_bool = rand.rand(2) < .8
-                draws_past = [
-                    past_samples[rand.randint(len(past_samples))]
-                    if d else
-                    draws[rand.randint(int(1 / 2 * itr / thinning), itr // thinning)]
-                    for d in draw_past_bool
-                ]
-                direction = draws_past[1] - draws_past[0]
+        if (diff_evolution_step_cadence and itr >= 100
+                and itr % diff_evolution_step_cadence == 0 and len(de_pool) >= 2):
+            # differential evolution step:
+            rnd_draw_idx = rand.randint(len(de_pool), size=2)
+            direction = de_pool[rnd_draw_idx[0]] - de_pool[rnd_draw_idx[1]]
+            if fix_param_set:
+                direction[list(fix_param_set)] = 0.0
 
             x1 = x0 + diff_evolution_scale * direction
             lp1 = lp_func(x1)
             lp_adj1 = lp_adj_func(x1)
 
-            accepted = int(log_uniform < lp1 + lp_adj1 - (lp0 + lp_adj0))
+            accepted = int(np.isfinite(lp1 + lp_adj1) and log_uniform < lp1 + lp_adj1 - (lp0 + lp_adj0))
             if accepted:
                 x0, lp0, lp_adj0 = x1, lp1, lp_adj1
-            diff_evolution_scale *= (1 + .05 * (accepted - .234))
+            if adapting:
+                diff_evolution_scale *= (1 + .05 * (accepted - .234))
 
         else:
             # coordinate mala step
@@ -236,7 +264,7 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
             lp_adj1 = lp_adj_func(x1)
 
             accepted = 0
-            if np.isfinite(lp1):
+            if np.isfinite(lp1 + lp_adj1):
 
                 if do_mala:
                     deriv1 = deriv_lp(coord, x1, f0=lp1 + lp_adj1)
@@ -269,19 +297,13 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
                     x0, lp0, lp_adj0 = x1, lp1, lp_adj1
                     accepted = 1
 
-            # not_burned_in = still_burnin and (np.any(num_accepted < 100) or np.any(num_tries - num_accepted < 100))
-            # if itr < thinning * n_burnin or not_burned_in:
-            tau[coord] *= 1 + tau_adjust * (accepted - target_accept)
-
-            # if still_burnin and not not_burned_in:
-            #     still_burnin = False
-            #     if debug:
-            #         print('burn in end at itr ', itr)
+            if adapting:
+                tau[coord] *= 1 + tau_adjust * (accepted - target_accept)
 
             num_tries[coord] += 1
             num_accepted[coord] += accepted
 
-        if itr % thinning == 0:
+        if (itr + 1) % thinning == 0:
             draws[itr // thinning] = x0
             log_posteriors[itr // thinning] = lp0
 
@@ -292,12 +314,11 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
                 pbar.set_description(
                     f'lp = {lp0:8.4e}, coord = {coord:3d}, tau = {tau[coord]:6.2e}, accept = {num_accepted[coord] / num_tries[coord]:6.3e}')
 
-    np.seterr(**err_settings)
-
     return {
         'settings': {
             'seed': seed,
             'n_samples': n_samples,
+            'n_warmup': n_warmup,
             'thinning': thinning,
             'target_accept': target_accept,
             'x0_start': x0_start,
@@ -344,7 +365,7 @@ def get_past_samples(chain_results_master, rand, n_chains, diff_evolution_frac_b
 
     Returns:
         2-D array of shape approximately ``(diff_evolution_max_draws, num_params)``
-        containing randomly selected post-warm-up draws from all chains.
+        containing randomly selected late warm-up draws from all chains.
     """
     return np.vstack(
         [
@@ -392,12 +413,13 @@ def mala(log_posterior, start_params, seed=0,
        ``format_starting_point_for_mcmc``, applying any bounded-to-unbounded
        transformations.
     2. Splits the total draw count into sub-chains of at most
-       ``max_subchain_draws`` draws so that Ray tasks stay responsive and the
-       per-coordinate tau values and DE pool can be updated between runs.
+       ``max_subchain_draws`` draws, with a separate boundary at the end of
+       warm-up. Tau, DE scale, and the DE history pool are adapted only during
+       warm-up and remain fixed throughout retained sampling.
     3. Dispatches each sub-chain to all chains in parallel via Ray.
-    4. After each sub-chain merges results, updates the DE past-sample pool,
-       re-computes the starting states, and (when ``debug=True``) prints a
-       convergence summary.
+    4. After each sub-chain merges results, updates the starting states and,
+       during warm-up only, the DE past-sample pool. When ``debug=True`` it
+       prints a convergence summary.
     5. When ``user_prompt_for_more_iters=True``, asks the user whether to
        continue sampling after all sub-chains complete.
     6. Assembles the final ``MCMCResults`` object.
@@ -410,7 +432,7 @@ def mala(log_posterior, start_params, seed=0,
             or list of 1-D arrays.
         seed: Base integer random seed; per-chain seeds are derived from this.
         log_posterior_jacobian_adjustment: Optional callable returning the
-            Jacobian log-determinant of the bounded→unbounded transform.
+            Jacobian log-determinant of the map from unbounded x to the original model parameters.
         start_params_is_original_scale: When ``True`` (default), starting
             values are in the original (bounded) space and are transformed
             before sampling.
@@ -420,8 +442,10 @@ def mala(log_posterior, start_params, seed=0,
         specification_name: Optional display label for the model run.
         n_chains: Number of parallel MCMC chains.
         n_samples: Total number of draws to collect per chain (including burn-in).
-        frac_burnin: Fraction of draws to classify as burn-in in the
-            ``MCMCResults`` object (e.g. 0.25 → first 25% discarded).
+        frac_burnin: Fraction of the initially requested draws used for
+            adaptation and discarded as burn-in (e.g. 0.25 → first 25%).
+            Must be in [0, 1). Additional draws requested interactively use
+            the frozen proposal and do not increase this burn-in count.
         thinning: Store every ``thinning``-th iteration.
         target_acceptance_rate: Per-coordinate target acceptance rate for
             adapting ``tau``.
@@ -439,8 +463,10 @@ def mala(log_posterior, start_params, seed=0,
         diff_evolution_step_cadence: Interval (in iterations) for DE jumps.
             ``None`` or ``0`` disables DE jumps.
         max_subchain_draws: Maximum draws per sub-chain.
-        diff_evolution_frac_burnin: Fraction of chain history to skip when
+        diff_evolution_frac_burnin: Fraction of warm-up history to skip when
             building the DE pool (avoids including early warm-up draws).
+            The pool is frozen when warm-up ends. Without warm-up, DE is
+            disabled because no history pool is available.
         diff_evolution_max_draws: Maximum DE pool size.
         callback_function: Optional callable invoked after each sub-chain
             with the current chain results dict; useful for checkpointing.
@@ -481,6 +507,25 @@ def mala(log_posterior, start_params, seed=0,
     """
 
     time_start = time.time()
+
+    for name, value in [('n_samples', n_samples), ('max_subchain_draws', max_subchain_draws)]:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value <= 0:
+            raise ValueError(f'{name} must be a positive integer')
+    if not np.isfinite(frac_burnin) or not 0 <= frac_burnin < 1:
+        raise ValueError('frac_burnin must be finite and in [0, 1)')
+    if diff_evolution_step_cadence:
+        if not np.isfinite(diff_evolution_frac_burnin) or not 0 <= diff_evolution_frac_burnin < 1:
+            raise ValueError('diff_evolution_frac_burnin must be finite and in [0, 1)')
+        if (isinstance(diff_evolution_max_draws, (bool, np.bool_))
+                or not isinstance(diff_evolution_max_draws, (int, np.integer))
+                or diff_evolution_max_draws <= 0):
+            raise ValueError('diff_evolution_max_draws must be a positive integer')
+
+    n_burnin = int(frac_burnin * n_samples)
+
+    def split_draws(count):
+        return [min(max_subchain_draws, count - start)
+                for start in range(0, count, max_subchain_draws)]
 
     if debug:
         print("------------------------------------------------------")
@@ -559,19 +604,24 @@ def mala(log_posterior, start_params, seed=0,
     if debug:
         print(f"Done! ({time.time() - t_put:.2f}s)")
 
-    n_samples_split_list = [max_subchain_draws] * (n_samples // max_subchain_draws) + [n_samples % max_subchain_draws]
+    # No block may straddle the warm-up boundary. This also avoids empty
+    # blocks when a requested draw count is exactly divisible by the limit.
+    n_samples_split_list = split_draws(n_burnin) + split_draws(n_samples - n_burnin)
+    n_completed = 0
 
     if tau0 is None:
         tau_start = None
-    elif isinstance(tau0, (int, float)):
-        tau_start = np.array([tau0]*num_params).astype(float)
+    elif np.ndim(tau0) == 0:
+        tau_start = np.full(num_params, tau0, dtype=float)
     else:
-        tau_start = np.array(tau0)
+        tau_start = np.array(tau0, dtype=float)
 
+    interrupted = False
     while True:
 
         for n_samples_bloc in n_samples_split_list:
             bloc += 1
+            n_warmup_bloc = min(n_samples_bloc, max(n_burnin - n_completed, 0))
 
             # print(str({'bloc': bloc, 'n_samples': n_samples_bloc}))
 
@@ -584,7 +634,7 @@ def mala(log_posterior, start_params, seed=0,
                         do_cauchy,
                         pbar_update_cadence, do_mala, debug, tau_adjust, bloc,
                         fix_param_idx, pos, diff_evolution_step_cadence,
-                        past_samples_id, diff_evolution_scale
+                        past_samples_id, diff_evolution_scale, n_warmup_bloc
                     )
                     for pos, (start_params, seed_chain) in enumerate(zip(x0s_formatted, rand.randint(0, 3_000_000, n_chains)))
                 ]
@@ -598,8 +648,7 @@ def mala(log_posterior, start_params, seed=0,
 
             except KeyboardInterrupt:
                 warnings.warn("\n\nKeyboard Interrupt! Stopping draws.\n\n")
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
+                interrupted = True
                 ray.shutdown()
                 break
             except Exception as e:
@@ -609,6 +658,7 @@ def mala(log_posterior, start_params, seed=0,
                 raise e
 
             outer_cnt += 1
+            n_completed += n_samples_bloc
 
             if chain_results_master is None:
                 chain_results_master = chain_results
@@ -629,7 +679,7 @@ def mala(log_posterior, start_params, seed=0,
                     old['acceptance_rate'] = old['num_accepted'] / np.clip(old['num_tries'], 1, np.inf)
                     old['acceptance_rate'][old['num_tries'] == 0] = np.nan
 
-                    for k in ['n_samples']:
+                    for k in ['n_samples', 'n_warmup']:
                         old['settings'][k] += new['settings'][k]
 
                     old['samples'] = np.vstack([old['samples'], new['samples']])
@@ -637,15 +687,17 @@ def mala(log_posterior, start_params, seed=0,
                     del new['samples']
 
             x0s_formatted = [C['samples'][-1] for C in chain_results_master]
-            tau_start = np.mean([c['tau'] for c in chain_results_master], axis=0)
-            diff_evolution_scale = np.mean([c['diff_evolution_scale'] for c in chain_results_master])
+            if n_warmup_bloc:
+                tau_start = np.mean([c['tau'] for c in chain_results_master], axis=0)
+                diff_evolution_scale = np.mean([c['diff_evolution_scale'] for c in chain_results_master])
 
-            past_samples = get_past_samples(
-                chain_results_master, rand, n_chains, diff_evolution_frac_burnin, diff_evolution_max_draws)
-            if ray.is_initialized():
-                past_samples_id = ray.put(past_samples)
-            else:
-                past_samples_id = past_samples
+                if diff_evolution_step_cadence:
+                    past_samples = get_past_samples(
+                        chain_results_master, rand, n_chains, diff_evolution_frac_burnin, diff_evolution_max_draws)
+                    if ray.is_initialized():
+                        past_samples_id = ray.put(past_samples)
+                    else:
+                        past_samples_id = past_samples
 
             if debug:
                 message = get_diagnostic_update_message(
@@ -656,9 +708,10 @@ def mala(log_posterior, start_params, seed=0,
 
                 print(message)
 
-        if user_prompt_for_more_iters:
+        if interrupted:
+            break
 
-            tau_start = np.mean([c['tau'] for c in chain_results_master], axis=0)
+        if user_prompt_for_more_iters:
 
             message = get_diagnostic_update_message(
                 chain_results_master, param_names, n_chains, time_start, time_start, transformation_function,
@@ -668,29 +721,31 @@ def mala(log_posterior, start_params, seed=0,
 
             n_samples_new = user_prompt_for_more_iters_method(message, do_prompt=True, assert_even=True)
 
-            if n_samples_new <= 0 or n_samples_new is None or n_samples_new == '':
+            if n_samples_new is None or n_samples_new == '' or n_samples_new <= 0:
                 break
 
-            n_samples_split_list = ([max_subchain_draws] * (n_samples_new // max_subchain_draws) \
-                               + [n_samples_new % max_subchain_draws])
+            n_samples_split_list = split_draws(n_samples_new)
 
             x0s_formatted = [C['samples'][-1] for C in chain_results_master]
 
         else:
             break
 
+    if interrupted and (chain_results_master is None or n_completed <= n_burnin):
+        raise RuntimeError('MALA interrupted before any post-warmup draws were collected')
+
     for c in chain_results_master:
         c['accepteds'] = np.mean(c['num_accepted'][c['num_tries'] > 0] / c['num_tries'][c['num_tries'] > 0])
 
     num_samps = len(chain_results_master[0]['samples'])
 
-    cov_params_unbndd, mean_params_unbndd = convert_samples_to_unbounded_space(
-        chain_results_master, transformations, num_params, debug=debug, key='samples', window_start=num_samps // 4)
+    cov_params_unbndd, mean_params_unbndd = convert_samples_to_original_space(
+        chain_results_master, transformations, num_params, debug=debug, key='samples', window_start=n_burnin)
 
     options_dict = dict(
         method=CD_MALA_METHOD,
         seed=seed, do_adaptive=True, x0=start_params.copy(), n_chains=n_chains,
-        n_samples=n_samples, thinning=thinning, frac_burnin=frac_burnin,
+        n_samples=num_samps, n_burnin=n_burnin, thinning=thinning, frac_burnin=frac_burnin,
         # resample_k=resample_k,
         target_accept_rate=target_acceptance_rate, do_cauchy=do_cauchy, do_mala=do_mala,
         x0_is_original_scale=start_params_is_original_scale, debug=debug,
@@ -703,7 +758,7 @@ def mala(log_posterior, start_params, seed=0,
         tau0=tau0,
     )
     other_info = dict(
-        tau_final=tau_start,
+        tau_final=np.mean([c['tau'] for c in chain_results_master], axis=0),
         cov_params_unbounded_space=cov_params_unbndd,
         mean_params_unbounded_space=mean_params_unbndd
     )
@@ -720,7 +775,7 @@ def mala(log_posterior, start_params, seed=0,
         num_params, log_posterior, log_posterior_jacobian_adjustment=log_posterior_jacobian_adjustment,
         param_names=param_names, chain_results=chain_results_master,
         mcmc_time=time.time() - time_start,
-        n_burnin=int(frac_burnin * num_samps), n_chains=n_chains, thinning=thinning, options=options_dict,
+        n_burnin=n_burnin, n_chains=n_chains, thinning=thinning, options=options_dict,
         specification_name=specification_name,
         debug=debug, model=model, fix_params=fix_params, other_info=other_info,
         transformations=transformations
