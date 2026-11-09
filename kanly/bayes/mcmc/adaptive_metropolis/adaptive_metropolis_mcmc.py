@@ -46,7 +46,7 @@ from kanly.bayes.mcmc.check_starting_point import check_starting_point
 from kanly.bayes.mcmc.diagnostics.diagnostics import get_diagnostic_update_message
 from kanly.bayes.mcmc.format_starting_point_for_mcmc import format_starting_point_for_mcmc
 from kanly.bayes.mcmc.mcmc_results import MCMCResults
-from kanly.bayes.parameter_transformations import convert_samples_to_unbounded_space
+from kanly.bayes.parameter_transformations import convert_samples_to_original_space
 from kanly.utils.print_options import print_options
 from kanly.utils.user_prompt_for_more_iters import user_prompt_for_more_iters_method
 
@@ -111,39 +111,49 @@ def normalize_matrix_det(V, not_fixed_param_index=None, normalizer_value=1.0):
 
 
 def make_pos_semidef(step_cov):
-    """Ensure a covariance matrix is positive semi-definite by diagonal perturbation.
+    """Return a finite, symmetric positive-definite proposal covariance.
 
-    Repeatedly attempts a Cholesky factorization of ``step_cov``.  On failure
-    (``LinAlgError``) adds a small identity multiple to the diagonal, growing
-    the increment by 1.5× each attempt until the factorization succeeds.
-    Scalar (0-D array) inputs are handled as a degenerate 1×1 case.
+    Scalar inputs become 1×1 matrices, including zero, which receives a
+    positive diagonal perturbation.  Singular or indefinite matrices are
+    shifted above their smallest eigenvalue.  Invalid shapes and non-finite
+    values are rejected instead of entering an unbounded repair loop.
 
     Args:
         step_cov: Covariance matrix (2-D NumPy array) or scalar to repair.
 
     Returns:
-        Positive semi-definite version of ``step_cov``, possibly with small
+        Positive-definite version of ``step_cov``, possibly with small
         diagonal additions.
     """
-    # Make a matrix positive semidefinite by adding to it's diagonal
-    is_pos_def = False
-    incr = 1e-6
+    step_cov = np.array(step_cov, dtype=float, copy=True)
+    if step_cov.ndim == 0:
+        step_cov = step_cov.reshape(1, 1)
+    if step_cov.ndim != 2 or not len(step_cov) or step_cov.shape[0] != step_cov.shape[1]:
+        raise ValueError('step_cov must be a scalar or a nonempty square covariance matrix')
+    if not np.all(np.isfinite(step_cov)):
+        raise ValueError('step_cov must contain only finite values')
+    if not np.allclose(step_cov, step_cov.T, rtol=1e-10, atol=1e-12):
+        raise ValueError('step_cov must be symmetric')
+    step_cov = step_cov / 2.0 + step_cov.T / 2.0
+    try:
+        np.linalg.cholesky(step_cov)
+        return step_cov
+    except np.linalg.LinAlgError:
+        pass
 
-    if np.shape(step_cov) == tuple():
-        if step_cov < 0:
-            step_cov = np.array([[incr]])
-
-    else:
-        while not is_pos_def:
-            try:
-                np.linalg.cholesky(step_cov)
-                is_pos_def = True
-                break
-            except np.linalg.LinAlgError:
-                step_cov = step_cov + np.diag([incr] * len(step_cov))
-                incr *= 1.5
-
-    return step_cov
+    min_eigenvalue = np.linalg.eigvalsh(step_cov)[0]
+    scale = max(1.0, np.max(np.abs(step_cov)))
+    ridge = max(1e-6, 10 * np.finfo(float).eps * scale)
+    for _ in range(10):
+        repaired = step_cov + np.eye(len(step_cov)) * (max(0.0, -min_eigenvalue) + ridge)
+        if not np.all(np.isfinite(repaired)):
+            break
+        try:
+            np.linalg.cholesky(repaired)
+            return repaired
+        except np.linalg.LinAlgError:
+            ridge *= 10
+    raise ValueError('step_cov could not be repaired to a finite positive-definite matrix')
 
 
 def _acceptance_choice(x0, x1, lp0, lp1, lp_adj0, lp_adj1, uniform_draw):
@@ -170,7 +180,7 @@ def _acceptance_choice(x0, x1, lp0, lp1, lp_adj0, lp_adj1, uniform_draw):
         ``min(0, lp_gap)``.
     """
 
-    if not np.isfinite(lp1):
+    if not (np.isfinite(lp1) and np.isfinite(lp_adj1) and np.isfinite(lp1 + lp_adj1)):
         accepted_bool = False
         log_acceptance_prob = -np.inf
 
@@ -193,6 +203,7 @@ def _acceptance_choice(x0, x1, lp0, lp1, lp_adj0, lp_adj1, uniform_draw):
     return x_new, lp_new, lp_adj_new, accepted_bool, log_acceptance_prob
 
 
+@np.errstate(all='ignore')
 def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posterior_jacobian_adjustment=None,
                                   n_burnin=DEFAULT_AM_N_BURNIN, n_samples=DEFAULT_AM_N_SAMPLES, itr0=0,
                                   target_acceptance_rate=DEFAULT_AM_TARGET_ACCEPTANCE_RATE, chain_no=None,
@@ -228,10 +239,10 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
             the unbounded/transformed parameter space.
         x0: Starting parameter vector (1-D array-like).
         step_cov: Initial proposal covariance matrix (NumPy array).  A scalar
-            ``0`` is treated as a 1×1 case; the matrix is repaired to positive
-            semi-definite by ``make_pos_semidef`` if needed.
+            is interpreted as an isotropic covariance; the matrix is repaired
+            to positive-definite by ``make_pos_semidef`` if needed.
         log_posterior_jacobian_adjustment: Optional callable that returns the
-            log-determinant of the Jacobian of the bounded→unbounded transform;
+            log absolute Jacobian determinant from sampling to original coordinates;
             ``None`` disables the adjustment.
         n_burnin: Number of burn-in iterations to run (draws are stored but
             excluded from the effective sample).
@@ -250,7 +261,7 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
         scaler_adjust_rate: Learning rate for the scaler adaptation rule.
         scaler_adjust_denom_power: Exponent applied to the iteration count in
             the diminishing-adaptation denominator.
-        thinning: Store every ``thinning``-th draw; the remaining draws are
+        thinning: Store after each ``thinning`` transitions; remaining draws are
             evaluated but discarded.
         pbar_update_cadence: Seconds between progress-bar updates (when ``debug=True``).
         do_adaptive: Whether to adapt the scalar at each iteration.
@@ -284,6 +295,26 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
     """
     __time_chn_master = time.time()
 
+    for name, value in [('n_burnin', n_burnin), ('n_samples', n_samples), ('itr0', itr0)]:
+        if not isinstance(value, (int, np.integer)) or value < 0:
+            raise ValueError(name + ' must be a nonnegative integer')
+    for name, value in [('draw_size', draw_size), ('thinning', thinning)]:
+        if not isinstance(value, (int, np.integer)) or value < 1:
+            raise ValueError(name + ' must be a positive integer')
+
+    x0 = np.array(x0, dtype=float).flatten().copy()
+    num_params = len(x0)
+    if not num_params or not np.all(np.isfinite(x0)):
+        raise ValueError('x0 must contain finite starting parameters')
+    if diff_evolution_past_samples is not None:
+        diff_evolution_past_samples = np.array(diff_evolution_past_samples, dtype=float, copy=True)
+        if (diff_evolution_past_samples.ndim != 2
+                or diff_evolution_past_samples.shape[1] != num_params
+                or not np.all(np.isfinite(diff_evolution_past_samples))):
+            raise ValueError('diff_evolution_past_samples must be a finite matrix with one column per parameter')
+        if len(diff_evolution_past_samples) < 2:
+            diff_evolution_past_samples = None
+
     do_diff_evolution = diff_evolution_past_samples is not None
     if not do_diff_evolution:
         diff_evolution_jump_cadence = None
@@ -311,11 +342,12 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
     #     resample_k = np.inf
 
     do_lp_adjustment = log_posterior_jacobian_adjustment is not None
-    x0 = np.array(x0, dtype=float).flatten().copy()
-    num_params = len(x0)
-
-    step_cov0 = step_cov.copy()
+    step_cov0 = np.array(step_cov, dtype=float, copy=True)
+    if step_cov0.ndim == 0:
+        step_cov = np.eye(num_params) * step_cov0
     step_cov = make_pos_semidef(step_cov)
+    if step_cov.shape != (num_params, num_params):
+        raise ValueError('step_cov must have one row and column per parameter')
 
     if max_scaler is None:
         max_scaler = DEFAULT_AM_MAX_SCALER
@@ -353,8 +385,8 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
     lp0 = log_posterior(x0)
     lp_adj0 = log_posterior_jacobian_adjustment(x0) if do_lp_adjustment else 0.0
 
-    if not np.all(np.isfinite(lp0)) or np.any(np.isnan(lp0)):
-        raise Exception('Starting point must generating finite log-posterior!')
+    if not (np.isfinite(lp0) and np.isfinite(lp_adj0) and np.isfinite(lp0 + lp_adj0)):
+        raise ValueError('Starting point must have a finite adjusted log-posterior')
 
     last_update_time = 0
     # last_update_cov = itr0 + 1
@@ -372,7 +404,7 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
         raise NotImplementedError
         # rand_dist = multivariate_t(loc=[0.0] * num_params, shape=step_cov.copy(), df=proposal_df)
 
-    draw_generator = (d for d in rand_dist.rvs(random_state=rand, size=draw_size))
+    draw_generator = iter(np.asarray(rand_dist.rvs(random_state=rand, size=draw_size)).reshape(draw_size, num_params))
     # draw_generator = (d for d in rand.multivariate_normal(mean=[0.0] * num_params, cov=step_cov.copy(), size=draw_size))
     draw_time += time.time() - _t_draw
 
@@ -381,9 +413,6 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
     # S2 = 0.0
     # S1 = 0.0
 
-    err_settings = np.seterr()
-    np.seterr(all='ignore')
-
     setup_time = time.time() - __time_chn_master
 
     accept = 0
@@ -391,7 +420,7 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
     log_acceptance_probs = []
     scalers = []
 
-    itr = 0
+    itr = itr0 - 1
 
     log_random_uniform = np.log(rand.rand(thinning * (n_samples + n_burnin)))
 
@@ -424,8 +453,8 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
         _t_draw = time.time()
         try:
             am_draw_next = next(draw_generator)
-        except:
-            draw_generator = (d for d in rand_dist.rvs(random_state=rand, size=draw_size))
+        except StopIteration:
+            draw_generator = iter(np.asarray(rand_dist.rvs(random_state=rand, size=draw_size)).reshape(draw_size, num_params))
             # draw_generator = (d for d in rand.multivariate_normal(mean=[0.0] * num_params, cov=step_cov.copy(), size=draw_size))
             am_draw_next = next(draw_generator)
 
@@ -470,7 +499,7 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
         accepteds.append(accepted_bool)
         log_acceptance_probs.append(log_acceptance_prob)
 
-        if itr % thinning == 0:
+        if (itr - itr0 + 1) % thinning == 0:
             draws_nc[(itr - itr0) // thinning] = x0
             log_posterior_arr[(itr - itr0) // thinning] = lp0
 
@@ -502,8 +531,6 @@ def run_adaptive_metropolis_chain(seed, log_posterior, x0, step_cov, log_posteri
                    f'accept_L200 = {np.mean(accepteds[-200:]):5.2f}, scaler = {scaler:6.2e}'
         pbar.set_description(pbar_str)
         pbar.close()
-
-    np.seterr(**err_settings)
 
     log_acceptance_probs = np.array(log_acceptance_probs, dtype=float)
 
@@ -569,21 +596,22 @@ def get_subchain_n_draws(n_burnin, n_samples, max_subchain_draws_burnin=5_000, m
         list flagging burn-in sub-chains, and ``subchain_cnt`` is initialized
         to 0 as a running counter.
     """
-    n_sub_chains_burnin = max(n_burnin // max_subchain_draws_burnin, n_burnin > 0)
-    subchain_n_burnin_iters = [max_subchain_draws_burnin * (
-            n_burnin >= max_subchain_draws_burnin)] * n_sub_chains_burnin
-    if n_burnin:
-        if n_burnin % max_subchain_draws_burnin:
-            if n_burnin > max_subchain_draws_burnin:
-                n_sub_chains_burnin += 1
-                subchain_n_burnin_iters.append(0)
-            subchain_n_burnin_iters[-1] += n_burnin % max_subchain_draws_burnin
+    for name, value in [('n_burnin', n_burnin), ('n_samples', n_samples)]:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < 0:
+            raise ValueError(f'{name} must be a nonnegative integer')
+    for name, value in [('max_subchain_draws_burnin', max_subchain_draws_burnin),
+                        ('max_subchain_draws_sample', max_subchain_draws_sample)]:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value <= 0:
+            raise ValueError(f'{name} must be a positive integer')
+    if n_burnin + n_samples == 0:
+        raise ValueError('At least one burn-in or sample draw must be requested')
 
-    n_sub_chains_samples = max(n_samples // max_subchain_draws_sample, n_samples > 0)
-    subchain_n_samples_iters = [max_subchain_draws_sample * (
-                n_samples >= max_subchain_draws_sample)] * n_sub_chains_samples
-    if n_samples:
-        subchain_n_samples_iters[-1] += n_samples % max_subchain_draws_sample
+    subchain_n_burnin_iters = [min(max_subchain_draws_burnin, n_burnin - start)
+                              for start in range(0, n_burnin, max_subchain_draws_burnin)]
+    subchain_n_samples_iters = [min(max_subchain_draws_sample, n_samples - start)
+                               for start in range(0, n_samples, max_subchain_draws_sample)]
+    n_sub_chains_burnin = len(subchain_n_burnin_iters)
+    n_sub_chains_samples = len(subchain_n_samples_iters)
 
     n_subchains = n_sub_chains_burnin + n_sub_chains_samples
     subchain_n_burnin_iters = subchain_n_burnin_iters + [0] * n_sub_chains_samples
@@ -593,6 +621,28 @@ def get_subchain_n_draws(n_burnin, n_samples, max_subchain_draws_burnin=5_000, m
     subchain_cnt = 0
 
     return n_subchains, subchain_n_burnin_iters, subchain_n_samples_iters, is_burnin_subchain, subchain_cnt
+
+
+def _build_de_pool(chain_results, rand, frac_burnin, max_draws):
+    """Sample a bounded history pool, or disable DE until two rows exist."""
+    budgets = [max_draws // len(chain_results) + (i < max_draws % len(chain_results))
+               for i in range(len(chain_results))]
+    parts = []
+    for chain, budget in zip(chain_results, budgets):
+        samples = chain['samples']
+        first = int(frac_burnin * len(samples))
+        count = min(budget, len(samples) - first)
+        if count:
+            parts.append(samples[rand.choice(np.arange(first, len(samples)), count, replace=False)])
+    if not parts or sum(len(part) for part in parts) < 2:
+        return None
+    return np.vstack(parts)
+
+
+def _draw_covariance(samples):
+    """Population covariance with matrix shape even for a single draw."""
+    centered = samples - np.mean(samples, axis=0)
+    return centered.T @ centered / len(samples)
 
 
 def amha(log_posterior, start_params, start_params_is_original_scale=True,
@@ -629,7 +679,8 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
 
          scalar_jitter_bounds=DEFAULT_AM_SCALAR_JITTER_BOUNDS,
 
-         callback_function=None
+         callback_function=None,
+         rng_state=None
 
          ) -> MCMCResults:
 
@@ -664,7 +715,7 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
         step_cov: Initial proposal covariance matrix.  Defaults to a small
             scaled identity if ``None``.
         log_posterior_jacobian_adjustment: Optional callable returning the
-            log-determinant of the Jacobian for the bounded→unbounded transform.
+            log-determinant of the Jacobian from unbounded sampling to original model coordinates.
             Required when ``transformations`` are supplied.
         param_names: List of parameter name strings.  Auto-generated when ``None``.
         specification_name: Optional display label for the model run.
@@ -674,7 +725,7 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
         n_samples: Number of post-burn-in draws per chain.
         max_processes: Maximum number of Ray worker processes to use when
             ``do_parallel=True``.
-        seed: Base integer random seed; each chain receives ``seed + chain_idx``.
+        seed: Base integer random seed used to generate per-chain seeds.
         target_acceptance_rate: Target Metropolis acceptance rate for the
             adaptive scalar.  Typically around 0.234 (Gelman optimal) or 0.44
             for 1-D chains.
@@ -725,6 +776,9 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
             of the proposal scalar.
         callback_function: Optional callable called after each sub-chain with
             the current ``MCMCResults`` object; useful for checkpointing.
+        rng_state: Optional NumPy RandomState state from a previous run's
+            ``other_info['rng_state']``. Restores the dispatcher random stream
+            so continued sampling does not repeat earlier chain seeds.
 
     Returns:
         ``MCMCResults`` object containing all draws, diagnostics, and metadata.
@@ -772,6 +826,15 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
 
     if do_diff_evolution_mc:
         assert isinstance(diff_evolution_weight, float) and 0 < diff_evolution_weight < 1
+        if not np.isfinite(diff_evolution_frac_burnin) or not 0 <= diff_evolution_frac_burnin <= 1:
+            raise ValueError('diff_evolution_frac_burnin must be in [0, 1]')
+        if (isinstance(diff_evolution_max_draws, (bool, np.bool_))
+                or not isinstance(diff_evolution_max_draws, (int, np.integer))
+                or diff_evolution_max_draws < 0):
+            raise ValueError('diff_evolution_max_draws must be a nonnegative integer')
+    else:
+        # A supplied pool is inactive when the caller disables DE.
+        diff_evolution_past_samples = None
 
     if debug:
         print("----------------------------------")
@@ -800,6 +863,23 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
 
     if step_cov is None:
         step_cov = np.eye(len(x0s_formatted[0])) * min(len(x0s_formatted[0]) ** -2, .01)
+    step_cov = np.array(step_cov, dtype=float, copy=True)
+    if step_cov.ndim == 0:
+        step_cov = np.eye(num_params) * step_cov
+    if step_cov.shape != (num_params, num_params):
+        raise ValueError('step_cov must have shape (num_params, num_params)')
+    step_cov = make_pos_semidef(step_cov)
+
+    if diff_evolution_past_samples is not None:
+        diff_evolution_past_samples = np.array(diff_evolution_past_samples, dtype=float, copy=True)
+        if diff_evolution_past_samples.size == 0:
+            diff_evolution_past_samples = None
+        elif (diff_evolution_past_samples.ndim != 2
+              or diff_evolution_past_samples.shape[1] != num_params
+              or not np.all(np.isfinite(diff_evolution_past_samples))):
+            raise ValueError('diff_evolution_past_samples must be a finite (n_draws, num_params) array')
+        elif len(diff_evolution_past_samples) < 2:
+            diff_evolution_past_samples = None
 
     scaler0_orig = scaler0
 
@@ -950,6 +1030,8 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
     if seed is None:
         seed = 0
     rand = np.random.RandomState(seed)
+    if rng_state is not None:
+        rand.set_state(rng_state)
 
     chain_nos = range(n_chains)
 
@@ -961,12 +1043,6 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
     n_subchains, subchain_n_burnin_iters, subchain_n_samples_iters, is_burnin_subchain, subchain_cnt \
         = get_subchain_n_draws(n_burnin, n_samples, max_subchain_draws_burnin=max_subchain_draws_burnin,
                                max_subchain_draws_sample=max_subchain_draws_sample)
-
-    if do_diff_evolution_mc:
-        if stop_adaptation_after_burnin and diff_evolution_past_samples is None:
-            if np.count_nonzero(subchain_n_burnin_iters) < 2:
-                raise Exception("`do_diff_evolution_mc` ineffective if less than two burnin sub-chains. "
-                                "\nConsider ratio of `n_burnin` to `max_subchain_draws_burnin`!")
 
     mean_master = None
     n_burnin_master = 0
@@ -1011,7 +1087,8 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
                 position, do_parallel,
             )
             for position, (seed, start_params, ch_num, step_cov) in enumerate(
-                zip(rand.randint(0, 100_000, n_chains), x0s_formatted, chain_nos, [step_cov.copy()] * n_chains)
+                zip(rand.randint(0, 2 ** 32, n_chains, dtype=np.uint32), x0s_formatted, chain_nos,
+                    [step_cov.copy()] * n_chains)
             )
         ]
 
@@ -1033,12 +1110,9 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
 
             except KeyboardInterrupt:
                 warnings.warn("\n\nKeyboard Interrupt! Stopping draws.\n\n")
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
                 ray.shutdown()
                 if n_samples_master == 0:
-                    n_samples_master = n_burnin_master // 3
-                    n_burnin_master = n_burnin_master - n_samples_master
+                    raise RuntimeError('AMHA interrupted before any post-warmup draws were collected')
                 break
 
             except Exception as e:
@@ -1051,10 +1125,9 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
             try:
                 chain_results = [run_adaptive_metropolis_chain(*_arg) for _arg in chain_args]
             except KeyboardInterrupt:
-                if n_samples_master == 0:
-                    n_samples_master = n_burnin_master // 3
-                    n_burnin_master = n_burnin_master - n_samples_master
                 warnings.warn("\n\nKeyboard Interrupt! Stopping draws.\n\n")
+                if n_samples_master == 0:
+                    raise RuntimeError('AMHA interrupted before any post-warmup draws were collected')
                 break
             except Exception as e:
                 raise e
@@ -1074,13 +1147,13 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
 
                 # add mean and cov
                 chain_results_master[i]['mean_draws'] = np.mean(chain_results[i]['samples'], axis=0)
-                chain_results_master[i]['cov_draws'] = np.cov(chain_results[i]['samples'], ddof=0, rowvar=False)
+                chain_results_master[i]['cov_draws'] = _draw_covariance(chain_results[i]['samples'])
 
             else:
 
                 new_mean, new_cov = (
                     np.mean(chn_new['samples'], axis=0),
-                    np.cov(chn_new['samples'], ddof=0, rowvar=False)
+                    _draw_covariance(chn_new['samples'])
                 )
 
                 cov_chn, mean_chn = aggregate_covs(
@@ -1139,9 +1212,11 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
             print(f"Updating covariance structure on samples {cov_window_start} to "
                   f"{len(chain_results_master[0]['samples'])}...", end='')
 
-        cov_new_master, _ = get_total_covariance_from_batches(
-            [c['samples'] for c in chain_results_master],
-            window_start=cov_window_start)
+        covariance_samples = [c['samples'][cov_window_start:] for c in chain_results_master]
+        cov_new_master, _ = aggregate_covs(
+            [_draw_covariance(samples) for samples in covariance_samples],
+            [np.mean(samples, axis=0) for samples in covariance_samples],
+            [len(samples) for samples in covariance_samples])
 
         step_cov_old = step_cov
         if allow_adaptation:
@@ -1182,6 +1257,20 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
         #         print("\nStep Cov slogdet (log Generalized Variance):")
         #         pprint.pprint(step_cov_slog_dets)
 
+        # Save the exact state that will initialize the next block, including
+        # when this call returns and MCMCResults.amha continues it later.
+        if do_diff_evolution_mc and allow_adaptation:
+            diff_evolution_past_samples = _build_de_pool(
+                chain_results_master, rand, diff_evolution_frac_burnin, diff_evolution_max_draws)
+            if do_parallel and ray.is_initialized():
+                diff_evolution_past_samples_id = ray.put(diff_evolution_past_samples)
+            else:
+                diff_evolution_past_samples_id = diff_evolution_past_samples
+
+        if allow_adaptation:
+            scaler0 = np.mean([np.mean(c['scalers'][-100:]) for c in chain_results_master])
+        itr0 = chain_results_master[0]['itr'] + 1
+
         if subchain_cnt < n_subchains:
             if debug:
                 prompt_message = get_diagnostic_update_message(
@@ -1220,24 +1309,6 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
             else:
                 break
 
-        if do_diff_evolution_mc:
-            if allow_adaptation:
-                diff_evolution_past_samples = np.vstack([
-                    c['samples'][rand.randint(
-                        low=int(diff_evolution_frac_burnin * len(c['samples'])),
-                        high=len(c['samples']),
-                        size=min(
-                            diff_evolution_max_draws // n_chains,
-                            int((1 - diff_evolution_frac_burnin) * len(c['samples']))
-                        )
-                    )]
-                    for c in chain_results_master
-                ])
-                if do_parallel and ray.is_initialized():
-                    diff_evolution_past_samples_id = ray.put(diff_evolution_past_samples)
-                else:
-                    diff_evolution_past_samples_id = diff_evolution_past_samples
-
         # if show_cov_every_subchain:
         #     with warnings.catch_warnings():
         #         warnings.simplefilter("ignore")
@@ -1250,12 +1321,8 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
         #             df_temp['past_samp'] = np.std(diff_evolution_past_samples, axis=0)
         #         print(df_temp.to_string())
 
-        if allow_adaptation:
-            scaler0 = np.mean([np.mean(c['scalers'][-100:]) for c in chain_results_master])
-        itr0 = chain_results_master[0]['itr']
-
-    cov_params_unbndd, mean_params_unbndd = convert_samples_to_unbounded_space(
-        chain_results_master, transformations, num_params, debug=debug, key='samples')
+    cov_params_unbndd, mean_params_unbndd = convert_samples_to_original_space(
+        chain_results_master, transformations, num_params, debug=debug, key='samples', window_start=n_burnin_master)
 
     options = {'method': AMH_METHOD,
                'min_scaler': min_scaler, 'max_scaler': max_scaler, 'scaler_adjust_rate': scaler_adjust_rate,
@@ -1267,7 +1334,7 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
                'max_subchain_draws_burnin': max_subchain_draws_burnin,
                'max_subchain_draws_sample': max_subchain_draws_sample,
                'n_burnin': n_burnin_master, 'n_samples': n_samples_master, 'n_chains': n_chains,
-               'x0': start_params.copy(),
+               'x0': start_params.copy(), 'x0_is_original_scale': start_params_is_original_scale,
                'step_cov': step_cov0_orig.copy(), 'do_adaptive': do_adaptive,
                'bounds': bounds.copy() if bounds is not None else None,
                'proposal_df': proposal_df,
@@ -1296,9 +1363,11 @@ def amha(log_posterior, start_params, start_params_is_original_scale=True,
         scaler=scaler0,
         step_cov=step_cov,
         cov_params_unbounded_space=cov_params_unbndd,
-        step_cov_initial_samples=DEFAULT_AM_STEP_COV_INITIAL_SAMPLES,
+        step_cov_initial_samples=step_cov_initial_samples,
         mean_params_unbounded_space=mean_params_unbndd,
         diff_evolution_past_samples=None if diff_evolution_past_samples is None else diff_evolution_past_samples.copy(),
+        rng_state=rand.get_state(),
+        next_iteration=chain_results_master[0]['itr'] + 1,
     )
     mcmc_time = time.time() - _time_mcmc_draws - _wait_time
     total_time = time.time() - _time_master - _wait_time
