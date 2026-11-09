@@ -1,2224 +1,2081 @@
+"""Core Bayesian model container with priors, bounds transforms, and MCMC/MAP entry points."""
+
 from __future__ import absolute_import, print_function
 
-import datetime
-import gc
-import pprint
-import random
-import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from inspect import signature
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
+from scipy.stats._distn_infrastructure import rv_frozen
+from scipy.stats._multivariate import multi_rv_frozen
 
 from kanly import __version__
-from kanly.bayes.mcmc.adaptive_metropolis.constants import METHOD as AMH_METHOD
-from kanly.bayes.mcmc.aggregate_covariances import aggregate_covs
-from kanly.bayes.mcmc.diagnostics.batched_means import \
-    get_ess_batched_means_for_chains, DEFAULT_BATCHED_MEANS_SELECTION, multi_ess
-from kanly.bayes.mcmc.diagnostics.gelman_rubin_split_rhat import get_rhat
-from kanly.bayes.mcmc.diagnostics.geweke import geweke_approx
-from kanly.dill_object import DillObject
-from kanly.nonparametric.kde import kde
-from kanly.time_series.auto_correlation_function import auto_correlation_function as acf
-from kanly.utils.function_str_to_callable import _check_func_for_test, get_key
-from kanly.utils.highest_density_interval import get_highest_density_interval
-from kanly.utils.plot_confidence_intervals import plot_confidence_intervals
+from kanly.bayes.map.maximum_a_posteriori import map, mle, BayesianModelMaximizationResult
+from kanly.bayes.mcmc.adaptive_metropolis.adaptive_metropolis_mcmc import amha as amha_internal
+from kanly.bayes.mcmc.adaptive_metropolis.constants import \
+    DEFAULT_AM_N_BURNIN, DEFAULT_AM_N_SAMPLES, \
+    DEFAULT_AM_N_CHAINS, \
+    DEFAULT_AM_THINNING, DEFAULT_AM_DRAW_SIZE, DEFAULT_AM_TARGET_ACCEPTANCE_RATE, DEFAULT_AM_MAX_PROCESSES, \
+    DEFAULT_AM_PBAR_UPDATE_CADENCE, DEFAULT_AM_DO_ADAPTIVE, \
+    DEFAULT_AM_DO_PARALLEL, DEFAULT_AM_USER_PROMPT_FOR_MORE_ITERS, \
+    DEFAULT_AM_SCALER_ADJUST_RATE, DEFAULT_AM_SCALER_ADJUST_DENOM_POWER, \
+    DEFAULT_AM_MIN_SCALER, DEFAULT_AM_MAX_SCALER, DEFAULT_AM_PROPOSAL_DF, \
+    DEFAULT_AM_MAX_SUBCHAIN_DRAWS_BURNIN, DEFAULT_AM_MAX_SUBCHAIN_DRAWS_SAMPlE, \
+    DEFAULT_AM_STEP_COV_INITIAL_SAMPLES, DEFAULT_AM_NORMALIZE_STEP_COV, \
+    DEFAULT_AM_DO_DIFF_EVOLUTION_MC, DEFAULT_AM_DIFF_EVOLUTION_FRAC_BURNIN, \
+    DEFAULT_AM_DIFF_EVOLUTION_MAX_DRAWS, DEFAULT_AM_DIFF_EVOLUTION_WEIGHT, DEFAULT_AM_STOP_ADAPTATION_AFTER_BURNIN, \
+    DEFAULT_AM_DIFF_EVOLUTION_JUMP_CADENCE, DEFAULT_AM_SCALAR_JITTER_BOUNDS
+from kanly.bayes.mcmc.coordinate_mala.constants import \
+    DEFAULT_COORD_MALA_THINNING, DEFAULT_COORD_MALA_N_CHAINS, DEFAULT_COORD_MALA_DEBUG, \
+    DEFAULT_COORD_MALA_DO_CAUCHY, DEFAULT_COORD_MALA_DO_MALA, DEFAULT_COORD_MALA_N_SAMPLES, \
+    DEFAULT_COORD_MALA_TAU_ADJUST, DEFAULT_COORD_MALA_P_BAR_UPDATE_CADENCE, DEFAULT_COORD_MALA_TARGET_ACCEPTANCE_RATE, \
+    DEFAULT_COORD_MALA_USER_PROMPT_FOR_MORE_ITERS, DEFAULT_COORD_MALA_DIFF_EVOLUTION_STEP_CADENCE, \
+    DEFAULT_COORD_MALA_MAX_SUBCHAIN_DRAWS, \
+    DEFAULT_COORD_MALA_DIFF_EVOLUTION_FRAC_BURNIN, DEFAULT_COORD_MALA_DIFF_EVOLUTION_MAX_DRAWS, \
+    DEFAULT_COORD_MALA_FRAC_BURNIN
+from kanly.bayes.mcmc.coordinate_mala.coordinate_mala_mcmc import mala as mala_internal
+from kanly.bayes.mcmc.mcmc_results import MCMCResults
+from kanly.bayes.parameter_transformations import get_transformation_vector_functions, bounds_2_transformations
+from kanly.bayes.utils.rv_to_nopython_logpdf import convert_str_to_scipy_rv, get_nopython_logpdf
+from kanly.optimize.bfgs_bounded_quasi_newton import bfgs_pqn
+from kanly.parameter_collection import ParameterCollection
+from kanly.stats.distributions.nopython_frozen_logpdf import \
+    MULTIVARIATE_DISTRIBUTIONS as SUPPORTED_MULTIVARIATE_DISTRIBUTIONS
+from kanly.utils.function_str_to_callable import get_callable_from_func_str
+from kanly.utils.print_options import print_options
 
-THRESHOLD_R_HAT = 1.01
-THRESHOLD_ESS = 5_000
+# from kanly.stats import IMPORT_STR
+#exec(IMPORT_STR)
+from kanly.stats.common import (
+    jit, njit, numpy, np, np_linalg, scipy, sp, sp_linalg, sp_special, stats, logit, log_d_expit, expit, d_expit, sin,
+    cos, tan, arcsin, arccos, arctan, cbrt, sqrt, log, log2, log10, exp, std_normal_cdf, normal_cdf, normal_pdf,
+    normal_logpdf, log_normal_pdf, log_normal_logpdf, log_normal_cdf, logpdf_beta, logpdf_cauchy, logpdf_chi2,
+    logpdf_expon, logpdf_f, logpdf_gamma, logpdf_genextreme, logpdf_halfcauchy, logpdf_halfnorm, logpdf_invgamma,
+    logpdf_laplace, logpdf_logistic, logpdf_lognorm, logpdf_multivariate_normal, logpdf_multivariate_t, logpdf_norm,
+    logpdf_pareto, logpdf_t, logpdf_truncnorm, logpdf_weibull_min, nopython_logpdf_beta, nopython_logpdf_cauchy,
+    nopython_logpdf_chi2, nopython_logpdf_expon, nopython_logpdf_f, nopython_logpdf_gamma, nopython_logpdf_genextreme,
+    nopython_logpdf_halfcauchy, nopython_logpdf_halfnorm, nopython_logpdf_invgamma, nopython_logpdf_laplace,
+    nopython_logpdf_logistic, nopython_logpdf_lognorm, nopython_logpdf_multivariate_normal,
+    nopython_logpdf_multivariate_t, nopython_logpdf_norm, nopython_logpdf_pareto, nopython_logpdf_t,
+    nopython_logpdf_truncnorm, nopython_logpdf_weibull_min, nopython_pdf_beta, nopython_pdf_cauchy, nopython_pdf_chi2,
+    nopython_pdf_expon, nopython_pdf_f, nopython_pdf_gamma, nopython_pdf_genextreme, nopython_pdf_halfcauchy,
+    nopython_pdf_halfnorm, nopython_pdf_invgamma, nopython_pdf_laplace, nopython_pdf_logistic, nopython_pdf_lognorm,
+    nopython_pdf_multivariate_normal, nopython_pdf_multivariate_t, nopython_pdf_norm, nopython_pdf_pareto,
+    nopython_pdf_t, nopython_pdf_truncnorm, nopython_pdf_weibull_min, pdf_beta, pdf_cauchy, pdf_chi2, pdf_expon, pdf_f,
+    pdf_gamma, pdf_genextreme, pdf_halfcauchy, pdf_halfnorm, pdf_invgamma, pdf_laplace, pdf_logistic, pdf_lognorm,
+    pdf_multivariate_normal, pdf_multivariate_t, pdf_norm, pdf_pareto, pdf_t, pdf_truncnorm, pdf_weibull_min,
+    __frozen_internal_logpdf_genextreme, __frozen_internal_logpdf_norm, __frozen_internal_logpdf_truncnorm,
+    __frozen_internal_logpdf_beta, __frozen_internal_logpdf_cauchy, __frozen_internal_logpdf_laplace,
+    __frozen_internal_logpdf_expon, __frozen_internal_logpdf_t, __frozen_internal_logpdf_gamma,
+    __frozen_internal_logpdf_lognorm, __frozen_internal_logpdf_invgamma, __frozen_internal_logpdf_logistic,
+    __frozen_internal_logpdf_chi2, __frozen_internal_logpdf_gennorm, __frozen_internal_logpdf_multivariate_normal,
+    __frozen_internal_logpdf_multivariate_t, __frozen_internal_logpdf_halfnorm, __frozen_internal_logpdf_pareto,
+    __frozen_internal_logpdf_halfcauchy, __frozen_internal_logpdf_loguniform, __frozen_internal_logpdf_f,
+    __frozen_internal_logpdf_weibull_min, __frozen_internal_logpdf_dirichlet, __nopython_frozen_internal_logpdf_norm,
+    __nopython_frozen_internal_logpdf_halfnorm, __nopython_frozen_internal_logpdf_beta,
+    __nopython_frozen_internal_logpdf_cauchy, __nopython_frozen_internal_logpdf_laplace,
+    __nopython_frozen_internal_logpdf_expon, __nopython_frozen_internal_logpdf_t,
+    __nopython_frozen_internal_logpdf_multivariate_t, __nopython_frozen_internal_logpdf_gamma,
+    __nopython_frozen_internal_logpdf_lognorm, __nopython_frozen_internal_logpdf_invgamma,
+    __nopython_frozen_internal_logpdf_logistic, __nopython_frozen_internal_logpdf_chi2,
+    __nopython_frozen_internal_logpdf_gennorm, __nopython_frozen_internal_logpdf_multivariate_normal,
+    __nopython_frozen_internal_logpdf_truncnorm, __nopython_frozen_internal_logpdf_pareto,
+    __nopython_frozen_internal_logpdf_halfcauchy, __nopython_frozen_internal_logpdf_loguniform,
+    __nopython_frozen_internal_logpdf_genextreme, __nopython_frozen_internal_logpdf_f,
+    __nopython_frozen_internal_logpdf_weibull_min, __nopython_frozen_internal_logpdf_dirichlet,
+    get_frozen_logpdf_pareto, get_frozen_logpdf_norm, get_frozen_logpdf_truncnorm, get_frozen_logpdf_halfnorm,
+    get_frozen_logpdf_beta, get_frozen_logpdf_cauchy, get_frozen_logpdf_laplace, get_frozen_logpdf_expon,
+    get_frozen_logpdf_t, get_frozen_logpdf_gamma, get_frozen_logpdf_invgamma, get_frozen_logpdf_lognorm,
+    get_frozen_logpdf_logistic, get_frozen_logpdf_gennorm, get_frozen_logpdf_chi2,
+    get_frozen_logpdf_multivariate_normal, get_frozen_logpdf_halfcauchy, get_frozen_logpdf_multivariate_t,
+    get_frozen_logpdf_uniform, get_frozen_logpdf_flat, get_frozen_logpdf_loguniform, get_frozen_logpdf_genextreme,
+    get_frozen_logpdf_f, get_frozen_logpdf_weibull_min, get_frozen_logpdf_dirichlet, )
 
 
-class MCMCResults(DillObject):
+class BayesianModel(ParameterCollection):
+    """Base container for Bayesian models: likelihood, priors, bounds, and sampling.
 
+    ``BayesianModel`` is the central class for organizing models you want to
+    optimize (MAP/MLE) or explore with MCMC.  Formula-based wrappers
+    (:class:`~kanly.bayes.bayesian_regression_model.BayesianLinearModel`,
+    :class:`~kanly.bayes.bayesian_regression_model.BayesianGeneralizedLinearModel`,
+    :class:`~kanly.bayes.bayesian_regression_model.BayesianNonlinearLeastSquaresModel`)
+    and code-block :class:`~kanly.bayes.data_model.DataModel` objects all
+    delegate to this class after building a log-likelihood.
+
+    At construction you supply:
+
+    * A **log-likelihood** callable ``log_likelihood_function(params)``.
+    * Optional **priors** (see :meth:`set_priors`).
+    * Optional **bounds** and whether to use smooth reparameterization
+      (``do_bounded_transform``; see :meth:`set_transformations`).
+
+    The model then exposes:
+
+    * ``log_posterior`` — log-likelihood + log-prior + bound handling on the
+      **original** parameter scale.
+    * ``log_posterior_transformed`` — same density expressed on an **unbounded**
+      internal scale when bounds use reparameterization.
+    * ``log_posterior_jacobian_adjustment`` — log-Jacobian so MCMC on
+      transformed coordinates targets the correct posterior after mapping back.
+
+    For original-scale parameters ``x`` and unbounded internal coordinates ``u``:
+
+    .. math::
+
+        \\log \\pi(x) = \\log \\pi_{\\mathrm{trans}}(\\mathrm{inv\\_transform}(x))
+
+    .. math::
+
+        \\log \\pi_{\\mathrm{trans}}(u) = \\log \\pi(\\mathrm{transform}(u))
+
+    MCMC samplers typically evaluate
+    ``log_posterior_transformed + log_posterior_jacobian_adjustment`` on ``u``,
+    then store draws on the original scale via ``transform``.
+
+    If there are no bounds, or ``do_bounded_transform=False``, sampling uses
+    hard log-barriers at bounds instead of reparameterization.  Regression
+    wrappers still impose ``__sigma2 > 0`` via bounds unless you override them.
+
+    Parameters
+    ----------
+    See :meth:`__init__` for constructor arguments.
+
+    Methods
+    -------
+    sample, amha, mala
+        MCMC; ``sample`` optionally runs coordinate MALA warmup then adaptive
+        Metropolis–Hastings with differential-evolution proposals.
+    map, mle
+        Posterior mode and maximum likelihood via bounded BFGS.
+
+    Examples
+    --------
+    Build a 2-parameter Bayesian model by hand and run adaptive Metropolis:
+
+    >>> import numpy as np
+    >>> from kanly.api import BayesianModel
+    >>> rng = np.random.default_rng(0)
+    >>> y = rng.normal(loc=2.0, scale=3.0, size=200)
+    >>> def log_lik(theta):                                # theta = (mu, log_sigma)
+    ...     mu, log_sigma = theta
+    ...     sigma = np.exp(log_sigma)
+    ...     return -0.5 * np.sum((y - mu)**2 / sigma**2) \\
+    ...            - len(y) * log_sigma
+    >>> model = BayesianModel(log_lik,                     # doctest: +SKIP
+    ...                       param_names=['mu', 'log_sigma'],
+    ...                       priors={'mu': 'norm(0, 10)',
+    ...                               'log_sigma': 'norm(0, 1)'})
+    >>> fit = model.sample([0.0, 0.0], n_samples=5_000,    # doctest: +SKIP
+    ...                    n_burnin=1_000, n_chains=4)
+    >>> print(fit)                                          # doctest: +SKIP
+
+    For most use cases the higher-level :class:`DataModel` builder (which
+    parses `data_string` + `model_string` blocks) is more convenient — see
+    :meth:`DataModel.build_data_model` and :meth:`DataModel.to_bayesian_model`.
+
+    Aliases on ``kanly.api``: ``bmodel``.
     """
-    Rich post-sampling results container for MCMC chains.
 
-        Stores all draw samples from one or more parallel chains, computes
-        and caches convergence diagnostics (split R-hat, ESS via ACF and
-        batched means, Geweke z-scores), provides summary tables, plotting
-        utilities (trace, KDE, histogram, rank, scatter), credible intervals
-        (equi-tailed and HPDI), and supports extending sampling by calling
-        ``amha`` again from the last state of each chain.
-
-        Inherits from ``DillObject`` so the full results object can be
-        serialized to disk with ``dill`` for later inspection.
-
-        Key attributes (set by ``__init__`` and ``set_summary_df``):
-
-        - ``sample_df``: DataFrame of shape ``(n_chains * n_iterations, num_params)``
-          containing all raw draw samples.
-        - ``sample_info_df``: Per-draw metadata (chain index, log-posterior,
-          burn-in flag, bloc/pid).
-        - ``summary_df``: Per-parameter summary statistics (mean, std, MCSE,
-          median, credible intervals, ESS, R-hat).
-        - ``cov_params``: Posterior sample covariance matrix as a DataFrame.
-        - ``map_params``: Parameter values at the highest log-posterior draw.
-        - ``R_hat``: Split Gelman-Rubin R-hat per parameter.
-        - ``ess``: ESS per parameter per chain from the ACF estimator.
-    """
-    def __init__(self, method, num_params, log_posterior, log_posterior_jacobian_adjustment, param_names,
-                 chain_results, mcmc_time, n_burnin, n_chains, thinning, options, specification_name=None,
-                 debug=False, model=None, fix_params=None, other_info=None, transformations=None,
+    def __init__(self, log_likelihood_function, bounds=None, do_bounded_transform=True, priors=None,
+                 param_names=None, num_params=None, specification_name=None, other_info=None, debug=False,
+                 nopython=False, parameter_groupings=None
                  ):
+        """Construct a Bayesian model from a log-density and optional priors/bounds.
 
+        Parameters
+        ----------
+        log_likelihood_function : callable
+            Function ``params -> float`` returning the log-likelihood (or, if
+            ``priors`` is empty, the full log-posterior).  ``params`` is a
+            1-D array in ``param_names`` order, or values are passed through
+            :meth:`~kanly.parameter_collection.ParameterCollection.dict_2_array`
+            when you call samplers with a dict.
+        bounds : dict, optional
+            Mapping ``{parameter_name: (lower, upper)}``.  Use ``np.inf`` for
+            one-sided limits.  Merged with support limits inferred from scipy
+            priors when applicable.  Regression wrappers add ``__sigma2`` bounds
+            automatically.
+        do_bounded_transform : bool, default True
+            If ``True`` and ``bounds`` is non-empty, bounded parameters are
+            reparameterized to an unbounded space for MCMC/optimization, with a
+            Jacobian correction on the log-density.  If ``False``, violations
+            of bounds set the log-density to ``-inf`` (hard barrier).
+        priors : dict, optional
+            Prior specifications keyed by:
+
+            * a **parameter name** (univariate prior on one coordinate),
+            * a **tuple of names** (callable prior on that subset),
+            * a **parameter-group name** from ``parameter_groupings`` (e.g.
+              multivariate normal on a block of coefficients),
+            * the empty string ``''`` for a **joint prior** on the full vector
+              (string expression with ``{param}`` placeholders or a callable
+              taking the full ``params`` array).
+
+            Values may be scipy frozen distributions, strings like
+            ``'norm(0, 1)'``, callables, or lists of priors to stack on the
+            same key.  ``None`` or ``{}`` means flat priors (likelihood only).
+        param_names : list of str, optional
+            Names for each element of ``params``.  Required unless
+            ``num_params`` is given.
+        num_params : int, optional
+            If ``param_names`` is omitted, parameters are named
+            ``x0``, ``x1``, ...  Required unless ``param_names`` is given.
+        specification_name : str, optional
+            Label printed in summaries and stored on ``MCMCResults``.
+        other_info : dict, optional
+            Arbitrary metadata attached to the model (e.g. formula strings).
+        debug : bool, default False
+            Verbose logging while parsing priors and transformations.
+        nopython : bool, default False
+            When ``True``, attempt Numba-friendly log-pdf callables for scipy
+            priors where supported.
+        parameter_groupings : dict, optional
+            Maps group names to lists of parameter names for block / multivariate
+            priors.
+
+        Raises
+        ------
+        Exception
+            If neither ``param_names`` nor ``num_params`` is supplied.
+
+        Attributes
+        ----------
+        log_likelihood_function
+            User-supplied log-likelihood callable.
+        log_posterior
+            Callable on the original parameter scale (after :meth:`set_priors`
+            and :meth:`set_transformations`).
+        log_posterior_transformed
+            Callable used by MCMC in transformed coordinates when applicable.
+        transform, inv_transform
+            Maps between bounded original space and unbounded sampling space.
+        log_posterior_jacobian_adjustment
+            Log-Jacobian adjustment for transformed-space MCMC.
+        bounds
+            Effective bounds dict after merging user input and prior support.
+        priors, priors_orig
+            Parsed prior specifications.
+
+        See Also
+        --------
+        kanly.bayes.data_model.DataModel.to_bayesian_model
+        kanly.bayes.bayesian_regression_model.BayesianLinearModel
         """
-        Initialize MCMCResults and compute all convergence diagnostics.
-
-        Args:
-            method: Name of the MCMC algorithm used (e.g. ``'amha'`` or ``'mala'``).
-            num_params: Number of sampled (free) parameters.
-            log_posterior: Callable ``log_posterior(x)`` evaluated on the unbounded/transformed space.
-            log_posterior_jacobian_adjustment: Callable that returns the Jacobian log-determinant of the bounded-to-unbounded transformation, or None.
-            param_names: Ordered sequence of parameter name strings; auto-generated as ``<theta_i>`` when None.
-            chain_results: List of per-chain result dicts returned by the sampler, each containing ``'samples'``, ``'log_posterior'``, ``'accepteds'``, ``'bloc'``, ``'pid'``, etc.
-            mcmc_time: Wall-clock time in seconds spent running the sampler.
-            n_burnin: Number of leading draws per chain to discard as burn-in.
-            n_chains: Number of parallel MCMC chains.
-            thinning: Thinning interval applied to draws during sampling.
-            options: Dict of sampler configuration options forwarded from the calling function.
-            specification_name: Optional display label for the model or run.
-            debug: Whether to print timing and diagnostic messages during initialization.
-            model: Optional reference to the originating ``BayesianModel`` instance.
-            fix_params: Optional dict mapping parameter names (or integer indices) to fixed values that were held constant during sampling.
-            other_info: Dict of additional sampler state (e.g. proposal covariance, scaler) for restarting.
-            transformations: Dict mapping parameter indices to ``TransformedParameter`` objects that reparameterize bounded parameters to an unbounded space.
-        """
-        _result_init_time = time.time()
-
-        self.method = method
-        self.log_posterior = log_posterior
-        self.log_posterior_jacobian_adjustment = log_posterior_jacobian_adjustment
-        self.specification_name = specification_name
-        self.date = datetime.datetime.today().strftime('%b %d, %Y')
-        self.timestamp = datetime.datetime.today().strftime('%H:%M:%S')
-
-        self.fix_params = fix_params
-        if self.fix_params is not None:
-            self.fix_params = self.fix_params.copy()
-            if len(self.fix_params) == 0:
-                self.fix_params = None
 
         if param_names is None:
-            param_names = [f'<theta{d}>' for d in range(num_params)]
+            if num_params is None:
+                raise Exception("Must supply either param names or number of params!")
+            assert isinstance(num_params, int) and num_params > 0
+            param_names = [f'x{d}' for d in range(num_params)]
 
-        self.param_names = np.array(param_names)
-        self.num_params = num_params
+        super().__init__(param_names, parameter_groupings)
 
-        if self.fix_params is not None:
-            par_names_set = set(self.param_names)
-            self.fix_params = {(k if k in par_names_set else param_names[int(k)]): v
-                               for k, v in fix_params.items()}
-
-        self.sample_df, self.sample_info_df, self.pids \
-            = self.build_sample_df(chain_results, n_burnin, n_chains, param_names, debug=debug)
-
-        self.n_chains = n_chains
-        self.thinning = thinning
-        self.n_iterations = len(self.sample_df) // self.n_chains
-        self.set_n_burnin(n_burnin, debug=debug)
-
-        self.map_idx, self.max_log_posterior, self.map_params = self.get_map()
-
-        self.chain_results = chain_results
-        self.acceptance_rate = np.mean([np.mean(c['accepteds']) for c in chain_results])
-
-        self.mcmc_time = mcmc_time
-
-        self.options = options
+        self.specification_name = specification_name
         self.other_info = other_info
-        self.model = model
 
-        self.transformations = transformations.copy() if transformations is not None else None
-        self.transformed_model = self.transformations is not None and len(self.transformations)
+        self.log_likelihood_function = log_likelihood_function
 
-        self.param_2_idx = {p: i for i, p in enumerate(self.param_names)}
+        # Build parameter transformations to respect bounds
+        self.set_transformations(bounds, do_bounded_transform, debug=debug)
+
+        # Build log-pdf from priors
+        self.set_priors(priors, debug=debug, nopython=nopython)
 
         self.__version__ = __version__
 
-        self.result_init_time = time.time() - _result_init_time
+    def _build_log_likelihood_transformed(self):
+        """Build ``log_likelihood_function_transformed`` for MCMC/optimization.
 
-        gc.collect()
+        When ``do_bounded_transform`` is active, likelihood evaluation maps
+        unbounded ``params`` through ``transform`` before applying the user
+        likelihood and hard bound indicator.  Otherwise the transformed
+        callable equals the bounded likelihood on the original scale.
 
-    @staticmethod
-    def get_result_type():
+        Sets attributes ``_log_likelihood_bounded`` and
+        ``log_likelihood_function_transformed``.
         """
-        Return the result type identifier for this object.
-
-        Returns:
-            The string ``'MCMC'``.
-        """
-        return 'MCMC'
-
-    def set_n_burnin(self, n_burnin, debug=False):
-        """
-        Set (or update) the burn-in cutoff and recompute all summary statistics.
-
-        Args:
-            n_burnin: Number of leading draws per chain to classify as burn-in.
-            debug: Whether to print timing diagnostics.
-        """
-        assert n_burnin * self.n_chains < len(self.sample_df)
-
-        self.n_burnin = n_burnin
-        self.n_samples = self.n_iterations - self.n_burnin
-
-        self.sample_info_df['is_burnin'] = False
-        for c in range(self.n_chains):
-            self.sample_info_df.loc[
-                self.sample_info_df.index[self.sample_info_df.chain == c][np.arange(self.n_iterations) < n_burnin],
-                'is_burnin'] = True
-
-        self.set_summary_df(debug=debug)
-
-    def compute_ess_from_acf(self, maxlag=10_000, min_rho=0, debug=False):
-
-        """
-        Compute per-chain ACFs and ACF-based effective sample sizes.
-
-                For each parameter and chain, computes the ACF of the post-burn-in
-                draws up to ``maxlag``, truncating at the first lag where consecutive
-                ACF pairs sum below ``min_rho`` (the initial positive-sequence
-                estimator truncation rule).  ESS is then estimated as
-                ``n / (1 + 2 * sum(acf[1:]))``.
-
-        Args:
-            maxlag: Maximum lag to include in the ACF summation.
-            min_rho: Truncation threshold; the ACF sum is cut at the first lag pair below this value.
-            debug: Whether to print timing and progress information.
-
-        Returns:
-            3-tuple ``(acfs_dict, ess, ess_time)`` where ``acfs_dict`` maps each parameter name to a per-chain dict of truncated ACF arrays, ``ess`` is a DataFrame of per-chain ESS values indexed by parameter name, and ``ess_time`` is the wall-clock time in seconds.
-        """
-        _t = time.time()
-        if debug:
-            print("Computing Auto-correlations and Effective Sample Size (ESS)...", end="")
-
-        acfs_dict = {k: dict() for k in self.param_names}
-        ch_index = {c: ~self.sample_info_df.is_burnin & (self.sample_info_df.chain == c)
-                    for c in self.sample_info_df.chain.unique()}
-        ess = []
-        for key in tqdm(self.param_names, disable=not debug):
-            for c in self.sample_info_df.chain.unique():
-                idx = ch_index[c]
-                x = self.sample_df[key].loc[idx].values
-
-                acf_vals = acf(x)
-
-                i = np.where(acf_vals[1:] + acf_vals[:-1] < min_rho)[0]
-                if len(i):
-                    i = min(i[0], maxlag)
-                else:
-                    i = maxlag
-                acf_vals2 = acf_vals[:i]
-                acfs_dict[key][c] = acf_vals2
-
-                ess.append({'param': key,
-                            'chain': c,
-                            'ESS': int(len(x) * 1 / (1 + 2 * np.sum(acf_vals2[1:])))
-                            })
-
-        ess = pd.DataFrame(ess).pivot_table(index='param', columns='chain')
-        ess = ess.loc[self.param_names]
-        ess.columns = range(self.n_chains)
-        ess.index = self.param_names
-
-        ess_time = time.time() - _t
-
-        if debug:
-            print("%.2fs" % ess_time)
-
-        return acfs_dict, ess, ess_time
-
-    def set_summary_df(self, maxlag=10_000, min_rho=.0, debug=False):  # , geweke_frac1=.1, geweke_frac2=.5):
-
-        """
-        Build and cache the summary statistics DataFrame.
-
-                Computes posterior covariance, means, quantiles, fraction positive,
-                split Gelman-Rubin R-hat via ``get_rhat``, and ESS via
-                ``compute_ess_from_acf``.  Results are stored in ``self.summary_df``,
-                ``self.cov_params``, ``self.mean_params``, ``self.R_hat``,
-                ``self.ess``, etc.  Fixed parameters (if any) have their R-hat and
-                MCSE set to NaN.
-
-        Args:
-            maxlag: Maximum ACF lag passed to ``compute_ess_from_acf``.
-            min_rho: Truncation threshold passed to ``compute_ess_from_acf``.
-            debug: Whether to print timing messages.
-        """
-        draws = self.sample_df.loc[~self.sample_info_df.is_burnin, self.param_names]
-
-        cov = np.cov(draws, rowvar=False)
-        if np.ndim(cov) < 2:
-            cov = cov.reshape((1, 1))
-        self.cov_params = pd.DataFrame(cov, columns=self.param_names, index=self.param_names)
-        self.mean_params = draws.mean(axis=0)
-
-        if debug:
-            _t = time.time()
-            print("Computing equi-tail 90% credible intervals... ", end="")
-        quantiles = np.array([
-            np.quantile(draws[k], (.05, .5, .95))
-            for k in self.param_names
-        ]).T
-        positive = np.array([
-            np.count_nonzero(draws[k] > 0) / len(draws)
-            for k in self.param_names
-        ])
-        if debug:
-            print('%.2fs' % (time.time() - _t))
-
-        draws_per_chain = len(self.sample_df) / self.n_chains
-        R_hat, _, self.R_hat_time, _, _ = get_rhat(
-            self._get_samples_split_by_chain(include_burnin=False),
-            split=2, debug=debug)
-
-        if self.fix_params is not None:
-            for i, k in enumerate(self.param_names):
-                if k in self.fix_params:
-                    R_hat[i] = np.nan
-
-        self.R_hat = pd.Series(R_hat, index=self.param_names)
-        self.max_R_hat = np.nanmax(self.R_hat)
-        self.avg_R_hat = np.nanmean(self.R_hat)
-        self.median_R_hat = np.nanmedian(self.R_hat)
-
-        with np.errstate(divide='ignore', invalid='ignore'):
-            std_params = np.diag(self.cov_params) ** .5
-
-        self.summary_df = pd.DataFrame(
-            {
-                'mean': self.mean_params,
-                'std': std_params,
-                'median': quantiles[1],
-                '[.05, ': quantiles[0],
-                '.95]': quantiles[2],
-                'positive': positive,
-                'R_hat': self.R_hat,
-            },
-            index=self.param_names
-        )
-        if self.fix_params is not None:
-            self.summary_df['fixed'] = [
-                '*' if k in self.fix_params else ''
-                for k in self.param_names
-            ]
-
-        # self.geweke_df = self.geweke(frac1=geweke_frac1, frac2=geweke_frac2, debug=debug)
-        # self.summary_df['max|z_Geweke|'] = np.abs(self.geweke_df).max(axis=1).round(2)
-
-        self.set_ess(maxlag=maxlag, min_rho=min_rho, debug=debug)
-        # self.set_multi_ess(debug=debug)
-
-        if self.fix_params is not None:
-            idx = [k in self.fix_params for k in self.param_names]
-            self.summary_df.loc[idx, 'MCSE'] = np.nan
-            self.summary_df.loc[idx, 'std'] = np.nan
-            # self.geweke_df.loc[idx] = np.nan
-            # self.summary_df.loc[idx, 'max|z_Geweke|'] = np.nan
-
-        self.mean_params = self.summary_df['mean'].copy()
-        self.params = self.mean_params
-        self.median_params = self.summary_df['median'].copy()
-        self.bse = self.summary_df['std'].copy()
-
-    def set_ess(self, maxlag=10_000, min_rho=.0, debug=False):
-
-        """
-        Compute and store ESS and MCSE columns in ``summary_df``.
-
-                Calls ``compute_ess_from_acf``, stores ``self.ess`` and ``self.acfs``,
-                appends ``ESS``, ``MCSE``, and ``Rel MCSE`` columns to ``summary_df``,
-                and computes ``min_efficiency``, ``avg_efficiency``, and
-                ``max_efficiency`` as the ESS-to-sample ratio across free parameters.
-
-        Args:
-            maxlag: Maximum ACF lag.
-            min_rho: ACF truncation threshold.
-            debug: Whether to print timing messages.
-        """
-        _t = time.time()
-        # if debug:
-        #    print('Setting ess...', end='')
-
-        acfs, ess, self.ess_time = self.compute_ess_from_acf(maxlag, min_rho, debug=debug)
-        self.ess = ess
-        self.acfs = acfs
-
-        if self.fix_params is not None:
-            for i, k in enumerate(self.param_names):
-                if k in self.fix_params:
-                    ess.loc[k] = 0
-
-        self.summary_df['ESS'] = ess.sum(axis=1)
-        self.summary_df['MCSE'] = self.summary_df['std'] / np.sqrt(self.summary_df['ESS'])
-        self.summary_df['Rel MCSE'] = self.summary_df['MCSE'] / self.summary_df['mean']
-
-        if self.fix_params is not None:
-            not_fixed_index = [k not in self.fix_params for k in self.param_names]
-        else:
-            not_fixed_index = self.summary_df.index
-
-        self.min_efficiency = self.summary_df['ESS'].loc[not_fixed_index].min() / (self.n_samples * self.n_chains)
-        self.avg_efficiency = self.summary_df['ESS'].loc[not_fixed_index].mean() / (self.n_samples * self.n_chains)
-        self.max_efficiency = self.summary_df['ESS'].loc[not_fixed_index].max() / (self.n_samples * self.n_chains)
-
-        self.summary_df = self.summary_df[
-            ['mean', 'std', 'MCSE', 'median', '[.05, ', '.95]', 'positive', 'Rel MCSE', 'ESS', 'R_hat',
-             # 'max|z_Geweke|'
-             ]
-            + (['fixed'] if 'fixed' in self.summary_df.columns else [])
-            ]
-
-        # if debug:
-        #    print('%.2fs' % (time.time() - _t))
-
-    @staticmethod
-    def build_sample_df(chain_results, n_burnin, n_chains, param_names, debug=False):
-
-        """
-        Concatenate per-chain raw draw arrays into tidy DataFrames.
-
-                Stacks the ``'samples'`` arrays from all chains row-wise into
-                ``sample_df``, assembles per-draw metadata (chain index, log-posterior,
-                burn-in flag, bloc, pid) into ``sample_info_df``, and deletes the
-                large array keys from ``chain_results`` to free memory.
-
-        Args:
-            chain_results: List of per-chain result dicts from the sampler.
-            n_burnin: Number of leading draws per chain marked as burn-in.
-            n_chains: Number of parallel chains.
-            param_names: Ordered parameter name list used as DataFrame column names.
-            debug: Whether to print timing messages.
-
-        Returns:
-            3-tuple ``(sample_df, sample_info_df, pids)`` where ``sample_df`` is a DataFrame of shape ``(n_chains * n_iterations, num_params)``, ``sample_info_df`` holds per-draw metadata, and ``pids`` is the array of unique worker process IDs.
-        """
-        _t = time.time()
-        if debug:
-            print("Joining samples from chains... ", end='')
-
-        samples = np.vstack([r['samples'] for r in chain_results])
-        blocs = np.hstack([r['bloc'] for r in chain_results])
-        pids = np.hstack([r['pid'] for r in chain_results])
-        gc.collect()
-
-        for r in chain_results:
-            for key in ['samples', 'bloc', 'pid']:
-                del r[key]
-
-        sample_df = pd.DataFrame(samples, columns=param_names)
-
-        sample_info_df = pd.DataFrame()
-        log_posterior_arr = np.hstack([r['log_posterior'] for r in chain_results])
-        sample_info_df['log_posterior'] = log_posterior_arr
-        for r in chain_results:
-            del r['log_posterior']
-
-        _total_n_draws = len(sample_df)
-        sample_info_df['chain'] = np.repeat(range(n_chains), _total_n_draws // n_chains)
-        sample_info_df['is_burnin'] = (np.arange(_total_n_draws) % (_total_n_draws // n_chains)) < n_burnin
-        sample_info_df['bloc'] = blocs
-        sample_info_df['pid'] = pids
-        pids = sample_info_df['pid'].unique()
-
-        if debug:
-            print("%.2fs" % (time.time() - _t))
-
-        return sample_df, sample_info_df, pids
-
-    def get_map(self):
-        """
-        Locate the maximum a posteriori (MAP) draw across all chains and iterations.
-
-                Scans ``sample_info_df['log_posterior']`` for its argmax and returns
-                the corresponding row index, log-posterior value, and parameter vector.
-
-        Returns:
-            3-tuple ``(map_idx, max_log_posterior, map_params)`` where ``map_idx`` is the integer row index in ``sample_df``, ``max_log_posterior`` is the corresponding log-posterior value, and ``map_params`` is a Series of parameter values at that draw.
-        """
-        assert hasattr(self, 'sample_info_df')
-        assert hasattr(self, 'sample_df')
-        map_idx = np.argmax(self.sample_info_df['log_posterior'])
-        max_log_posterior = self.sample_info_df['log_posterior'][map_idx]
-        map_params = self.sample_df.loc[map_idx, :].copy()
-        return map_idx, max_log_posterior, map_params
-
-    def log_posterior_original(self, x):
-        """
-        Evaluate the log-posterior in the original (possibly bounded) parameter space.
-
-                If the model was reparameterized (``self.transformed_model`` is True),
-                first maps ``x`` to the unbounded space via ``inv_transform`` before
-                calling ``self.log_posterior``.  Otherwise calls ``self.log_posterior``
-                directly.
-
-        Args:
-            x: Parameter vector in the original (bounded) space.
-
-        Returns:
-            Scalar log-posterior value.
-        """
-        if self.transformed_model:
-            return self.log_posterior(self.inv_transform(x))
-        else:
-            return self.log_posterior(x)
-
-    def transform(self, x):
-        """
-        Map a parameter vector from the unbounded (sampling) space to the original space.
-
-                Applies each ``TransformedParameter`` forward transform to the
-                corresponding element of ``x``.  Elements without a transformation
-                are passed through unchanged.  Returns ``x`` unmodified when the
-                model has no transformations.
-
-        Args:
-            x: Parameter vector in the unbounded sampling space.
-
-        Returns:
-            NumPy array of the same length as ``x`` with bounded/original-scale values.
-        """
-
-        if self.transformed_model:
-            return np.array([
-                self.transformations[i](x[i]) if i in self.transformations else x[i]
-                for i in range(self.num_params)
-            ])
-        else:
-            return x
-
-    def inv_transform(self, x):
-        """
-        Map a parameter vector from the original (bounded) space to the unbounded sampling space.
-
-                Applies each ``TransformedParameter.inv_transform`` to the corresponding
-                element of ``x``.  Elements without a transformation are passed through.
-
-        Args:
-            x: Parameter vector in the original (bounded) space.
-
-        Returns:
-            NumPy array in the unbounded sampling space.
-        """
-
-        if self.transformed_model:
-            return np.array([
-                self.transformations[i].inv_transform(x[i]) if i in self.transformations else x[i]
-                for i in range(self.num_params)
-            ])
-        else:
-            return x
-
-    def summary(self, param_subset=None, show_positive=False, show_ESS=True, show_R_hat=True, show_CI=True):
-
-        """
-        Build and return a formatted MCMC summary string.
-
-                Renders ``summary_df`` with formatted floating-point values and
-                appends two-column header blocks showing chain counts, timing,
-                acceptance rate, ESS efficiency, and Gelman-Rubin statistics.
-                Optionally suppresses the ``positive``, ESS, R-hat, or credible
-                interval columns.  Appends a warning when any R-hat exceeds
-                ``THRESHOLD_R_HAT`` or any ESS is below ``THRESHOLD_ESS``.
-
-        Args:
-            param_subset: Optional list of parameter names to include; ``None`` shows all.
-            show_positive: Whether to include the fraction-positive column.
-            show_ESS: Whether to include the ESS column.
-            show_R_hat: Whether to include the R-hat column.
-            show_CI: Whether to include the credible interval columns.
-
-        Returns:
-            Multi-line formatted string ready for printing.
-        """
-        tbl_copy = self.summary_df.copy()
-
-        def coef_fmt(x):
-            """
-            Format a scalar value for display in the summary table.
+        def _log_likelihood(params):
+            """Evaluate the log-likelihood including any hard-bound log-barrier.
+
+            Adds ``lp_bounds_log_pdf(params)`` (which returns ``-inf`` when
+            ``params`` violates any hard bound, and 0 otherwise) to the
+            user-supplied log-likelihood function.
 
             Args:
-                x: Numeric value to format.
+                params: Parameter vector in the original (bounded) space.
 
             Returns:
-                String in scientific notation for very small or very large values, else 4 significant figures.
+                Scalar log-likelihood value (``-inf`` if bounds are violated).
             """
-            if abs(x) < .0001 or abs(x) > 100_000:
-                return '%.2e' % x
+            return self.log_likelihood_function(params) + self.lp_bounds_log_pdf(params)
+
+        self._log_likelihood_bounded = _log_likelihood
+        if self.transformations is not None and len(self.transformations):
+
+            def _log_likelihood_function_transformed(params):
+                """Evaluate the log-likelihood at unbounded-space parameters.
+
+                Maps ``params`` from the unbounded sampling space back to the
+                original (bounded) space via ``self.transform`` before
+                evaluating the bounded log-likelihood.
+
+                Args:
+                    params: Parameter vector in the unbounded sampling space.
+
+                Returns:
+                    Scalar log-likelihood value in the original space.
+                """
+                params_transformed = self.transform(params)
+                return _log_likelihood(params_transformed)
+
+        else:
+            _log_likelihood_function_transformed = self._log_likelihood_bounded
+
+        self.log_likelihood_function_transformed = _log_likelihood_function_transformed
+
+    def _build_log_posterior(self, debug=False):
+        """Rebuild ``log_posterior`` and ``log_posterior_transformed`` after prior/bound changes.
+
+        Composes log-likelihood, summed log-priors, and bound indicators on the
+        original scale, then wires the transformed-space variant used by MCMC.
+
+        Parameters
+        ----------
+        debug : bool, default False
+            Unused; retained for API compatibility with :meth:`set_priors`.
+        """
+        def _log_posterior(params):
+            """Evaluate the log-posterior in the original (bounded) parameter space.
+
+            Sums log-likelihood, log-prior, and the hard-bound log-barrier.
+
+            Args:
+                params: Parameter vector in the original (possibly bounded) space.
+
+            Returns:
+                Scalar log-posterior value (``-inf`` if bounds are violated).
+            """
+            return self.log_likelihood_function(params) + self.log_pdf_prior(params) + self.lp_bounds_log_pdf(params)
+
+        self.log_posterior = _log_posterior
+        self.log_posterior.__doc__ = \
+            """The log posterior function parametrized on the original parameter space,
+            which is possibly bounded.
+            
+            `self.log_posterior(x) = self.log_posterior_transformed(self.inv_transform(x))`
+            """
+
+        if self.transformations is not None and len(self.transformations):
+
+            def _log_posterior_transformed(params):
+                """Evaluate the log-posterior in the unbounded sampling space.
+
+                Maps ``params`` to the original space via ``self.transform``
+                before evaluating ``_log_posterior``.  Does not include the
+                Jacobian adjustment; that is handled by
+                ``self.log_posterior_jacobian_adjustment``.
+
+                Args:
+                    params: Parameter vector in the unbounded sampling space.
+
+                Returns:
+                    Scalar log-posterior value (``-inf`` if bounds are violated).
+                """
+                params_transformed = self.transform(params)
+                return _log_posterior(params_transformed)
+
+        else:
+            _log_posterior_transformed = _log_posterior
+
+        self.log_posterior_transformed = _log_posterior_transformed
+        self.log_posterior_transformed.__doc__ = \
+            """The log posterior function parametrized on the unbounded parameter space,
+            a transformation of the original possibly bounded parameter space.  Requires the Jacobian adjustment 
+            to be the correct density.
+            
+            `self.log_posterior_transformed(x) = self.log_posterior(self.transform(x))`
+            """
+
+    def set_transformations(self, bounds, do_bounded_transform, debug=False):
+        """Configure bounds and reparameterization for MCMC/optimization.
+
+        Parameters
+        ----------
+        bounds : dict or None
+            ``{name: (lower, upper)}`` with finite or infinite limits.  ``None``
+            is treated as no explicit bounds.
+        do_bounded_transform : bool
+            If ``True`` and there are bounds, each bounded coordinate gets a
+            smooth bijection to ``(-inf, inf)`` and ``lp_bounds_log_pdf`` is
+            identically zero (bounds enforced by the map).  If ``False``, bounds
+            are enforced by returning ``-inf`` outside the interval.
+        debug : bool, default False
+            Print transformation source when ``True``.
+
+        Notes
+        -----
+        Also sets ``self.transform``, ``self.inv_transform``,
+        ``self.log_posterior_jacobian_adjustment``, and refreshes likelihood/
+        posterior callables via :meth:`_build_log_likelihood_transformed` and
+        :meth:`_build_log_posterior`.
+        """
+
+        if bounds is None:
+            bounds = dict()
+
+        assert np.all([len(v) == 2 for v in bounds.values()])
+        self.bounds = {k: tuple(v) for k, v in bounds.items()}
+        self.do_bounded_transform = do_bounded_transform
+
+        if do_bounded_transform and len(bounds):
+            # Enforce bounds through reparameterization (preferred for MCMC stability).
+            self.lp_bounds_log_pdf = lambda x: 0.0
+            transformations = bounds_2_transformations(bounds)
+        else:
+            lb, ub = np.full(self.num_params, -np.inf, ), np.full(self.num_params, np.inf, )
+            for i, k in enumerate(self.param_names):
+                if k in bounds:
+                    lb[i], ub[i] = bounds[k]
+
+            def _lp_bounds_log_pdf_internal(x):
+                """Return 0 if all parameters are within bounds, else -inf.
+
+                Acts as a hard-boundary log-indicator function: any parameter
+                outside its ``[lb, ub]`` interval sends the log-posterior to
+                ``-inf``, causing automatic rejection in any MCMC or optimizer
+                step.
+
+                Args:
+                    x: Parameter vector in the original (bounded) space.
+
+                Returns:
+                    0.0 if all bounds are satisfied, ``-np.inf`` otherwise.
+                """
+                if np.any((x < lb) | (x > ub)):
+                    return -np.inf
+                else:
+                    return 0
+
+            self.lp_bounds_log_pdf = _lp_bounds_log_pdf_internal
+
+            transformations = dict()
+
+        _transform, _inv_transform, _log_posterior_jacobian_adjustment, _trans_func_str, _inv_trans_func_str, _lp_adj_func_str \
+            = get_transformation_vector_functions(transformations, self.param_names)
+
+        self.transformations = transformations
+        self.transform = _transform
+        self.inv_transform = _inv_transform
+        self.log_posterior_jacobian_adjustment = _log_posterior_jacobian_adjustment
+
+        self.transform.__doc__ = f"Converts parameters back to 'original' bounded parameter space of the model\n\n{_trans_func_str}"
+        self.inv_transform.__doc__ = f"Converts parameters from 'original' bounded of the model to the transformed unbounded space\n\n{_inv_trans_func_str}"
+        self.log_posterior_jacobian_adjustment.__doc__ = """"
+        The jacobian adjustment to the log-posterior to ensure it is the correct density function.
+
+        `self.log_posterior_transformed + self.log_posterior_jacobian_adjustment` should represent the same
+        density as `self.log_posterior`\n\n%s.
+        """ % _lp_adj_func_str
+
+        self._build_log_likelihood_transformed()
+        self._build_log_posterior()
+
+    def set_priors(self, priors, debug=False, nopython=False):
+        """Parse priors and rebuild the log-posterior.
+
+        Parameters
+        ----------
+        priors : dict or None
+            Prior specifications (see :class:`BayesianModel` constructor).
+            Multiple priors per key may be passed as a list; they sum in log
+            space.  String entries like ``'norm(0, 1)'`` are converted to scipy
+            frozen distributions when possible.  scipy priors may tighten
+            ``self.bounds`` to the distribution support and trigger a recursive
+            call to :meth:`set_transformations`.
+        debug : bool, default False
+            Print parsing progress and conversions.
+        nopython : bool, default False
+            Prefer Numba-compiled log-pdf helpers for scipy priors when available.
+
+        Notes
+        -----
+        Stores callables in ``self.priors_callables`` and
+        ``self.prior_callables_dict``, then calls :meth:`_build_log_posterior`.
+        """
+
+        if priors is None:
+            priors = dict()
+
+        if debug:
+            print("Setting priors...", end="")
+
+        self.priors_orig = priors.copy() if priors is not None else None
+        self.priors = {k: v for k, v in priors.items()
+                       if not ((v is None) or (hasattr(v, 'len') and len(v) == 0))}
+        self.prior_callables_dict = dict()
+        self.priors_callables = []
+
+        if len(priors) == 0:
+            self._build_log_posterior(debug=debug)
+            if debug:
+                print("No priors!")
+            return
+
+        # Try to convert any prior that is a string to a scipy random variable
+        # modifies `self.priors` inplace
+        self.convert_str_prior_2_scipy_rv(self.priors,
+                                          self.param_names + list(self.parameter_groupings.keys()),
+                                          debug=debug)
+
+        for prior_key, priors_k in self.priors.items():
+
+            if prior_key not in self.prior_callables_dict:
+                self.prior_callables_dict[prior_key] = []
+
+            # EACH PRIOR KEY MAPS TO A LIST OF PRIORS (THAT STACK) FOR THAT KEY
+            if not isinstance(priors_k, Iterable) or isinstance(priors_k, str):
+                priors_k = [priors_k]
+
+            for p_sub in priors_k:
+
+                # If they prior maps to a certain parameter, do this
+                if prior_key in self.param_names:
+
+                    # if it is a scipy random variable, try to get the fast logpdf
+                    # Otherwise, use the logpdf from the object
+                    if isinstance(p_sub, rv_frozen):
+
+                        try:
+                            p_sub_func = get_nopython_logpdf(p_sub, nopython=nopython, logpdf_only=True)
+                        except:
+                            p_sub_func = p_sub.logpdf
+
+                        p_sub_func = self.get_prior_function_index_callable(p_sub_func, self.param_2_idx[prior_key])
+                        # Append to list of callables
+                        self.prior_callables_dict[prior_key].append(p_sub_func)
+                        self.priors_callables.append(p_sub_func)
+
+                        bnds = p_sub.support()  # get support
+                        set_bounds = False
+                        if -np.inf < bnds[0] or bnds[1] < np.inf:
+                            if prior_key not in self.bounds:
+                                self.bounds[prior_key] = bnds
+                                set_bounds = True
+                            else:
+                                if bnds[0] > self.bounds[prior_key][0] or bnds[1] < self.bounds[prior_key][1]:
+                                    self.bounds[prior_key] = bnds
+                                    set_bounds = True
+                        if set_bounds:
+                            if debug:
+                                print(f"Setting bounds for '{prior_key}' as `{str(bnds)}`")
+                            self.set_transformations(self.bounds, self.do_bounded_transform, debug=debug)
+
+                    elif isinstance(p_sub, str):
+                        p_sub_func = get_callable_from_func_str(p_sub, self.param_names, debug=debug)
+                        self.priors_callables.append(p_sub_func)
+                        self.prior_callables_dict[prior_key].append(p_sub_func)
+                    elif isinstance(p_sub, Callable):
+                        p_sub_func = p_sub
+                        self.priors_callables.append(
+                            self.get_prior_function_index_callable(p_sub_func, self.param_2_idx[prior_key]))
+                        self.prior_callables_dict[prior_key].append(
+                            self.get_prior_function_index_callable(p_sub_func, self.param_2_idx[prior_key]))
+                    else:
+                        raise Exception(f'"{p_sub}" (type "{type(p_sub)}") for prior on "{prior_key}" did not work!')
+
+                # check if it is in a parameter grouping
+                elif prior_key in self.parameter_groupings:
+                    if isinstance(p_sub, (rv_frozen, multi_rv_frozen)):
+
+                        try:
+                            p_sub_func = get_nopython_logpdf(p_sub, nopython=nopython, logpdf_only=True)
+                        except:
+                            p_sub_func = p_sub.logpdf
+
+                        p_sub_func = self.get_prior_function_index_callable(
+                            p_sub_func, [self.param_2_idx[j] for j in self.parameter_groupings[prior_key]])
+
+                        # Append to list of callables
+                        self.prior_callables_dict[prior_key].append(p_sub_func)
+                        self.priors_callables.append(p_sub_func)
+
+                    elif isinstance(p_sub, Callable):
+                        p_sub_func = self.get_prior_function_indices_list_callable(
+                            p_sub, [self.param_2_idx[j] for j in self.parameter_groupings[prior_key]])
+                        self.prior_callables_dict[prior_key].append(p_sub_func)
+                        self.priors_callables.append(p_sub_func)
+
+                    else:
+                        raise Exception(f"Prior on a parameter grouping like '{prior_key}' must be a callable, "
+                                        f"or use scipy.stats rv syntax for multivariate distributions.\nCurrently "
+                                        f"supported are {SUPPORTED_MULTIVARIATE_DISTRIBUTIONS}!")
+
+                # next check if it is on a tuple of parameter names
+                # currently must be a callable!
+                elif isinstance(prior_key, tuple):
+                    if not set(prior_key) <= set(self.param_names):
+                        raise Exception("If supplying tuple prior key, must be subset of parameters!")
+                    if isinstance(p_sub, Callable) and len(signature(p_sub).parameters) == len(prior_key):
+                        p_sub_func = self.get_prior_function_indices_list_callable(p_sub, [self.param_2_idx[j] for j in
+                                                                                           prior_key])
+                        self.prior_callables_dict[prior_key].append(p_sub_func)
+                        self.priors_callables.append(p_sub_func)
+                    else:
+                        raise Exception(f"If specifying a prior on a subset of parameters, as in "
+                                        f"{prior_key}, must have a callable with {len(prior_key)} "
+                                        f"args, not whatever it is you supplied.")
+
+                # otherwise, we treat it as a vector prior on ALL parameters
+                # so should be either a callable that accepts the entire param vector
+                # or a string that explicitly references parameters
+                elif prior_key == '':
+
+                    if isinstance(p_sub, str):
+                        p_sub_func2 = get_callable_from_func_str(p_sub, self.param_names, debug=debug)
+                    elif isinstance(p_sub, Callable):
+                        p_sub_func2 = p_sub
+                    else:
+                        raise Exception(f'prior for `"{prior_key}" must be a string or callable!')
+
+                    self.priors_callables.append(p_sub_func2)
+                    self.prior_callables_dict[prior_key].append(p_sub_func2)
+
+                else:
+                    raise Exception(f"Valid prior keys are either (a) a parameter name string, "
+                                    f"(b) a tuple of strings of parameter names, or "
+                                    f"(c) the empty string `''` (to signify a prior on all parameters), "
+                                    f"you supplied {prior_key}")
+
+        if debug:
+            print(f"done!\n\tPriors on {set(self.prior_callables_dict.keys())} params.")
+
+        self._build_log_posterior(debug=debug)
+
+    def log_pdf_prior(self, params):
+        """Sum of log-prior contributions at ``params`` on the original scale.
+
+        Parameters
+        ----------
+        params : array_like
+            Parameter vector aligned with :attr:`param_names`.
+
+        Returns
+        -------
+        float
+            Total log-prior density (0.0 if no priors were registered).
+        """
+        if len(self.priors_callables):
+            return np.sum([p(params) for p in self.priors_callables])
+        else:
+            return 0.0
+
+    @staticmethod
+    def convert_str_prior_2_scipy_rv(priors, param_names, debug=False):
+        """Convert string-valued prior entries to scipy frozen RV objects where possible.
+
+        Args:
+            priors: Prior mapping to update in-place.
+            param_names: Valid parameter names used to guard conversion.
+            debug: Debug mode flag.
+        """
+        for prior_key, rvs in priors.items():
+            if isinstance(rvs, str) or not isinstance(rvs, Iterable):
+                rvs = [rvs]
+            rvs_new = []
+            for rv in rvs:
+                if isinstance(rv, str):
+                    if prior_key in param_names:
+                        try:
+                            rv2 = convert_str_to_scipy_rv(rv)
+                            priors[prior_key] = rv2
+                            if debug:
+                                print(f"Converted '{rv}' into scipy random variable! {rv2}")
+                            rv = rv2
+                        except Exception as e:
+                            if debug:
+                                print(f"Could not convert str '{rv}' to scipy random variable!")
+
+                rvs_new.append(rv)
+
+            if len(rvs_new) == 1:
+                rvs_new = rvs_new[0]
+
+            priors[prior_key] = rvs_new
+
+    @staticmethod
+    def get_prior_function_index_callable(fun, idx):
+        """Converts a univariate logpdf prior on the parameter at
+        index `idx` to something on the full vector
+
+        Args:
+            fun: Univariate prior callable.
+            idx: Parameter index (or index list/slice) to evaluate.
+        """
+
+        def temp(x):
+            """Evaluate the univariate prior on the single coordinate ``x[idx]``.
+
+            Args:
+                x: Full parameter vector (array-like).
+
+            Returns:
+                Scalar log-pdf value from ``fun`` at ``x[idx]``.
+            """
+            x = np.asarray(x)
+            x_sub = x[idx]
+            return fun(x_sub)
+
+        return temp
+
+    @staticmethod
+    def get_prior_function_indices_list_callable(fun, indices):
+        """Converts a logpdf prior on the parameters at
+        indices `indices` to something on the full vector
+
+        Args:
+            fun: Callable defined on selected coordinates.
+            indices: Selected parameter indices.
+        """
+        assert len(indices) > 0
+
+        def temp(x):
+            """Evaluate the multi-variate prior on selected coordinates of ``x``.
+
+            Extracts the coordinates at ``indices`` from the full vector and
+            passes them as positional arguments to ``fun``.
+
+            Args:
+                x: Full parameter vector (array-like).
+
+            Returns:
+                Scalar log-pdf value from ``fun`` evaluated at the selected coordinates.
+            """
+            x = np.asarray(x)
+            return fun(*(x[i] for i in indices))
+
+        return temp
+
+    def amha(self, start_params, step_cov=None, debug=False, specification_name=None, n_chains=DEFAULT_AM_N_CHAINS,
+             n_burnin=DEFAULT_AM_N_BURNIN, n_samples=DEFAULT_AM_N_SAMPLES, max_processes=DEFAULT_AM_MAX_PROCESSES,
+             seed=None, target_acceptance_rate=DEFAULT_AM_TARGET_ACCEPTANCE_RATE, draw_size=DEFAULT_AM_DRAW_SIZE,
+             scaler0=None, min_scaler=DEFAULT_AM_MIN_SCALER, max_scaler=DEFAULT_AM_MAX_SCALER,
+             scaler_adjust_rate=DEFAULT_AM_SCALER_ADJUST_RATE, thinning=DEFAULT_AM_THINNING,
+             scaler_adjust_denom_power=DEFAULT_AM_SCALER_ADJUST_DENOM_POWER,
+             # resample_k=DEFAULT_AM_RESAMPLE_K,
+             pbar_update_cadence=DEFAULT_AM_PBAR_UPDATE_CADENCE, do_adaptive=DEFAULT_AM_DO_ADAPTIVE,
+             max_subchain_draws_burnin=DEFAULT_AM_MAX_SUBCHAIN_DRAWS_BURNIN,
+             max_subchain_draws_sample=DEFAULT_AM_MAX_SUBCHAIN_DRAWS_SAMPlE,
+             do_parallel=DEFAULT_AM_DO_PARALLEL,
+             user_prompt_for_more_iters=DEFAULT_AM_USER_PROMPT_FOR_MORE_ITERS, proposal_df=DEFAULT_AM_PROPOSAL_DF,
+             start_params_is_original_scale=True, step_cov_initial_samples=DEFAULT_AM_STEP_COV_INITIAL_SAMPLES,
+             fix_params=None,
+             normalize_step_cov=DEFAULT_AM_NORMALIZE_STEP_COV,
+             do_diff_evolution_mc=DEFAULT_AM_DO_DIFF_EVOLUTION_MC,
+             diff_evolution_past_samples=None,
+             diff_evolution_frac_burnin=DEFAULT_AM_DIFF_EVOLUTION_FRAC_BURNIN,
+             diff_evolution_max_draws=DEFAULT_AM_DIFF_EVOLUTION_MAX_DRAWS,
+             diff_evolution_weight=DEFAULT_AM_DIFF_EVOLUTION_WEIGHT,
+             diff_evolution_jump_cadence=DEFAULT_AM_DIFF_EVOLUTION_JUMP_CADENCE,
+             scalar_jitter_bounds=DEFAULT_AM_SCALAR_JITTER_BOUNDS,
+             stop_adaptation_after_burnin=DEFAULT_AM_STOP_ADAPTATION_AFTER_BURNIN,
+             callback_function=None
+             ) -> MCMCResults:
+        """Adaptive Metropolis–Hastings with optional differential evolution (AMHA).
+
+        Runs multichain MCMC on ``log_posterior_transformed`` (plus Jacobian
+        adjustment when bounds are reparameterized).  Proposals are multivariate
+        Gaussian or Student-t with **adaptive covariance** ``step_cov`` and
+        global scale ``scaler`` tuned toward ``target_acceptance_rate`` (default
+        ~0.234).  When ``do_diff_evolution_mc=True``, proposals also move along
+        differences of past samples (DE) mixed with Gaussian noise.
+
+        Delegates to
+        :func:`~kanly.bayes.mcmc.adaptive_metropolis.adaptive_metropolis_mcmc.amha`.
+
+        Parameters
+        ----------
+        start_params : array_like or dict
+            Initial value per chain (dict keys are parameter names; missing
+            entries default to 0).
+        step_cov : ndarray, optional
+            Initial proposal covariance in transformed space.  ``None`` uses the
+            identity (often poor for correlated posteriors; see :meth:`sample`
+            MALA warmup).
+        debug : bool, default False
+            Verbose progress output.
+        specification_name : str, optional
+            Label on returned :class:`~kanly.bayes.mcmc.mcmc_results.MCMCResults`.
+        n_chains, n_burnin, n_samples : int
+            Chain count and draw counts for burn-in vs retained sampling phases.
+            Burn-in draws are kept but labeled; relabel ex post on results.
+        max_processes : int
+            Cap on parallel workers when ``do_parallel=True``.
+        seed : int, optional
+            RNG seed for reproducibility.
+        target_acceptance_rate : float
+            Target Metropolis acceptance rate for ``scaler`` adaptation.
+        draw_size : int
+            Batch size for vectorized proposal draws.
+        scaler0, min_scaler, max_scaler, scaler_adjust_rate, scaler_adjust_denom_power
+            Global proposal scale initialization and Robbins–Monro-style updates.
+        thinning : int
+            Keep every ``thinning``-th draw.
+        pbar_update_cadence : float
+            Seconds between progress-bar updates when ``debug=True``.
+        do_adaptive : bool
+            Adapt ``step_cov`` from pooled chain history between blocks.
+        max_subchain_draws_burnin, max_subchain_draws_sample : int
+            Draws per chain before regrouping chains to refresh covariance and
+            DE history during burn-in vs sampling.
+        do_parallel : bool
+            Run chains in parallel via Ray when available.
+        user_prompt_for_more_iters : bool
+            Prompt to extend sampling after diagnostics.
+        proposal_df : float
+            Student-t df for proposals; ``inf`` means Gaussian.
+        start_params_is_original_scale : bool
+            If ``True``, map starts through ``inv_transform`` before sampling.
+        step_cov_initial_samples : int, optional
+            Delay before first covariance update (defaults from ``n_burnin``).
+        fix_params : dict, optional
+            Parameters held fixed at given values, on the same scale as the
+            starting parameters.
+        normalize_step_cov : bool
+            Reserved; normalize proposal determinant.
+        do_diff_evolution_mc : bool
+            Mix DE direction proposals with Gaussian noise.
+        diff_evolution_past_samples : ndarray, optional
+            Joint draws in unbounded sampling coordinates, such as the pool
+            from MALA warmup in :meth:`sample`.
+        diff_evolution_frac_burnin, diff_evolution_max_draws
+            Which past draws enter the DE pool.
+        diff_evolution_weight : float
+            Weight on DE direction vs Gaussian component in proposals.
+        diff_evolution_jump_cadence : int
+            How often to attempt a full-scale DE jump.
+        scalar_jitter_bounds : tuple
+            Bounds on extra scalar jitter in proposals.
+        stop_adaptation_after_burnin : bool
+            If ``True``, freeze ``step_cov``/``scaler`` adaptation after burn-in.
+        callback_function : callable, optional
+            ``callback(params) -> str`` each retained draw.
+
+        Returns
+        -------
+        MCMCResults
+            Chains, acceptance rates, and diagnostics on the original parameter
+            scale after applying the forward transform to the unbounded draws.
+
+        Notes
+        -----
+        Kanly's AMHA is **not** identical to textbook adaptive Metropolis alone:
+        it adds DE proposals (ter Braak) and block-wise covariance updates (Haario
+        et al.).  See the bayes package README *Sampling Functionality* and
+        References there.
+
+        See Also
+        --------
+        mala, sample
+        """
+
+        if specification_name is None:
+            specification_name = self.specification_name
+
+        start_params = np.array(self.dict_2_array(start_params))
+        self.check_bounds_satisfied(start_params, start_params_is_original_scale)
+
+        fit = amha_internal(
+            self.log_posterior_transformed, start_params, start_params_is_original_scale=start_params_is_original_scale,
+            step_cov=step_cov, log_posterior_jacobian_adjustment=self.log_posterior_jacobian_adjustment,
+            param_names=self.param_names,
+            bounds=None if self.do_bounded_transform else self.bounds_dict_2_array(),
+            specification_name=specification_name, debug=debug,
+            n_chains=n_chains, n_burnin=n_burnin, n_samples=n_samples, max_processes=max_processes, seed=seed,
+            target_acceptance_rate=target_acceptance_rate, draw_size=draw_size, scaler0=scaler0,
+            min_scaler=min_scaler, max_scaler=max_scaler, scaler_adjust_rate=scaler_adjust_rate,
+            thinning=thinning, scaler_adjust_denom_power=scaler_adjust_denom_power,
+            pbar_update_cadence=pbar_update_cadence, do_adaptive=do_adaptive,
+            max_subchain_draws_burnin=max_subchain_draws_burnin, max_subchain_draws_sample=max_subchain_draws_sample,
+            do_parallel=do_parallel,
+            user_prompt_for_more_iters=user_prompt_for_more_iters, proposal_df=proposal_df,
+            step_cov_initial_samples=step_cov_initial_samples, model=self, fix_params=fix_params,
+            transformations=self.transformations,
+            normalize_step_cov=normalize_step_cov,
+            do_diff_evolution_mc=do_diff_evolution_mc,
+            diff_evolution_past_samples=diff_evolution_past_samples,
+            diff_evolution_frac_burnin=diff_evolution_frac_burnin,
+            diff_evolution_max_draws=diff_evolution_max_draws, diff_evolution_weight=diff_evolution_weight,
+            diff_evolution_jump_cadence=diff_evolution_jump_cadence,
+            scalar_jitter_bounds=scalar_jitter_bounds,
+            stop_adaptation_after_burnin=stop_adaptation_after_burnin,
+            callback_function=callback_function
+        )
+
+        return fit
+
+    def mala(self, start_params,
+             n_chains=DEFAULT_COORD_MALA_N_CHAINS,
+             n_samples=DEFAULT_COORD_MALA_N_SAMPLES, frac_burnin=DEFAULT_COORD_MALA_FRAC_BURNIN,
+             thinning=DEFAULT_COORD_MALA_THINNING,
+             # resample_k=DEFAULT_COORD_MALA_RESAMPLE_K,
+             target_acceptance_rate=DEFAULT_COORD_MALA_TARGET_ACCEPTANCE_RATE, do_cauchy=DEFAULT_COORD_MALA_DO_CAUCHY,
+             do_mala=DEFAULT_COORD_MALA_DO_MALA, start_params_is_original_scale=True, debug=DEFAULT_COORD_MALA_DEBUG,
+             pbar_update_cadence=DEFAULT_COORD_MALA_P_BAR_UPDATE_CADENCE,
+             user_prompt_for_more_iters=DEFAULT_COORD_MALA_USER_PROMPT_FOR_MORE_ITERS,
+             tau_adjust=DEFAULT_COORD_MALA_TAU_ADJUST,
+             diff_evolution_step_cadence=DEFAULT_COORD_MALA_DIFF_EVOLUTION_STEP_CADENCE,
+             diff_evolution_frac_burnin=DEFAULT_COORD_MALA_DIFF_EVOLUTION_FRAC_BURNIN,  # TODO
+             diff_evolution_max_draws=DEFAULT_COORD_MALA_DIFF_EVOLUTION_MAX_DRAWS,  # TODO
+             max_subchain_draws=DEFAULT_COORD_MALA_MAX_SUBCHAIN_DRAWS,
+             fix_params=None, specification_name=None, callback_function=None, tau0=None,
+             ) -> MCMCResults:
+        """Coordinate-wise Metropolis / MALA with optional DE jumps.
+
+        Updates **one random coordinate** per micro-step using finite-difference
+        partial derivatives of ``log_posterior_transformed``.  With
+        ``do_mala=True`` (default), proposals include Langevin drift toward
+        higher density; with ``do_mala=False``, plain coordinate random walk.
+        Per-coordinate step sizes ``tau`` adapt toward
+        ``target_acceptance_rate``.  Periodic full-dimensional DE steps use
+        ``diff_evolution_step_cadence``.
+
+        Delegates to
+        :func:`~kanly.bayes.mcmc.coordinate_mala.coordinate_mala_mcmc.mala`.
+
+        Parameters
+        ----------
+        start_params : array_like or dict
+            Initial point(s) per chain.
+        n_chains, n_samples : int
+            Number of chains and total draws per chain (burn-in is a **fraction**
+            ``frac_burnin``, unlike AMHA's fixed ``n_burnin`` count).
+        frac_burnin : float
+            Share of ``n_samples`` labeled burn-in (e.g. 0.25).
+        thinning : int
+            Keep every ``thinning``-th draw.
+        target_acceptance_rate : float
+            Target acceptance for ``tau`` adaptation (default ~0.57).
+        do_cauchy : bool
+            Use Cauchy instead of Gaussian proposal noise.
+        do_mala : bool
+            Gradient-informed MALA vs coordinate Metropolis.
+        start_params_is_original_scale : bool
+            Whether ``start_params`` are on the original bounded scale.
+        debug, pbar_update_cadence, user_prompt_for_more_iters
+            Verbosity and optional extension prompt.
+        tau_adjust : float
+            Learning rate for per-coordinate ``tau`` updates.
+        diff_evolution_step_cadence, diff_evolution_frac_burnin, diff_evolution_max_draws
+            DE jump scheduling and history pool.
+        max_subchain_draws : int
+            Draws before regrouping chains for adaptation.
+        fix_params : dict, optional
+            Fixed coordinates supplied on the same scale as ``start_params``.
+        specification_name : str, optional
+            Run label.
+        callback_function : callable, optional
+            Per-draw callback.
+        tau0 : array_like, optional
+            Initial per-coordinate step sizes in unbounded sampling coordinates.
+
+        Returns
+        -------
+        MCMCResults
+            Includes ``other_info['cov_params_unbounded_space']`` used by
+            :meth:`sample` to initialize AMHA ``step_cov``.
+
+        Notes
+        -----
+        Useful alone on difficult posteriors and as **warmup** inside
+        :meth:`sample` when ``do_mala_cd_warmup=True``.
+
+        See Also
+        --------
+        amha, sample
+        """
+
+        if specification_name is None:
+            specification_name = self.specification_name
+
+        start_params = np.array(self.dict_2_array(start_params))
+        self.check_bounds_satisfied(start_params, start_params_is_original_scale)
+
+        fit = mala_internal(
+            self.log_posterior_transformed, start_params,
+            log_posterior_jacobian_adjustment=self.log_posterior_jacobian_adjustment,
+            n_chains=n_chains, n_samples=n_samples, frac_burnin=frac_burnin, thinning=thinning,
+            # resample_k=resample_k,
+            target_acceptance_rate=target_acceptance_rate, do_cauchy=do_cauchy, do_mala=do_mala,
+            start_params_is_original_scale=start_params_is_original_scale, debug=debug, pbar_update_cadence=pbar_update_cadence,
+            transformations=self.transformations, user_prompt_for_more_iters=user_prompt_for_more_iters,
+            param_names=self.param_names, tau_adjust=tau_adjust, fix_params=fix_params,
+            diff_evolution_step_cadence=diff_evolution_step_cadence,
+            diff_evolution_frac_burnin=diff_evolution_frac_burnin, diff_evolution_max_draws=diff_evolution_max_draws,
+            max_subchain_draws=max_subchain_draws,
+            specification_name=specification_name, model=self,
+            callback_function=callback_function, tau0=tau0
+        )
+
+        return fit
+
+    def sample(
+            self, start_params,
+
+            step_cov=None, debug=False, specification_name=None, n_chains=DEFAULT_AM_N_CHAINS,
+            n_burnin=DEFAULT_AM_N_BURNIN, n_samples=DEFAULT_AM_N_SAMPLES, max_processes=DEFAULT_AM_MAX_PROCESSES,
+            seed=None, target_acceptance_rate=DEFAULT_AM_TARGET_ACCEPTANCE_RATE, draw_size=DEFAULT_AM_DRAW_SIZE,
+            thinning=DEFAULT_AM_THINNING,
+            scaler0=None, min_scaler=DEFAULT_AM_MIN_SCALER, max_scaler=DEFAULT_AM_MAX_SCALER,
+            scaler_adjust_rate=DEFAULT_AM_SCALER_ADJUST_RATE,
+            scaler_adjust_denom_power=DEFAULT_AM_SCALER_ADJUST_DENOM_POWER,
+            # resample_k=DEFAULT_AM_RESAMPLE_K, TODO remove
+            pbar_update_cadence=DEFAULT_AM_PBAR_UPDATE_CADENCE, do_adaptive=DEFAULT_AM_DO_ADAPTIVE,
+            max_subchain_draws_burnin=DEFAULT_AM_MAX_SUBCHAIN_DRAWS_BURNIN,
+            max_subchain_draws_sample=DEFAULT_AM_MAX_SUBCHAIN_DRAWS_SAMPlE,
+            do_parallel=DEFAULT_AM_DO_PARALLEL,
+            user_prompt_for_more_iters=DEFAULT_AM_USER_PROMPT_FOR_MORE_ITERS, proposal_df=DEFAULT_AM_PROPOSAL_DF,
+            start_params_is_original_scale=True, step_cov_initial_samples=DEFAULT_AM_STEP_COV_INITIAL_SAMPLES,
+            fix_params=None,
+            normalize_step_cov=DEFAULT_AM_NORMALIZE_STEP_COV,
+            do_diff_evolution_mc=DEFAULT_AM_DO_DIFF_EVOLUTION_MC,
+            diff_evolution_max_draws=DEFAULT_AM_DIFF_EVOLUTION_MAX_DRAWS,
+            diff_evolution_past_samples=None,
+            diff_evolution_weight=DEFAULT_AM_DIFF_EVOLUTION_WEIGHT,
+            diff_evolution_frac_burnin=DEFAULT_AM_DIFF_EVOLUTION_FRAC_BURNIN,
+            stop_adaptation_after_burnin=DEFAULT_AM_STOP_ADAPTATION_AFTER_BURNIN,
+
+            do_mala_cd_warmup=False,
+            keep_mala_warmup=True,
+
+            n_samples_mala=DEFAULT_COORD_MALA_N_SAMPLES, frac_burnin_mala=DEFAULT_COORD_MALA_FRAC_BURNIN,
+            n_chains_mala=None,
+            thinning_mala=DEFAULT_COORD_MALA_THINNING,
+            # resample_k=DEFAULT_COORD_MALA_RESAMPLE_K, TODO remove
+            target_acceptance_rate_mala=DEFAULT_COORD_MALA_TARGET_ACCEPTANCE_RATE,
+            do_cauchy_mala=DEFAULT_COORD_MALA_DO_CAUCHY,
+            do_mala_mala=DEFAULT_COORD_MALA_DO_MALA,
+            tau_adjust_mala=DEFAULT_COORD_MALA_TAU_ADJUST,
+            max_subchain_draws_mala=DEFAULT_COORD_MALA_MAX_SUBCHAIN_DRAWS,
+
+            diff_evolution_step_cadence_mala=DEFAULT_COORD_MALA_DIFF_EVOLUTION_STEP_CADENCE,
+            diff_evolution_frac_burnin_mala=DEFAULT_COORD_MALA_DIFF_EVOLUTION_FRAC_BURNIN,
+            diff_evolution_max_draws_mala=DEFAULT_COORD_MALA_DIFF_EVOLUTION_MAX_DRAWS,
+            diff_evolution_jump_cadence=DEFAULT_AM_DIFF_EVOLUTION_JUMP_CADENCE,
+
+            tau0_mala=None,
+
+            scalar_jitter_bounds=DEFAULT_AM_SCALAR_JITTER_BOUNDS,
+
+            callback_function=None,
+
+    ) -> MCMCResults:
+        """Default MCMC: optional coordinate MALA warmup, then AMHA main phase.
+
+        Summary
+        -------
+        High-level sampler on this model.  When ``do_mala_cd_warmup=True``, runs
+        coordinate MALA to learn per-parameter scales and a covariance matrix,
+        then **AMHA** (adaptive Metropolis–Hastings + optional DE) for the main
+        run.  When ``do_mala_cd_warmup=False`` (default), calls :meth:`amha`
+        directly with your ``step_cov`` (identity if omitted).
+
+        Warmup hands off to AMHA: last MALA draws as chain starts;
+        ``step_cov`` from MALA sample covariance in unbounded space;
+        optional ``diff_evolution_past_samples`` from MALA history when DE is
+        enabled.  Set ``keep_mala_warmup=True`` to attach warmup
+        :class:`~kanly.bayes.mcmc.mcmc_results.MCMCResults` under
+        ``fit.other_info['mala_cd_warmup_fit']``.
+
+        Notes
+        -----
+        Kanly's algorithms differ from textbook AM-only / full-dimensional MALA
+        but reuse the same ideas.  Implementations:
+
+        * AMHA — ``kanly.bayes.mcmc.adaptive_metropolis.adaptive_metropolis_mcmc.amha``
+        * MALA — ``kanly.bayes.mcmc.coordinate_mala.coordinate_mala_mcmc.mala``
+
+        **Coordinate MALA (optional warmup)**
+
+        Warmup helps when parameters have very different scales or strong
+        correlation, so a blind identity ``step_cov`` for AMHA would fail.
+
+        Coordinate MALA explained:
+
+            This "warmup" phase is often necessary in the presence of very complicated distributions that have
+            correlation between parameters and/or very different scales between parameters.  For a d-dimensional
+            distribution, going straight to Adaptive-Metropolis Hastings can be challenging as specifying the
+            right starting variance-covariance for the proposals can lead to basically no exploration of the
+            parameter space, since the proposal scales by coordinate are so out of whack with the distribution.
+
+            Instead, this warmup steps samples coordinate by coordinate. It adjusts the size of the steps so that we
+            are sampling in every direction, allowing us to
+                (a) move rapidly towards higher density areas since we don't need to figure out multivariate steps, and
+                (b) learn the right "scales" of each parameter for use in the AMH sampling step later.
+
+            Essentially the algorithm is as follows:
+
+            1. Initialize a starting point parameter value x(0)
+            3. Initialize a scaler for each coordinate s(0,k) > 0 for all coordinates k
+            4. Initialize "blocks", e.g. sequences for which we sample before regrouping and
+               adjusting the algorithm.  E.g., if blocks = [1000, 1000, 10_000] we'd do 1000 runs, regroup
+               then 1000 more runs, regroup, then a final 10_000 runs.
+
+            for block in blocks:
+
+                for chain in range(n_chains):
+
+                    for i in range(number of samples in block):
+
+                        a.  Draw a random coordinate "k" to sample along.
+
+                        b.  Evaluate the partial derivative of the log posterior density at x(i) along coordinate "k",
+                            call it g(x(i),k)
+
+                        c.  Form the proposal step
+
+                            j != k:  y(i+1)[j] = x(i)[j],
+                            j == k:  y(i+1)[j] = x(i)[j] + s(i,k) * g(x(i),k) + sqrt(2*s(i,k)) * epsilon(i)
+
+                            where s(i,k) is the scalar size for coordinate k, and epsilon(i) is white noise.  Our
+                            proposals are then "moving" us towards higher density.
+                            This is similar to Hamiltonian Monte Carlo,
+                            except we are doing only one step (instead of a full path) and one coordinate at a time.
+
+                        e.  [When doing differential evolution in MALA, we do something like the differential evolution
+                            step described below in the AMH description, we don't repeat it here, but the proposal
+                            is modified as you might expect.]
+
+                        f.  Draw U(i) ~ Uniform[0,1]
+
+                        e.  Accept the step if
+
+                            log( U(i) )     <   log_posterior( y(i+1) ) - log_posterior( x(i) )
+                                                + Q( y(i+1) | x(i) ) - Q( x(i) | y(i+1 ),
+
+                            where Q( z | w ) is the probability of proposing z given we are at w.  We need to do this
+                            "correction" to make the chain "reversible", since the proposals here are *not* symmetric.
+
+                            Formally,
+
+                            Q(z | w) = -1. / (4. * s(i,k)) * (w[k] - (z[k] + s(i,k) * g(z, k))) ** 2
+
+                            and is derived from the normal distribution and g(.) is the gradient as above.
+
+                            Set accept(i) = 1 if the above is true, else 0.
+                            Here, `log_posterior` is the logarithm of the posterior density function.
+
+                        f.  Update the current parameter location and add it to the sample:
+
+                            x(i+1) = accept(i) * y(i+1) + (1 - accept(i)) * x(i)
+
+                        g.  Update the scalar parameter for coordinate k, approximately as follows
+
+                            s(i+1,k) = s(i,k) * (1 +
+                                scalar_adjust_rate/(i+1)**scaler_adjust_denom_power * (accept(i) - target_acceptance_rate)
+                            )
+
+                > Regroup from the individual MCMC chains and
+                    b.  Sample from the history across chains to form the sample for the
+                        Differential Evolution step (the nu(i) directions above).
+
+            > Use the final 3/4 of the MALA samples to
+                (a) approximate the variance-covariance proposal matrix for the following AMHA, and
+                (b) draw initial samples for the AMHA differential evolution.
+
+        **Adaptive Metropolis–Hastings + differential evolution (main phase)**
+
+        Adaptive Metropolis-Hastings + Differential Evolution Explained:
+
+            This is where the actual sampling is done for the final approximation to the posterior distribution.
+
+            It is divided into two sections:
+                * Burnin: specified by number of draws in `n_burnin`, and
+                * Sampling: specified by the number of draws in `n_samples`.
+
+            Essentially the burnin samples are used to tune to the sampling algorithm, but are not included in
+            the final results.  If `stop_adaptation_after_burnin=True`, then there are no further adaptations in
+            the sampling distribution after the burnin samples are complete, otherwise there are still some small
+            adaptations.  In practice this doesn't matter much and can lead to faster convergence, but in theory
+            the sample only asymptotically converges to the correct target distribution if the adaptations go to zero.
+            Note that burnin samples are not discarded, in the final results they are just labeled as burnin.
+
+            This is a very simplified version of the code, but essentially the code essentially runs as follows:
+
+            1. Initialize a starting point parameter value x(0)
+            2. Initialize a starting point variance-covariance Sigma(0)
+            3. Initialize a scaler s(0) > 0
+            4. Initialize "blocks", e.g. sequences for which we sample before regrouping and
+               adjusting the algorithm.  E.g., if blocks = [1000, 1000, 10_000] we'd do 1000 runs, regroup
+               then 1000 more runs, regroup, then a final 10_000 runs.
+
+            for block in blocks:
+
+                for chain in range(n_chains):
+
+                    for i in range(number of samples in block):
+
+                        a.  Draw a proposal noise vector epsilon(i) ~ Normal(0, Sigma(block)), where
+                           Sigma(i) is the current proposal distribution covariance matrix at iteration i.
+
+                        b.  [If doing Differential Evolution,] draw a pair of past points x(j1(i)), x(j2(i))
+                            from the history of samples, and form the direction:
+
+                            nu(i) = x(j1(i)) - x(j2(i)).
+
+                            The first "block" will not have this of course
+                            unless the user supplies `diff_evolution_past_samples`.
+
+                        c.  Form a proposal parameter point
+
+                            y(i+1) = x(i) + scaler(i) * (
+                                weight_DE * nu(i) + (1-weight_DE) * epsilon(i)
+                            )
+
+                        d.  Draw U(i) ~ Uniform[0,1]
+
+                        e.  Accept the step if
+
+                            log( U(i) ) < log_posterior( y(i+1) ) - log_posterior( x(i) ).
+
+                            Set accept(i) = 1 if the above is true, else 0.
+                            Here, `log_posterior` is the logarithm of the posterior density function.
+
+                        f.  Update the current parameter location and add it to the sample:
+
+                             x(i+1) = accept(i) * y(i+1) + (1 - accept(i)) * x(i)
+
+                        g.  Update the scalar parameter, approximately as follows
+
+                            s(i+1) = s(i) * (1 +
+                                scalar_adjust_rate/(i+1)**scaler_adjust_denom_power * (accept(i) - target_acceptance_rate)
+                            )
+
+                > Regroup from the individual MCMC chains and
+                    a.  Update the variance-covariance matrix `step_cov` across chains to
+                        Sigma(block+1) = Var(all samples x across chains)
+                    b.  Sample from the history across chains to form the sample for the
+                        Differential Evolution step (the nu(i) directions above).
+
+            > Use the non-burnin samples to form the final approximation to the posterior distribution.
+
+        References
+        ----------
+        .. [0] Metropolis–Hastings:
+           https://en.wikipedia.org/wiki/Metropolis%E2%80%93Hastings_algorithm
+        .. [1] Haario et al. (2001), adaptive Metropolis:
+           https://projecteuclid.org/journals/bernoulli/volume-7/issue-2/An-adaptive-Metropolis-algorithm/bj/1080222083.full
+        .. [2] ter Braak (2006), DE-MCMC:
+           https://doi.org/10.1007/s11222-006-8769-1
+        .. [3] MALA overview:
+           https://en.wikipedia.org/wiki/Metropolis-adjusted_Langevin_algorithm
+
+        Parameters
+        ----------
+            start_params: the starting point, can be a dict keyed on param names or a vector.  If multiple vectors are supplied,
+                there should be one for each chain. There is no default value, you need to set an initialization.
+                The dict need not include all parameters, parameters not included are set to zero.
+            step_cov: an initial variance-covariance for the AMH proposal; if None defaults to identity.  A good guess
+                      can make the algorithm work much faster, but typically this is hard to know, especially for
+                      distributions where parameters are heavily correlated and/or have very different scales.  The MALA
+                      warmup step is mostly to learn this matrix.
+            debug: whether to have verbose output, default `False`
+            specification_name: optional string naming the sample run, default None.
+            n_chains: the number of chains to run
+            n_burnin: the number of "burnin" draws to run that are not used in approximating the final distribution.
+                      (Note that these are retained; you can change the "burnin" ex-post on the `MCMCResults` object.)
+            n_samples: the number of "sample" draws to be used in approximating the final distribution.
+            max_processes: the maximum number of cores to run on, default 8.
+                           Will run about `n_chains`/`max_processes` chains per core.
+            seed: the random seed initialization for the random sampling object, default 0
+            target_acceptance_rate: The target acceptance rate for proposed samples in the adaptive metropolis sampling, default = .234.
+            draw_size: the number of parameters to draw from proposal distribution at once; default 2000.  It is much
+                       faster to draw many samples at once and loop through them than draw one at a time.
+            thinning: keep every `thinning`'d samples, that is if `thinning`=4 we keep every fourth draw of the MCMC.
+                      Default is 1 (no thinning of sample).
+            scaler0: the initial scaling factor in the AMH MCMC; defaults to 2.38/sqrt(2*d) where d is number of parameters.
+            min_scaler: the minimum scaling factor for the AMH MCMC; default 1e-12
+            max_scaler: the maximum scaling factor for the AMH MCMC; default inf
+            scaler_adjust_rate: default .5; the scaling on the proposal evolves as
+                                `scaler *= (1 + scaler_adjust_rate / max(itr - 100, 1) ** scaler_adjust_denom_power)`
+                                subject to bounds `min_scaler`, `max_scaler`.
+            scaler_adjust_denom_power: default .35; the scaling on the proposal evolves as
+                                       `scaler *= (1 + scaler_adjust_rate / max(itr - 100, 1) ** scaler_adjust_denom_power)`
+                                       subject to bounds
+            pbar_update_cadence: the time (in seconds) after which to update progress bars when debug=True; default=.7s
+            do_adaptive: whether to adjust proposal distribution over time, default = True.  Adaptation stops after pre-specifief
+                         `n_burnin` samples if `stop_adaptation_after_burnin=True`.
+            max_subchain_draws_burnin: default 5_000; the number of draws to do on a chain before regrouping across the chains,
+                                       adjusting the proposal variance-covariance, and re-sampling past draws for the differential
+                                       evolution step.
+            max_subchain_draws_sample: default 25_000; same as `max_subchain_draws_burnin` but for sampling cycles.
+            do_parallel: whether to run the chains in parrallel using `ray` package, or sequentially.  Default is True.
+            user_prompt_for_more_iters: flag for whether the sampling should terminate after the specified number of samples
+                                        are reached, or whether to prompt the user to enter additional samples to draw after
+                                        seeing convergence diagnostics.
+            proposal_df: if a positive integer, sample from a t(df=proposal_df) distribution,
+                         default is inf (for Gaussian proposals)
+            start_params_is_original_scale: default True. Boolean for whether supplied `start_params` starting point is in the "original"
+                                  parameter space, or the "transformed" (or "unconstrained") parameter space. Typically
+                                  not something to pay attention to.
+            step_cov_initial_samples: if `do_adaptive=True`, the number of draws to wait for before adjusting the proposal
+                                      distribution to avoid degeneracy.  Default is None, which resolves to `max(n_burnin // 100, 50)`.
+            fix_params: fixed values on the same scale as `start_params`. Returned
+                        draws and fixed-parameter metadata use the original model scale.
+            normalize_step_cov: default False; not currently used, for normalizing determinant of proposal distribution
+            do_diff_evolution_mc: default True; flag for whether to do Differential Evolution sampling (True) or straight
+                                  Adaptive Metropolis Hastings (False).  With differential evolution, proposal steps are in
+                                  the direction of differences of past pairs of samples, plus some Gaussian noise tuned to the
+                                  sampled distribution so far.  Otherwise, it is straight Adaptive Metropolis where proposals
+                                  come from a Gaussian tuned to the burnin-sample of the distribution.
+            diff_evolution_max_draws: default 25_000; the number of draws from the sampling history to use for the D.E. jumps.
+            diff_evolution_past_samples: default None; optional array of past draws from which to begin the D.E. sampling immediately.
+            diff_evolution_weight: default 0.95; the share of weight to give to the D.E. jump proposal vs the tuned Gaussian noise in AMH.
+            diff_evolution_frac_burnin: default .25; only pull D.E. points for jumps exclusing first `diff_evolution_frac_burnin` share of
+                                        samples.
+            diff_evolution_jump_cadence: default np.inf; cadence with which to try a full (scaler=1) jump in direction of
+                                         differential evolution direction (x(i1) - x(i2)) where x(i1),x(i2) are the D.E.
+                                         draws at iteration i.  Don't experiment with this.
+            stop_adaptation_after_burnin: default False. If True, freeze proposal
+                                          adaptation after the burn-in phase.  For long chains this
+                                          rarely changes practical results; in theory adaptation must
+                                          vanish for exact asymptotic correctness.
+
+            do_mala_cd_warmup: default False. If True, run coordinate MALA warmup before AMHA.
+                               Recommended for strongly correlated or badly scaled posteriors.
+            keep_mala_warmup: default True. If True, store warmup MCMCResults in
+                              ``fit.other_info['mala_cd_warmup_fit']``; if False, warmup time is counted
+                              but warmup draws are not attached to the returned object.
+            n_samples_mala: the number of samples to be drawn, default 20_000
+            frac_burnin_mala: the share of sample to discard as burnin for MALA; default .25
+            n_chains_mala: default 4; the number of chains to run in the MALA warmup.
+            thinning_mala: keep every `thinning`'d samples, that is if `thinning`=4 we keep every fourth draw of the MALA MCMC.
+                           Default is 1 (no thinning of sample).
+            target_acceptance_rate_mala: default 0.57; the target acceptance rate for the CD MALA step.
+            do_cauchy_mala: default False; if True noise in proposal is Cauchy distributed rather than Gaussian.
+            do_mala_mala: default True; whether to use the coordinate slope in forming the proposal.
+                          If false, straight Metropolis Hastings by coordinate.
+            tau_adjust_mala: learning rate for MALA per-coordinate step-size adaptation.
+            max_subchain_draws_mala: max draws per chain before MALA regroups chains.
+            diff_evolution_step_cadence_mala: default 20; every this many iterations, try a full DE step
+                                              instead of a single-coordinate update.
+            diff_evolution_frac_burnin_mala: default 0.5; fraction of history to sample from for D.E. jumps in the MALA warmup,
+                                             e.g. 0.3 means only sample from last 30% of history.
+            diff_evolution_max_draws_mala: default 2_500; the number of draws from the sampling history to use for the D.E. jumps in the MALA warmup
+            tau0_mala: initial per-coordinate step sizes for MALA warmup.
+            scalar_jitter_bounds: bounds on scalar jitter in AMHA proposals (see :meth:`amha`).
+            callback_function: optional ``callback(params) -> str`` each retained draw.
+
+        Returns
+        -------
+        MCMCResults
+            Main-phase samples; may include ``other_info['mala_cd_warmup_fit']`` when
+            ``do_mala_cd_warmup`` and ``keep_mala_warmup`` are True.
+
+        See Also
+        --------
+        amha, mala
+        """
+
+        if debug:
+            print('\n' * 3+ '=' * 100)
+            settings_dict = dict(
+                **dict(
+                    debug=debug,
+                    pbar_update_cadence=pbar_update_cadence,
+                    user_prompt_for_more_iters=user_prompt_for_more_iters,
+
+                    seed=seed,
+                    do_adaptive=do_adaptive,
+                    n_chains=n_chains,
+                    n_burnin=n_burnin,
+                    n_samples=n_samples,
+                    target_acceptance_rate=target_acceptance_rate,
+                    thinning=thinning,
+                    max_subchain_draws_burnin=max_subchain_draws_burnin,
+                    max_subchain_draws_sample=max_subchain_draws_sample,
+                    draw_size=draw_size,
+
+                    step_cov=None if None else "User Supplied",
+                    scaler0=scaler0, min_scaler=min_scaler, max_scaler=max_scaler,
+                    scaler_adjust_rate=scaler_adjust_rate,
+                    scaler_adjust_denom_power=scaler_adjust_denom_power,
+
+                    do_parallel=do_parallel,
+                    max_processes=max_processes,
+
+                    start_params_is_original_scale=start_params_is_original_scale,
+
+                    normalize_step_cov=normalize_step_cov,
+                    stop_adaptation_after_burnin=stop_adaptation_after_burnin,
+
+                    do_diff_evolution_mc=do_diff_evolution_mc,
+                    diff_evolution_max_draws=diff_evolution_max_draws,
+                    diff_evolution_past_samples=None if diff_evolution_past_samples is None else len(diff_evolution_past_samples),
+                    diff_evolution_weight=diff_evolution_weight,
+                    diff_evolution_frac_burnin=diff_evolution_frac_burnin,
+                    diff_evolution_jump_cadence=diff_evolution_jump_cadence,
+
+                    scalar_jitter_bounds = str(scalar_jitter_bounds),
+
+                    do_mala_cd_warmup=do_mala_cd_warmup
+                ),
+                **(
+                    dict(
+                        keep_mala_warmup=keep_mala_warmup,
+
+                        n_samples_mala=n_samples_mala, frac_burnin_mala=frac_burnin_mala,
+                        n_chains_mala=n_chains_mala,
+                        thinning_mala=thinning_mala,
+                        max_subchain_draws_mala=max_subchain_draws_mala,
+                        do_mala_mala=do_mala_mala,
+                        do_cauchy_mala=do_cauchy_mala,
+                        tau_adjust_mala=tau_adjust_mala,
+                        tau0_mala=tau0_mala,
+                        target_acceptance_rate_mala=target_acceptance_rate_mala,
+
+                        diff_evolution_step_cadence_mala=diff_evolution_step_cadence_mala,
+                        diff_evolution_frac_burnin_mala=diff_evolution_frac_burnin_mala,
+                        diff_evolution_max_draws_mala=diff_evolution_max_draws_mala,
+
+                    ) if do_mala_cd_warmup else dict()
+                )
+            )
+            print_options(settings_dict, title='SAMPLING SETTINGS')
+
+        if specification_name is None:
+            specification_name = self.specification_name
+
+        start_params = np.array(self.dict_2_array(start_params))
+        self.check_bounds_satisfied(start_params, start_params_is_original_scale)
+
+        if do_mala_cd_warmup:
+
+            if debug:
+                print('\n' * 3 + '=' * 100)
+                print('Beginning Coordinate MALA warmup fit to tune location and parameter scale...\n')
+
+            if n_chains_mala is None:
+                n_chains_mala = n_chains
+
+            fit_mala = self.mala(
+                start_params, n_chains=n_chains_mala,
+                n_samples=n_samples_mala, frac_burnin=frac_burnin_mala,
+                thinning=thinning_mala,
+                # resample_k=None, # TODO remove
+                target_acceptance_rate=target_acceptance_rate_mala,
+                max_subchain_draws=max_subchain_draws_mala,
+                do_cauchy=do_cauchy_mala,
+                do_mala=do_mala_mala, start_params_is_original_scale=start_params_is_original_scale, debug=debug,
+                pbar_update_cadence=pbar_update_cadence,
+                user_prompt_for_more_iters=user_prompt_for_more_iters,
+                diff_evolution_step_cadence=diff_evolution_step_cadence_mala,
+                diff_evolution_max_draws=diff_evolution_max_draws_mala,
+                diff_evolution_frac_burnin=diff_evolution_frac_burnin_mala,
+                tau_adjust=tau_adjust_mala, fix_params=fix_params, specification_name=specification_name,
+                callback_function=callback_function, tau0=tau0_mala
+            )
+
+            if debug:
+                print("Intermediate initial MALA fit:")
+                print(fit_mala)
+
+            start_params = np.array(fit_mala.get_last_sample(n_chains))
+            # MCMCResults exposes original-scale draws. Match the caller's
+            # scale before AMHA, preserving how fixed parameters are interpreted.
+            if not start_params_is_original_scale:
+                start_params = np.array([self.inv_transform(x) for x in start_params])
+            self.check_bounds_satisfied(start_params, start_params_is_original_scale)
+            # Both proposals operate in sampling coordinates. Use the full
+            # retained warmup for covariance regardless of the DE pool budget.
+            step_cov = fit_mala.other_info['cov_params_unbounded_space']
+            diff_evolution_past_samples = None
+            if do_diff_evolution_mc and diff_evolution_max_draws >= 2:
+                diff_evolution_past_samples = fit_mala.get_inv_transform_draws(
+                    size=diff_evolution_max_draws, seed=seed, return_cov=False)
+
+            if debug:
+                print('\nMALA Warmup fit completed...\n')
+                print('=' * 100)
+
+        fit = self.amha(
+            start_params, step_cov=step_cov, debug=debug, specification_name=specification_name, n_chains=n_chains,
+            n_burnin=n_burnin, n_samples=n_samples, max_processes=max_processes,
+            seed=seed, target_acceptance_rate=target_acceptance_rate, draw_size=draw_size,
+            scaler0=scaler0, min_scaler=min_scaler, max_scaler=max_scaler,
+            scaler_adjust_rate=scaler_adjust_rate, thinning=thinning,
+            scaler_adjust_denom_power=scaler_adjust_denom_power,
+            # resample_k=DEFAULT_AM_RESAMPLE_K, # TODO remove
+            pbar_update_cadence=pbar_update_cadence, do_adaptive=do_adaptive,
+            max_subchain_draws_burnin=max_subchain_draws_burnin,
+            max_subchain_draws_sample=max_subchain_draws_sample,
+            do_parallel=do_parallel,
+            user_prompt_for_more_iters=user_prompt_for_more_iters, proposal_df=proposal_df,
+            start_params_is_original_scale=start_params_is_original_scale,
+            step_cov_initial_samples=step_cov_initial_samples,
+            fix_params=fix_params,
+            normalize_step_cov=normalize_step_cov,
+            do_diff_evolution_mc=do_diff_evolution_mc,
+            diff_evolution_past_samples=diff_evolution_past_samples,
+            diff_evolution_frac_burnin=diff_evolution_frac_burnin,
+            diff_evolution_max_draws=diff_evolution_max_draws,
+            diff_evolution_weight=diff_evolution_weight,
+            diff_evolution_jump_cadence=diff_evolution_jump_cadence,
+            scalar_jitter_bounds=scalar_jitter_bounds,
+            stop_adaptation_after_burnin=stop_adaptation_after_burnin,
+            callback_function=callback_function
+        )
+
+        if do_mala_cd_warmup:
+            fit.mcmc_time += fit_mala.mcmc_time + fit_mala.result_init_time
+            if keep_mala_warmup:
+                fit.other_info['mala_cd_warmup_fit'] = fit_mala
             else:
-                return '%.4g' % x
+                del fit_mala
 
-        for c in ['mean', 'std', 'median', '[.05, ', '.95]', 'positive', 'MCSE', 'Rel MCSE']:
-            tbl_copy[c] = tbl_copy[c].apply(coef_fmt)
-        if param_subset is not None:
-            tbl_copy = tbl_copy[tbl_copy.param.isin(param_subset)]
+        return fit
 
-        tbl_copy['R_hat'] = tbl_copy['R_hat'].apply(lambda x: '%.4f' % x)
+    def check_bounds_satisfied(self, start_params, start_params_is_original_scale):
+        """Ensure MCMC/optimization starts are finite and strictly inside bounds.
 
-        if not show_positive:
-            del tbl_copy['positive']
-        if not show_ESS:
-            del tbl_copy['ESS']
-        if not show_R_hat:
-            del tbl_copy['R_hat']
-        if not show_CI:
-            del tbl_copy['[.05, ']
-            del tbl_copy['.95]']
+        Parameters
+        ----------
+        start_params : array_like
+            One vector or a list of per-chain vectors.
+        start_params_is_original_scale : bool
+            If ``False``, values are on the unbounded transformed scale (only
+            valid when ``do_bounded_transform=True``).
 
-        tbl_strs = tbl_copy.to_string().split('\n')
-        width = len(tbl_strs[0])
+        Raises
+        ------
+        Exception
+            Wrong dimension, non-finite values, or points on/outside bounds.
+        """
 
-        ret = '═' * width
-        ret += '\nMCMC Results'
-        if self.specification_name is not None:
-            ret += f'\n"{self.specification_name}"'
-        ret += '\n' + '─' * width
+        if not start_params_is_original_scale and not self.do_bounded_transform:
+            raise Exception("Cannot supply starting point that is on transformed unbounded scale "
+                            "When `do_bounded_transform` is False!")
 
-        ret += '\n\nNum Parameters:     %d' % len(self.param_names)
-        ret += '\nMethod:             %s' % self.method
+        if np.ndim(start_params) == 1:
+            start_params = [start_params]
 
-        ret += '\n\n'
+        for x in start_params:
+            if len(x) != self.num_params:
+                raise Exception(f'`start_params` must have {self.num_params} length, but you supplied {len(x)}!')
 
-        info1 = np.array([
-            ('Date:', self.date),
-            ('Time:', self.timestamp),
-            ('', ''),
-            ('Total Iterations:', self.n_chains * (self.n_samples + self.n_burnin)),
-            ('MCMC Draw Time:', '%.2fs' % self.mcmc_time),
-            ('R_hat Time:', '%.2fs' % self.R_hat_time),
-            ('ESS Time:', '%.2fs' % self.ess_time),
-            ('Summary Time:', '%.2fs' % self.result_init_time),
-            ('', ''),
-            ('No. Chains:', self.n_chains),
-            ('    Thinning:', self.thinning),
-            ('    Iterations:', self.n_iterations),
-            ('    Burnin:', self.n_burnin),
-            ('    Samples:', self.n_samples),
-            ('', ''),
-        ])
-        info2 = np.array([
-            ('Acceptance Rate:', "%.4f" % self.acceptance_rate),
-            ('Adaptive:', self.options['do_adaptive']),
-            ('', ''),
-            # ('Multi ESS (*):', np.sum(self.m_ess)),
-            # ('', ''),
-            ('Efficiency:', ''),
-            ('    Min:', "%.4f" % self.min_efficiency),
-            ('    Avg:', "%.4f" % self.avg_efficiency),
-            ('    Max:', "%.4f" % self.max_efficiency),
-            ('', ''),
-            ('Gelman-Rubin:', ''),
-            ('    R_hat > 1.01:', f"{np.sum(self.R_hat > 1.01)}/{self.num_params}"),
-            ('    Avg Split R_hat:', "%.4f" % self.avg_R_hat),
-            ('    Median Split R_hat:', "%.4f" % self.median_R_hat),
-            ('    Max Split R_hat:', "%.4f" % self.max_R_hat),
-            ('', ''),
-            ('Maximum Log Posterior:', "%.4e" % self.max_log_posterior),
-        ])
-        info_series1 = pd.Series(info1[:, 1], index=info1[:, 0]).to_string().split('\n')
-        info_series2 = pd.Series(info2[:, 1], index=info2[:, 0]).to_string().split('\n')
-        ret += '\n'.join([f'{i1}        {i2}' for i1, i2 in zip(info_series1, info_series2)])
+        for x in start_params:
+            for i, p in enumerate(self.param_names):
 
-        ret += '\n'
+                x_i = x[i]
 
-        ret += '\n' + '═' * width
-        ret += '\n' + tbl_strs[0]
-        ret += '\n' + '─' * width
-        ret += '\n' + '\n'.join(tbl_strs[1:])
-        ret += '\n' + '─' * width
+                if not np.isfinite(x_i):
+                    raise Exception(f"\nParam {i} ('{p}'): value {x_i} is not finite!")
 
-        if np.any(self.R_hat > THRESHOLD_R_HAT):
-            ret += f'\nSome R_hat are above {THRESHOLD_R_HAT}, the MCMC chains have not converged!'
-        if np.any(self.ess.sum(axis=1) < THRESHOLD_ESS):
-            if self.fix_params is not None:
-                not_fixed_params = np.array([k not in self.fix_params for k in self.param_names])
-            else:
-                not_fixed_params = True
-            if np.any((self.ess.sum(axis=1) < THRESHOLD_ESS) & not_fixed_params):
-                ret += f'\nSome effective sample sizes are below {THRESHOLD_ESS}!\n'
+                if p not in self.bounds:
+                    continue
 
-        # ret += f"\n{np.sum(np.abs(self.geweke_df.values) > 1.96)}/" \
-        #        f"{self.n_chains * (self.num_params - (len(self.fix_params) if self.fix_params else 0))} " \
-        #        "approximate Geweke z-scores are stat-sig at 5% level."
+                if not start_params_is_original_scale:
+                    x_i = self.transformations[p].transform(x[i])
 
-        # ret += '\n(*) Multi ESS still experimental\n'
-        ret += "\n" + (" " * max(width - 11 - len(self.__version__), 0)) + "[kanly, v=%s]\n" % self.__version__
+                if x_i <= self.bounds[p][0] or x_i >= self.bounds[p][1]:
+                    raise Exception(f"Bounds not satisfied at starting point!"
+                                    f"\nParam {i} ('{p}'): value {x_i} does not fall "
+                                    f"strictly in bounds {self.bounds[p]}!")
 
-        return ret
+    def maximize_posterior(self, start_params, transformed=False, **bfgs_pqn_kwargs):
+        """
+        If `transformed=True`, then `start_params` is taken to be on the transformed scale
+
+        Args:
+            start_params: Initial point.
+            transformed: Whether ``start_params`` are already transformed.
+            **bfgs_pqn_kwargs: Optimizer options forwarded to ``bfgs_pqn``.
+        """
+        return self._maximize_function_internal(
+            self.log_posterior_transformed,
+            start_params, transformed=transformed, name='log_posterior', **bfgs_pqn_kwargs)
+
+    def maximize_likelihood(self, start_params, transformed=False, **bfgs_pqn_kwargs):
+        """
+        If `transformed=True`, then `start_params` is taken to be on the transformed scale
+
+        Args:
+            start_params: Initial point.
+            transformed: Whether ``start_params`` are already transformed.
+            **bfgs_pqn_kwargs: Optimizer options forwarded to ``bfgs_pqn``.
+        """
+        return self._maximize_function_internal(
+            self.log_likelihood_function_transformed,
+            start_params, transformed=transformed, name='log_likelihood', **bfgs_pqn_kwargs)
+
+    def _maximize_function_internal(self, func, start_params, name=None, transformed=False, **bfgs_pqn_kwargs):
+        """Shared bounded/unbounded maximization wrapper used by MAP and MLE methods.
+
+        Args:
+            func: Objective callable to maximize.
+            start_params: Initial point.
+            name: Optional objective_function label.
+            transformed: Whether ``start_params`` are already transformed.
+            **bfgs_pqn_kwargs: Optimizer options.
+        """
+        if not transformed:
+            start_params = self.inv_transform(start_params)
+        result = bfgs_pqn(func, start_params,
+                          # bounds=None if self.do_bounded_transform else self.bounds_dict_2_array(), # TODO remove bounds
+                          maximize=True, **bfgs_pqn_kwargs)
+        params = result.x.copy()
+        if not transformed:
+            params = self.transform(params)
+        return {'params': params,
+                'optimization_result': result,
+                'name': name,
+                'transformed': transformed}
 
     def __str__(self):
-        """
-        Return the formatted MCMC summary string (calls ``summary()``).
+        """Return a formatted summary string of this Bayesian model.
+
+        Displays the number of parameters, model type, parameter names,
+        their bounds, and the registered prior distributions.
 
         Returns:
-            String returned by ``self.summary()``.
+            Multi-line string suitable for printing.
         """
-        return self.summary()
+
+        def prior_2_str(x):
+            """Convert a prior object to a display string.
+
+            Args:
+                x: A prior specification: a string, a frozen scipy distribution,
+                    a frozen multivariate distribution, or a callable.
+
+            Returns:
+                Human-readable string representation of the prior.
+            """
+            if isinstance(x, str):
+                return x
+            elif isinstance(x, rv_frozen):
+                return f'{x.dist.name}({x.args}, {x.kwds})'
+            elif isinstance(x, multi_rv_frozen):
+                return f'{x._dist}(dim={x.dim})'
+            elif isinstance(x, Callable):
+                return 'Callable'
+            else:
+                raise Exception
+
+        df_params = pd.DataFrame({'parameter': self.param_names})
+        df_params['bounds'] = [str(self.bounds.get(k, '')) for k in self.param_names]
+        prior_list = []
+        for k in self.param_names:
+            priors_k = []
+            if k in self.priors_orig:
+                priors_k.append(prior_2_str(self.priors_orig[k]))
+            for j in self.priors_orig.keys():
+                if isinstance(j, tuple) and k in j:
+                    priors_k.append(prior_2_str(self.priors_orig[j]))
+            for pg, grp in self.parameter_groupings.items():
+                if k in grp and pg in self.priors:
+                    priors_k.append(prior_2_str(self.priors_orig[pg]))
+
+            if priors_k:
+                prior_list.append(', '.join(priors_k))
+            else:
+                prior_list.append('')
+
+        df_params['priors'] = prior_list
+
+        width = max(len('Bayesian Statistical Model'), len(df_params.to_string().split('\n')[0]))
+        bar = '─' * width
+        dbl_bar = '═' * width
+
+        s = (
+            bar,
+            f'Bayesian Statistical Model' + (
+                '\n' + self.specification_name if self.specification_name is not None else ''),
+            dbl_bar,
+            f'Num Params: {self.num_params}',
+            f'Type:       {self.model_type()}',
+            f'',
+            f'{df_params.to_string()}',
+            bar,
+        )
+        return '\n'.join(s)
 
     def __repr__(self):
-        """
-        Return the formatted MCMC summary string.
-
-        Returns:
-            String returned by ``str(self)``.
-        """
+        """Return the formatted model summary string."""
         return str(self)
 
-    # TODO SWAP OUT?
-    # from kanly import __version__
-    # from kanly.bayes.mcmc.gelman_rubin_split_rhat import get_rhat
-    # from kanly.time_series.auto_correlation_function import auto_correlation_function
-    # from kanly.bayes.utils.highest_density_interval import get_highest_density_interval
-    # from kanly.bayes.utils.kde_clipped import get_kde_clipped
-    # from kanly.utils.function_str_to_callable import _check_func_for_test
-
-    # def diagnostic_plot(self, key, max_points=50_000, scale_exclude_burnin=True, figsize=(10, 5), dpi=130, title=None):
-    #
-    #     f, ax = plt.subplots(nrows=2, ncols=2, figsize=figsize, dpi=dpi)
-    #
-    #     vals_w_burnin = self.get_sample(key, include_burnin=True)
-    #     n = len(vals_w_burnin)
-    #
-    #     xx = np.arange(n)
-    #     stride_0 = max(1, (n // max_points))
-    #     ax[0][0].plot(xx[::stride_0], vals_w_burnin[::stride_0])
-    #
-    #     if scale_exclude_burnin:
-    #         z = vals_w_burnin[~self.sample_info_df.is_burnin][::stride_0]
-    #         scale = [z.min(), z.max()]
-    #         diff = scale[1] - scale[0]
-    #         scale[0] -= .01 * diff
-    #         scale[1] += .01 * diff
-    #         ax[0][0].set_ylim(scale)
-    #
-    #     for j in range(self.n_chains):
-    #         ax[0][0].axvline(j * (n // self.n_chains), ls=':', color='k')
-    #         ax[0][0].axvline(j * (n // self.n_chains) + self.n_burnin, ls='--', color='grey')
-    #         ax[0][0].axvspan(j * (n // self.n_chains), j * (n // self.n_chains) + self.n_burnin, alpha=.5, color='grey')
-    #     ax[0][0].set_title(f'Trace', fontsize=15)
-    #     ax[0][0].set_xlabel('Draw', fontsize=12)
-    #     ax[0][0].set_xlim(0, n)
-    #
-    #     vals = vals_w_burnin[~self.sample_info_df.is_burnin]
-    #     xx_overall = np.linspace(*np.quantile(vals, (.0005, .9995)), 250)
-    #     kde_overall, _, _ = get_kde_clipped(vals)
-    #
-    #     ax[0][1].plot(xx_overall, kde_overall(xx_overall), lw=2, color='k')
-    #     ax[0][1].hist(vals, density=True, bins=30, alpha=.4)
-    #     ax[0][1].set_title(f'Overall KDE\n(ESS = {self.summary_df["ESS"][key] if key in self.param_names else "?"})',
-    #                        fontsize=15)
-    #
-    #     mean, median = np.mean(vals), np.median(vals)
-    #     ax[0][1].axvline(mean, color='k', label='mean')
-    #     ax[0][1].axvline(median, color='k', ls='--', label='med')
-    #     if key in self.param_names:
-    #         ax[0][1].axvline(self.map_params[key], color='k', ls=':', label='map')
-    #     ax[0][1].legend(loc='best', fontsize=9)
-    #
-    #     for c in range(self.n_chains):
-    #         sample_c = self.get_sample(key, chain=c, include_burnin=False)
-    #         kde_c, l, h = get_kde_clipped(sample_c)
-    #         x_rng_chn = np.linspace(l, h, 250)
-    #         ax[1][1].plot(x_rng_chn, kde_c(x_rng_chn))
-    #
-    #     ax[1][1].plot(xx_overall, kde_overall(xx_overall), color='k', lw=3)  # TODO
-    #     ax[1][1].set_title(f'Chain KDEs\n(R_hat = '
-    #                        f'{"%.4f" % self.summary_df.R_hat[key] if key in self.param_names else "?"})',
-    #                        fontsize=15)
-    #
-    #     ax[0][1].set_xlim(ax[1][1].get_xlim())
-    #
-    #     if key in self.param_names:
-    #         for c in range(len(self.chain_results)):
-    #             ax[1][0].plot(self.acfs[key][c], marker='.', lw=0)
-    #         ax[1][0].axhline(0, color='k')
-    #         ax[1][0].set_xlabel('Lag', fontsize=12)
-    #         ax[1][0].set_title('Autocorrelation by Chain', fontsize=15)
-    #     else:
-    #         ax[1][0].set_title('Autocorrelations not Shown\nfor custom functions', fontsize=15)
-    #         ax[1][0].axis("off")
-    #
-    #     plt.suptitle(
-    #         (f'"{key}"' +
-    #          (f'\n{"%.3e" % self.mean_params[key]}  ({"%.3e" % self.bse[key]})'
-    #           if key in self.param_names else ''
-    #           )) if title is None else title,
-    #         fontsize=17)
-    #
-    #     plt.tight_layout()
-    #
-    #     return f
-
-    def equitail_ci(self, key, level):
-        """
-        Compute the equi-tailed credible interval for a parameter.
-
-        Args:
-            key: Parameter name (or callable/index) passed to ``get_sample``.
-            level: Coverage probability, e.g. ``0.9`` for a 90% interval.
+    @classmethod
+    def model_type(cls):
+        """Return the model type identifier string.
 
         Returns:
-            2-element array ``[lower, upper]`` of the equi-tailed interval bounds.
+            The string ``'General'`` for the base ``BayesianModel`` class;
+            subclasses override this to return a more specific label.
         """
-        return np.quantile(self.get_sample(key), [(1 - level) / 2, (1 + level) / 2])
+        return 'General'
 
-    def set_param_names(self, param_names):
+    def step_back_from_bounds(self, x, step=.001):
+        """Nudge ``x`` slightly inward from finite bounds.
+
+        Useful for starting optimizers or samplers when a user supplies values
+        exactly on a bound.
+
+        Parameters
+        ----------
+        x : ndarray
+            Parameter vector on the original scale.
+        step : float, ndarray, or dict, default 0.001
+            Inward shift as a fraction of interval width (two-sided bounds),
+            or per-parameter overrides.
+
+        Returns
+        -------
+        ndarray
+            Copy of ``x`` clipped inward where bounds are finite.
         """
-        Rename all parameters in-place across every stored DataFrame and dict.
+        xcopy = x.copy()
 
-                Updates ``param_names``, ``summary_df`` index, ``cov_params``
-                columns/index, ``mean_params``, ``median_params``, ``bse``,
-                ``R_hat``, ``map_params``, ``ess`` index, ``acfs``, and
-                ``sample_df`` column names.
+        if self.bounds is None or len(self.bounds) == 0:
+            return xcopy
 
-        Args:
-            param_names: New ordered list of parameter names; must have the same length as the current list.
+        if isinstance(step, (int, float)):
+            step = np.array([float(step)] * self.num_params)
+        elif isinstance(step, dict):
+            return self.dict_2_array(step, default_value=.0001)
+        assert np.all(step < 1) and np.all(step >= 0)
+
+        lb = np.ones(self.num_params) * -np.inf
+        ub = np.ones(self.num_params) * np.inf
+        for i, k in enumerate(self.param_names):
+            if k in self.bounds:
+                l, u = self.bounds[k]
+                if l > -np.inf and u < np.inf:
+                    dist = u - l
+                    l += step[i] * dist
+                    u -= step[i] * dist
+                elif l > -np.inf and u == np.inf:
+                    l += min(step[i], 3 * abs(xcopy[i] - l))
+                elif l == -np.inf and u < np.inf:
+                    u -= min(step[i], 3 * abs(u - xcopy[i]))
+                lb[i] = l
+                ub[i] = u
+
+        return np.clip(xcopy, lb, ub)
+
+    def get_frozen_function(self, function, fixed_params, transformed_space=False):
+        """Restrict a full-vector callable to free coordinates only.
+
+        Parameters
+        ----------
+        function : callable
+            ``f(params) -> float`` on the full ``params`` vector.
+        fixed_params : dict or None
+            ``{name: value}`` for coordinates held fixed during optimization
+            or sampling.
+        transformed_space : bool, default False
+            If ``True``, ``function`` is defined on unbounded coordinates and
+            ``fixed_params`` values on the original scale are mapped through
+            ``inv_transform``.
+
+        Returns
+        -------
+        temp_func : callable
+            ``f_reduced(z)`` where ``z`` has length ``n_unfixed``.
+        n_unfixed : int
+        fixed_param_ind, fixed_param_vals, unfixed_param_ind : ndarray
+            Indexing metadata to rebuild the full vector.
+
+        Notes
+        -----
+        Used by :meth:`map` and :meth:`mle` when ``fixed_params`` is set.
         """
-        assert len(param_names) == len(self.param_names)
 
-        old_param_names = self.param_names
+        if fixed_params is None or len(fixed_params) == 0:
+            return function, self.num_params, [], [], list(range(self.num_params))
 
-        self.param_names = param_names
-        self.summary_df.index = param_names
-        self.cov_params.columns = param_names
-        self.cov_params.index = param_names
-
-        for c in [self.median_params, self.mean_params, self.bse, self.R_hat, self.map_params]:
-            c.index = param_names
-
-        self.ess.index = [('ESS', k) for k in param_names]
-        self.acfs = {new_k: self.acfs[k] for new_k, k in zip(param_names, old_param_names)}
-
-        self.sample_df.rename(dict(zip(old_param_names, param_names)), axis=1, inplace=True)
-
-    def apply_function_to_sample(self, func):
-        """
-        Apply an arbitrary function to the post-burn-in sample DataFrame.
-
-                Checks the function signature against ``param_names`` via
-                ``_check_func_for_test``, then calls it on the filtered DataFrame.
-                Falls back to ``np.vectorize`` if the result length does not match
-                the number of post-burn-in rows.
-
-        Args:
-            func: Callable that accepts a DataFrame row (or the full DataFrame) and returns a value.
-
-        Returns:
-            Array or Series of function outputs aligned to the post-burn-in draws.
-        """
-        func = _check_func_for_test(func, self.param_names)
-        v = func(self.sample_df[~self.sample_info_df.is_burnin])
-        if len(v) != np.count_nonzero(~self.sample_info_df.is_burnin):
-            func = np.vectorize(func)
-            return func(self.sample_df[~self.sample_info_df.is_burnin])
+        if transformed_space:
+            fixed_params_transformed = {
+                k: self.transformations.get(k).inv_transform(v)
+                if k in self.transformations else v
+                for k, v in fixed_params.items()
+            }
         else:
-            return v
-
-    def trace(self, key, scale_exclude_burnin=True, show=False, figsize=None, max_points=5_000):
-
-        """
-        Plot per-chain trace plots for a single parameter.
-
-                Creates one subplot row per chain, overlaying horizontal lines at
-                the 1st, 5th, 50th, 95th, and 99th percentiles of the post-burn-in
-                samples.  The burn-in period is shaded in each subplot.
-
-        Args:
-            key: Parameter name (or index/callable).
-            scale_exclude_burnin: Whether to set the y-axis limits based only on post-burn-in values.
-            show: Whether to call ``plt.show()``.
-            figsize: Figure size ``(width, height)``; auto-scaled by chain count when ``None``.
-            max_points: Maximum number of draw points to render per chain (sub-sampled if exceeded).
-
-        Returns:
-            Matplotlib Figure object.
-        """
-        if figsize is None:
-            figsize = (7, self.n_chains * 1.5)
-
-        fig, ax = plt.subplots(nrows=self.n_chains, dpi=130, figsize=figsize, sharex=True, sharey=True)
-
-        sample_excl_burn = self.get_sample(key, include_burnin=False)
-        q01, q05, q50, q95, q99 = np.quantile(sample_excl_burn, [.01, .05, .5, .95, .99])
-
-        for i in range(self.n_chains):
-            y = self.get_sample(key, chain=i, include_burnin=True).values
-            xrng = np.arange(self.n_iterations)
-            if len(y) > max_points:
-                stride = int(np.ceil(len(y) / max_points))
-                y = y[::stride]
-                xrng = xrng[::stride]
-            ax[i].plot(xrng, y, alpha=.7)
-            ax[i].axhline(q50, color='g', lw=2)
-            ax[i].axhline(q05, ls='--', color='g')
-            ax[i].axhline(q95, ls='--', color='g')
-            ax[i].axhline(q01, ls=':', color='g')
-            ax[i].axhline(q99, ls=':', color='g')
-            ax[i].axvspan(0, self.n_burnin, color='k', alpha=.05)
-            ax[i].axvline(self.n_burnin, color='k', ls=':')
-            ax[i].set_ylabel(f'Chain {i}')
-
-        if scale_exclude_burnin:
-            l, h = sample_excl_burn.min(), sample_excl_burn.max()
-            plt.ylim((l - (h - l) * .05, h + (h - l) * .05))
-
-        plt.xlabel('Draw')
-        plt.suptitle(key, fontsize=15)
-        plt.tight_layout()
-        plt.xlim((0, self.n_iterations))
-
-        if show:
-            plt.show()
-
-        return fig
-
-    def get_key(self, key, debug=False):
-        """
-        Resolve a user-supplied parameter key to a canonical parameter name.
-
-        Args:
-            key: Parameter name string, integer index, or callable.
-            debug: Whether to print debugging info.
-
-        Returns:
-            Resolved parameter key (string, index, or callable).
-        """
-        return get_key(key, self.param_names, debug)
-
-    def boxplot(self, key, subsample=None, seed=0, show=False, figsize=None):
-
-        """
-        Plot per-chain box-style interval plots for a single parameter.
-
-                For each chain, renders a horizontal line plot showing the
-                [5, 95] interval, [25, 75] IQR, [33, 67] interval, median (circle),
-                and mean (diamond).
-
-        Args:
-            key: Parameter name (or index/callable).
-            subsample: Maximum number of draws to sample per chain.
-            seed: Random seed for sub-sampling.
-            show: Whether to call ``plt.show()``.
-            figsize: Figure size tuple.
-
-        Returns:
-            Matplotlib Figure object.
-        """
-        if figsize is None:
-            figsize = (8, self.n_chains * .5)
-
-        fig = plt.figure(figsize=figsize, dpi=130)
-
-        for i, chn in enumerate(range(self.n_chains)):
-            color = None
-            x = self.get_sample(key, chain=chn, subsample=subsample, seed=seed)
-            z = np.quantile(x, [.05, .25, 1 / 3, .5, 2 / 3, .75, .95])
-            temp = plt.plot([z[0], z[-1]], [i, i], lw=2,
-                            label='[.05, .95]' if i == 0 else None)
-            color = temp[0].get_color()
-            plt.plot([z[1], z[-2]], [i, i], lw=4, color=color,
-                     label='[.25, .75]' if i == 0 else None)
-            plt.plot([z[2], z[-3]], [i, i], lw=6, color=color,
-                     label='[.33, .67]' if i == 0 else None)
-            a = plt.scatter([z[3]], [i], marker='o', s=90, facecolor='none', edgecolor=color, zorder=3, color=color,
-                            label='median' if i == 0 else None)
-            a.set_facecolor('white')
-            a = plt.scatter([x.mean()], [i], marker='d', s=90, facecolor='none', edgecolor=color, zorder=3, color=color,
-                            label='mean' if i == 0 else None)
-            a.set_facecolor('white')
-
-        plt.title(f'"{key}"', fontsize=13)
-        plt.ylabel("Chain", fontsize=13)
-        plt.legend(loc=(1.03, 0))
-        if show:
-            plt.show()
-
-        return fig
-
-    def scatter(self, key1, key2, subsample=15_000, alpha=.3, figsize=None, dpi=130, seed=0, show=False, chain=None):
-
-        """
-        Plot a 2-D scatter of two parameters' post-burn-in draws.
-
-                Draws a scatter of all selected samples in cornflower blue with
-                random subsets highlighted in magenta and red to reveal local
-                density.  Reports the Pearson correlation in the title.
-
-        Args:
-            key1: First parameter name (x-axis).
-            key2: Second parameter name (y-axis).
-            subsample: Number of draws to use; ``None`` uses all post-burn-in draws.
-            alpha: Scatter point transparency.
-            figsize: Figure size tuple.
-            dpi: Figure resolution.
-            seed: Random seed for sub-sampling.
-            show: Whether to call ``plt.show()``.
-            chain: Optional integer chain index to restrict draws; ``None`` uses all chains.
-
-        Returns:
-            Matplotlib Figure object.
-        """
-        if figsize is None:
-            figsize = (5, 5)
-
-        for key in [key1, key2]:
-            if self.fix_params and key in self.fix_params:
-                raise Exception(f"No diagnostic plot available for fixed parameter {key}!")
-
-        fig = plt.figure(figsize=figsize, dpi=dpi)
-
-        y1 = self.get_sample(key1, subsample=subsample, seed=seed, chain=chain, return_array=True)
-        y2 = self.get_sample(key2, subsample=subsample, seed=seed, chain=chain, return_array=True)
-
-        plt.scatter(y1, y2, alpha=alpha, color='cornflowerblue')
-
-        rand = np.random.RandomState(seed)
-        rindx = rand.randint(0, len(y1), min(1000, len(y1) // 5))
-        plt.scatter(y1[rindx], y2[rindx], color='darkmagenta', alpha=alpha)
-
-        rindx = rand.randint(0, len(y1), min(200, len(y1) // 50))
-        plt.scatter(y1[rindx], y2[rindx], color='r', alpha=alpha)
-
-        plt.xlabel(key1[:50], fontsize=13)
-        plt.ylabel(key2[:50], fontsize=13)
-
-        plt.title('Correlation: %.4f' % np.corrcoef(y1, y2)[0, 1])
-
-        if show:
-            plt.show()
-
-        return fig
-
-    def hpdi(self, key, level, num_cdf_interp_points=301, num_lower_bound_search_grid_points=501):
-        """
-        Compute the Highest Posterior Density Interval (HPDI) for a parameter.
-
-                Delegates to ``get_highest_density_interval`` on the post-burn-in
-                draws.
-
-        Args:
-            key: Parameter name (or index/callable).
-            level: Coverage probability (e.g. 0.9).
-            num_cdf_interp_points: Number of grid points for CDF interpolation.
-            num_lower_bound_search_grid_points: Search grid size for the optimal lower bound.
-
-        Returns:
-            2-tuple ``(lower, upper)`` of HPDI bounds.
-        """
-        return get_highest_density_interval(self.get_sample(key), level,
-                                            num_cdf_interp_points=num_cdf_interp_points,
-                                            num_lower_bound_search_grid_points=num_lower_bound_search_grid_points)
-
-    def diagnostic_plot(self, key, max_points=50_000, scale_exclude_burnin=True, figsize=(10, 5), dpi=130, title=None,
-                        show=False,
-                        clip=True,
-                        hist_instead_of_kde=False,  # TODO
-                        **kde_options,
-                        ):
-
-        """
-        Generate a 2×2 diagnostic panel for a single parameter.
-
-                Panel layout:
-                - Top-left: full-chain trace (all chains overlaid) with burn-in shaded.
-                - Top-right: overall KDE with mean, median, and MAP lines annotated.
-                - Bottom-left: ACF per chain (scatter plot).
-                - Bottom-right: per-chain KDEs with chain legend.
-
-        Args:
-            key: Parameter name (or index/callable).
-            max_points: Maximum draw points in the trace panel (sub-sampled if exceeded).
-            scale_exclude_burnin: Whether to restrict the trace y-axis to post-burn-in range.
-            figsize: Figure size ``(width, height)``.
-            dpi: Figure resolution.
-            title: Optional suptitle override.
-            show: Whether to call ``plt.show()``.
-            clip: KDE clip bounds; ``True`` auto-clips to the [0.01%, 99.99%] quantiles.
-            hist_instead_of_kde: Not yet implemented; reserved for future use.
-            **kde_options: Additional keyword arguments forwarded to the ``kde`` helper.
-
-        Returns:
-            Matplotlib Figure object.
-        """
-        key = self.get_key(key, debug=False)
-
-        if self.fix_params and key in self.fix_params:
-            raise Exception(f"No diagnostic plot available for fixed parameter {key}!")
-
-        f, ax = plt.subplots(nrows=2, ncols=2, figsize=figsize, dpi=dpi)
-
-        vals_w_burnin = self.get_sample(key, include_burnin=True)
-        n = len(vals_w_burnin)
-
-        xx = np.arange(n)
-        stride_0 = max(1, (n // max_points))
-        ax[0][0].plot(xx[::stride_0], vals_w_burnin[::stride_0])
-
-        if scale_exclude_burnin:
-            z = vals_w_burnin[~self.sample_info_df.is_burnin][::stride_0]
-            scale = [z.min(), z.max()]
-            diff = scale[1] - scale[0]
-            scale[0] -= .01 * diff
-            scale[1] += .01 * diff
-            ax[0][0].set_ylim(scale)
-
-        for j in range(self.n_chains):
-            ax[0][0].axvline(j * (n // self.n_chains), ls=':', color='k')
-            ax[0][0].axvline(j * (n // self.n_chains) + self.n_burnin, ls='--', color='grey')
-            ax[0][0].axvspan(j * (n // self.n_chains), j * (n // self.n_chains) + self.n_burnin, alpha=.5, color='grey')
-        ax[0][0].set_title(f'Trace', fontsize=15)
-        ax[0][0].set_xlabel('Draw', fontsize=12)
-        ax[0][0].set_xlim(0, n)
-
-        vals = vals_w_burnin[~self.sample_info_df.is_burnin]
-        if isinstance(clip, bool) and clip:
-            clip = np.quantile(vals, [.0001, .9999])
-        kdeobj = kde(vals, clip=clip,  **kde_options)
-        ax[0][1].plot(*kdeobj,  lw=2, color='k')
-        ax[0][1].hist(vals, density=True, bins=30, alpha=.4)
-        ax[0][1].set_title(f'Overall KDE\n(ESS = {self.summary_df["ESS"][key] if key in self.param_names else "?"})',
-                           fontsize=15)
-
-        mean, median = np.mean(vals), np.median(vals)
-        ax[0][1].axvline(mean, color='k', label='mean')
-        ax[0][1].axvline(median, color='k', ls='--', label='med')
-        if key in self.param_names:
-            ax[0][1].axvline(self.map_params[key], color='k', ls=':', label='map')
-        ax[0][1].legend(loc='best', fontsize=9)
-
-        for c in range(self.n_chains):
-            sample_c = self.get_sample(key, chain=c, include_burnin=False)
-            kdeobj = kde(sample_c, clip=clip, **kde_options)
-            ax[1][1].plot(*kdeobj, label=c)
-        ax[1][1].legend(loc='best', fontsize=8, labelspacing=.15)
-
-        #ax[1][1].plot(xx_overall, kde_overall(xx_overall), color='k', lw=3)  # TODO
-        ax[1][1].set_title(f'Chain KDEs\n(R_hat = '
-                           f'{"%.4f" % self.summary_df.R_hat[key] if key in self.param_names else "?"})',
-                           fontsize=15)
-
-        ax[0][1].set_xlim(ax[1][1].get_xlim())
-
-        if key in self.param_names:
-            for c in range(len(self.chain_results)):
-                ax[1][0].plot(self.acfs[key][c], marker='.', lw=0, label=c)
-            ax[1][0].axhline(0, color='k')
-            ax[1][0].set_xlabel('Lag', fontsize=12)
-            ax[1][0].set_title('Autocorrelation by Chain', fontsize=15)
-        else:
-            ax[1][0].set_title('Autocorrelations not Shown\nfor custom functions', fontsize=15)
-            ax[1][0].axis("off")
-        ax[1][0].legend(loc='best', fontsize=8, labelspacing=.15)
-
-        plt.suptitle(
-            (f'"{key}"' +
-             (f'\nmean = {"%.3e" % self.mean_params[key]}  (std = {"%.3e" % self.bse[key]})'
-              if key in self.param_names else ''
-              )) if title is None else title,
-            fontsize=17)
-
-        plt.tight_layout()
-
-        if show:
-            plt.show()
-
-        return f
-
-    def multi_trace(self, keys=None, max_points=5_000, scale_exclude_burnin=True, ncols=3, show=False, figsize=None,
-                    dpi=130):
-
-        """
-        Plot a compact grid of trace plots for multiple parameters.
-
-                Lays out ``len(keys)`` subplots in a grid with ``ncols`` columns,
-                sharing the x-axis.  Burn-in regions are shaded and chain boundaries
-                are marked with vertical lines.
-
-        Args:
-            keys: Parameter names to plot; defaults to all parameters.
-            max_points: Maximum total draw points rendered across the grid.
-            scale_exclude_burnin: Whether to set each subplot's y-limits from post-burn-in values.
-            ncols: Number of subplot columns.
-            show: Whether to call ``plt.show()``.
-            figsize: Figure size tuple.
-            dpi: Figure resolution.
-
-        Returns:
-            Matplotlib Figure object.
-        """
-        if keys is None:
-            keys = self.param_names
-
-        if isinstance(keys, str):
-            keys = [keys]
-
-        p = len(keys)
-
-        ncols = min(ncols, p)
-        nrows = int(np.ceil(p / ncols))
-
-        if figsize is None:
-            figsize = (2 * ncols, 1.5 + 1.5 * nrows)
-
-        f, ax = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize, sharex=True, dpi=dpi)
-
-        stride = max(len(self.sample_df) // max_points, 1)
-        xrng = np.arange(len(self.sample_df))[::stride]
-
-        for i, k in tqdm(enumerate(keys)):
-            if p > 3:
-                _ax = ax[i // ncols][i % ncols]
-            elif p == 1:
-                _ax = ax
-            else:
-                _ax = ax[i % ncols]
-            title = k if len(k) < 22 else k[:18] + '...'
-            _ax.set_title(title)
-            y = self.get_sample(k, include_burnin=True)
-            _ax.plot(xrng, y[::stride])
-            yax = _ax.axes.get_yaxis()
-            yax.set_visible(False)
-            for c in range(self.n_chains):
-                _ax.axvline(self.n_iterations * c, color='k', ls=':')
-                _ax.axvline(self.n_iterations * c + self.n_burnin, color='k', lw=.5, ls=':')
-                _ax.axvspan(self.n_iterations * c, self.n_iterations * c + self.n_burnin, color='k', alpha=.1)
-
-            _ax.set_xlim([0, self.n_iterations * self.n_chains])
-
-            if scale_exclude_burnin:
-                z = y[~self.sample_info_df.is_burnin]
-                scale = [z.min(), z.max()]
-                diff = scale[1] - scale[0]
-                scale[0] -= .01 * diff
-                scale[1] += .01 * diff
-                _ax.set_ylim(scale)
-
-        plt.tight_layout()
-
-        if show:
-            plt.show()
-
-        return f
-
-    def kde(self, keys=None, seed=0, dpi=130, figsize=None, max_kde_sample_points=10_000, gridsize=500,
-            split_chain=False, fontsize=12, ncols=3, show_legend=False, show=False,
-            clip=None, **kde_options
-            ):
-
-        """
-        Plot KDE density curves for one or more parameters.
-
-                For each parameter, plots per-chain KDEs (dashed/dotted) and an
-                overall pooled-chain KDE (solid black).  Optionally splits each
-                chain into its first and second halves to check within-chain
-                stationarity.
-
-        Args:
-            keys: List of parameter names to plot.
-            seed: Random seed for sub-sampling.
-            dpi: Figure resolution.
-            figsize: Figure size tuple.
-            max_kde_sample_points: Maximum number of draws used for KDE estimation.
-            gridsize: Number of grid points in the KDE evaluation.
-            split_chain: Whether to plot each chain as two halves (stationarity check).
-            fontsize: Title font size.
-            ncols: Number of subplot columns.
-            show_legend: Whether to show chain legends.
-            show: Whether to call ``plt.show()``.
-            clip: KDE clip bounds; ``True`` auto-clips.
-            **kde_options: Additional keyword arguments forwarded to the ``kde`` helper.
-
-        Returns:
-            Matplotlib Figure object.
-        """
-        for key in keys:
-            if self.fix_params and key in self.fix_params:
-                raise Exception(f"No diagnostic plot available for fixed parameter {key}!")
-
-        if keys is None:
-            keys = self.param_names
-        if isinstance(keys, (str, int)):
-            keys = [keys]
-
-        p = len(keys)
-        ncols = min(ncols, p)
-        nrows = int(np.ceil(p / ncols))
-        if figsize is None:
-            figsize = (2 * ncols, 1.5 + 1.5 * nrows)
-
-        f, ax = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize, dpi=dpi)
-
-        for i, key in tqdm(enumerate(keys)):
-
-            if p > 3:
-                _ax = ax[i // ncols][i % ncols]
-            elif p == 1:
-                _ax = ax
-            else:
-                _ax = ax[i % ncols]
-
-            title = key if len(key) < 22 else key[:18] + '...'
-            _ax.set_title(title, fontsize=fontsize)
-
-            # overall kde
-            y = self.get_sample(key)
-            if isinstance(clip, bool) and clip:
-                clip = np.quantile(y, [.0001, .9999])
-
-            # chain kde
-            for c in range(self.n_chains):
-                if split_chain:
-                    ys = [self.get_sample(key, chain=c, half=h) for h in [1, 2]]
-                    linestyles = ['--', ':']
-                    labels = [f'{c} [half 1]', f'{c} [half 2]']
-                else:
-                    ys = [self.get_sample(key, chain=c)]
-                    linestyles = ['--']
-                    labels = [c]
-
-                facecolor = None
-                for y, ls, label in zip(ys, linestyles, labels):
-                    kdeobj = kde(y, gridsize=gridsize, clip=clip, **kde_options)
-                    temp = _ax.plot(*kdeobj, ls=ls, label=f'chain {label}', color=facecolor)
-                    facecolor = temp[0].get_color()
-
-            # Overall KDE
-            kdeobj = kde(y, gridsize=gridsize, clip=clip, **kde_options)
-            _ax.plot(*kdeobj, ls='-', lw=2, color='k', alpha=.8)
-
-            if show_legend:
-                _ax.legend(loc='best')
-
-            yax = _ax.axes.get_yaxis()
-            yax.set_visible(False)
-
-        plt.tight_layout()
-
-        if show:
-            plt.show()
-
-        return f
-
-    def hpdi_plot(self, key, level, num_cdf_interp_points=301, num_lower_bound_search_grid_points=501,
-                  dpi=130, figsize=(10, 4.6), clip=True, max_kde_sample_points=15_000, num_kde_interp_points=500,
-                  show=False, **kde_options):
-
-        """
-        Plot the HPDI and equi-tailed interval for a parameter.
-
-                Renders a KDE with histogram overlay, annotates mean, median, MAP,
-                HPDI bounds, and equi-tailed interval bounds.
-
-        Args:
-            key: Parameter name (or index/callable).
-            level: Coverage probability (e.g. 0.9 for a 90% interval).
-            num_cdf_interp_points: CDF interpolation grid size.
-            num_lower_bound_search_grid_points: HPDI search grid size.
-            dpi: Figure resolution.
-            figsize: Figure size tuple.
-            clip: KDE clip bounds; ``True`` auto-clips.
-            max_kde_sample_points: KDE grid size.
-            num_kde_interp_points: Unused; reserved.
-            show: Whether to call ``plt.show()``.
-            **kde_options: Additional keyword arguments forwarded to the ``kde`` helper.
-
-        Returns:
-            2-tuple ``(fig, (lower_hpdi, upper_hpdi))``.
-        """
-        (lp_hpdi, rp_hpdi) = self.hpdi(key, level, num_cdf_interp_points=num_cdf_interp_points,
-                                       num_lower_bound_search_grid_points=num_lower_bound_search_grid_points)
-
-        lp_eqt, rp_eqt = self.equitail_ci(key, level)
-
-        f, ax = plt.subplots(dpi=dpi, figsize=figsize)
-        data = self.get_sample(key)
-        plt.hist(data, density=True, alpha=.2, bins=25, color='b')
-        plt.hist(data, density=True, alpha=.2, bins=500, color='b')
-
-        if isinstance(clip, bool) and clip:
-            clip = np.quantile(data, [.0001, .9999])
-
-        kdeobj = kde(data, gridsize=max_kde_sample_points, clip=clip, **kde_options)
-        plt.plot(*kdeobj, color='b', lw=2.2, label='kde')
-
-        mean, median = data.mean(), np.median(data)
-        plt.axvline(mean, lw=1.5, ls='-', color='k',
-                    label=f'Mean = {mean:03e}')
-        plt.axvline(median, lw=1.5, ls='--', color='g',
-                    label=f'Median = {median:03e}')
-        if key in self.param_names:
-            plt.axvline(self.map_params[key], lw=1.5, ls=':', color='orange',
-                        label=f'MAP = {"%.3e" % self.map_params[key]}')
-
-        for i, j in enumerate([lp_hpdi, rp_hpdi]):
-            plt.axvline(j, lw=2, ls='--', color='r',
-                        label=f'Highest Posterior Density Interval\n[{"%.3e" % lp_hpdi}, {"%.3e" % rp_hpdi}]' if i == 0 else None)
-
-        for i, j in enumerate([lp_eqt, rp_eqt]):
-            plt.axvline(j, lw=2, ls=':', color='magenta',
-                        label=f'Equitailed Interval\n[{"%.3e" % lp_eqt}, {"%.3e" % rp_eqt}]' if i == 0 else None)
-
-        ax.set_title(f'Parameter "{key}"\nLevel: {np.round(100 * level, 1)}%', fontsize=18)
-        plt.legend(loc='best')
-
-        plot_lo, plot_hi = (data.min(), data.max())
-
-        plot_lo -= .025 * (plot_hi - plot_lo)
-        plot_hi += .025 * (plot_hi - plot_lo)
-        plt.xlim([plot_lo, plot_hi])
-
-        if show:
-            plt.show()
-
-        return f, (lp_hpdi, rp_hpdi)
-
-    def multi_scatter(self, keys, subsample=10_000, figsize=(10, 10), bins=25, fontsize=14, seed=0, suptitle=None,
-                      show=False, max_axis_label_len=24, chain=None, labels=None):
-
-        """
-        Plot a pairwise scatter grid (lower triangle + marginal histograms).
-
-                Renders 2-D histograms for all pairs ``(i, j)`` with ``j <= i`` in
-                the lower-left triangle, 1-D marginal histograms on the left column
-                and bottom row, and reports pairwise Pearson correlations as subplot
-                titles.
-
-        Args:
-            keys: List of parameter names to include.
-            subsample: Number of draws per parameter.
-            figsize: Figure size tuple.
-            bins: Number of histogram bins.
-            fontsize: Font size for labels and titles.
-            seed: Random seed for sub-sampling.
-            suptitle: Optional super-title.
-            show: Whether to call ``plt.show()``.
-            max_axis_label_len: Maximum characters to display for axis labels.
-            chain: Optional chain index to restrict draws.
-            labels: Optional display labels overriding ``keys``.
-
-        Returns:
-            Matplotlib Figure object.
-        """
-        for key in keys:
-            if self.fix_params and key in self.fix_params:
-                raise Exception(f"No diagnostic plot available for fixed parameter {key}!")
-
-        if labels is None:
-            key_strs = [str(k) for k in keys]
-        else:
-            key_strs = labels
-        num_keys = len(keys)
-
-        keys = [self.get_key(k) for k in keys]
-        assert len(keys) >= 2
-
-        fig, ax = plt.subplots(nrows=num_keys + 1, ncols=num_keys + 1, figsize=figsize,
-                               gridspec_kw={'width_ratios': [.5] + [1] * num_keys,
-                                            'height_ratios': [1] * num_keys + [.5]})
-
-        for i in range(len(keys)):
-            x_i = self.get_sample(keys[i], subsample=subsample, seed=seed, chain=chain)
-            ax[len(keys) - 1 - i][0].hist(x_i, density=True, bins=bins, orientation='horizontal')
-            ax[len(keys) - 1 - i][0].set_ylabel(key_strs[i][:max_axis_label_len], fontsize=fontsize)
-
-            ax[len(keys)][i + 1].hist(x_i, density=True, bins=bins)
-            ax[len(keys)][i + 1].set_xlabel(key_strs[i][:max_axis_label_len], fontsize=fontsize)
-
-            for j in range(len(keys)):
-                if j > i:
-                    continue
-                elif i == j:
-                    x_j = x_i
-                else:
-                    x_j = self.get_sample(keys[j], subsample=subsample, seed=seed, chain=chain)
-
-                ax[len(keys) - 1 - i][j + 1].hist2d(x_j, x_i, bins=bins, cmap='Blues')
-                ax[len(keys) - 1 - i][j + 1].set_title(f'corr={np.round(np.corrcoef(x_i, x_j)[0, 1], 4)}',
-                                                       fontsize=fontsize)
-                # ax[len(keys) - 1 - i][j + 1].set_xlabel(key_strs[j], fontsize=fontsize)
-                # ax[len(keys) - 1 - i][j + 1].set_ylabel(key_strs[i], fontsize=fontsize)
-
-        if suptitle:
-            plt.suptitle(suptitle, fontsize=fontsize)
-
-        plt.tight_layout()
-
-        ax[len(keys)][0].axis("off")
-        for j in range(len(keys)):
-            for i in range(j + 1, len(keys)):
-                ax[i][len(keys) - j].axis("off")
-
-        if show:
-            plt.show()
-
-        return fig
-
-    def hist(self, key, subsample=10_000, figsize=(6, 2.7), bins=25, fontsize=14, seed=0, title=None,
-             max_axis_label_len=24, show=False, dpi=130, include_chains=True, cumulative=False):
-
-        """
-        Plot a density histogram for a single parameter.
-
-                Plots one combined histogram (black step line) plus per-chain
-                histograms when ``include_chains=True``.  Supports cumulative mode.
-
-        Args:
-            key: Parameter name (or index/callable).
-            subsample: Number of draws to sample.
-            figsize: Figure size tuple.
-            bins: Number of histogram bins.
-            fontsize: Title font size.
-            seed: Random seed.
-            title: Optional plot title override.
-            max_axis_label_len: Maximum characters to display in the auto-generated title.
-            show: Whether to call ``plt.show()``.
-            dpi: Figure resolution.
-            include_chains: Whether to overlay per-chain histograms.
-            cumulative: Whether to render a cumulative distribution.
-
-        Returns:
-            Matplotlib Figure object.
-        """
-        fig = plt.figure(dpi=dpi, figsize=figsize)
-        y = self.get_sample(key, subsample=subsample, seed=seed)
-        plt.hist(y, color='k', histtype='step', lw=2, bins=bins, density=True,
-                 cumulative=cumulative)
-
-        if include_chains:
-            for r in range(self.n_chains):
-                y = self.get_sample(key, subsample=subsample, seed=seed, chain=r)
-                plt.hist(y, histtype='step', lw=1, bins=bins, label=f'chn {r}', density=True,
-                         cumulative=cumulative)
-
-        if title is None:
-            title = key[:max_axis_label_len]
-            if len(title) < len(key):
-                title += '...'
-
-        plt.title(title, fontsize=fontsize)
-        plt.legend(loc='best')
-        plt.tight_layout()
-
-        if show:
-            plt.show()
-
-        return fig
-
-    def multi_hist(self, keys, subsample=10_000, figsize=None, bins=25, fontsize=14, seed=0, suptitle=None,
-                   ncols=3, max_axis_label_len=24, show=False, dpi=130, cumulative=False, labels=None,
-                   sharex=False, sharey=False):
-
-        """
-        Plot a grid of histograms for multiple parameters.
-
-                Lays out histograms in a grid with ``ncols`` columns.  Raises if
-                any requested parameter is fixed.
-
-        Args:
-            keys: List of parameter names.
-            subsample: Number of draws per parameter.
-            figsize: Figure size tuple.
-            bins: Histogram bin count.
-            fontsize: Axis label font size.
-            seed: Random seed for sub-sampling.
-            suptitle: Optional super-title.
-            ncols: Number of subplot columns.
-            max_axis_label_len: Maximum label characters.
-            show: Whether to call ``plt.show()``.
-            dpi: Figure resolution.
-            cumulative: Whether to use cumulative histograms.
-            labels: Optional display labels overriding ``keys``.
-            sharex: Whether subplots share the x-axis.
-            sharey: Whether subplots share the y-axis.
-
-        Returns:
-            Matplotlib Figure object.
-        """
-        for key in keys:
-            if self.fix_params and key in self.fix_params:
-                raise Exception(f"No diagnostic plot available for fixed parameter {key}!")
-
-        if labels is None:
-            key_strs = [str(k) for k in keys]
-        else:
-            key_strs = labels
-        num_keys = len(keys)
-
-        keys = [self.get_key(k) for k in keys]
-        assert len(keys) >= 2
-
-        ncols = min(ncols, num_keys)
-        nrows = int(np.ceil(num_keys / ncols))
-
-        if figsize is None:
-            figsize = (ncols * 2, 1.5 + 1.5 * nrows)
-
-        fig, ax = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize, dpi=dpi, sharex=sharex, sharey=sharey)
-        if nrows == 1:
-            ax = [ax]
-
-        for i in range(len(keys)):
-            x_i = self.get_sample(keys[i], subsample=subsample, seed=seed)
-
-            r_, c_ = i // ncols, i % ncols
-
-            ax[r_][c_].hist(x_i, density=True, bins=bins, cumulative=cumulative)
-            ax[r_][c_].set_xlabel(key_strs[i][:max_axis_label_len], fontsize=fontsize)
-
-        if suptitle:
-            plt.suptitle(suptitle, fontsize=fontsize)
-
-        plt.tight_layout()
-
-        if show:
-            plt.show()
-
-        return fig
-
-    def rank_plot(self, key, show=False, bins=10, figsize=None, dpi=130, fontsize=14, suptitle=None):
-
-        """
-        Plot per-chain rank histograms for a single parameter.
-
-                Ranks all post-burn-in draws across chains together, then histograms
-                each chain's rank distribution.  Under convergence, all histograms
-                should be approximately uniform.
-
-        Args:
-            key: Parameter name (or index/callable).
-            show: Whether to call ``plt.show()``.
-            bins: Number of rank histogram bins.
-            figsize: Figure size tuple.
-            dpi: Figure resolution.
-            fontsize: Suptitle font size.
-            suptitle: Optional suptitle override.
-
-        Returns:
-            Matplotlib Figure object.
-        """
-        if figsize is None:
-            figsize = (7, self.n_chains * 1.5)
-
-        fig, ax = plt.subplots(nrows=self.n_chains, dpi=dpi, figsize=figsize, sharex=True, sharey=True)
-        sample = self.get_sample(key, include_burnin=False)
-
-        chains = np.array(self.sample_info_df.chain[~self.sample_info_df.is_burnin])
-        index = np.argsort(sample)
-
-        for i, c in enumerate(range(self.n_chains)):
-            temp = index[chains == i]
-            ax[i].hist(temp, bins=bins, alpha=.5, density=False)
-            ax[i].axhline(1 / bins * len(temp), ls='--', color='k')
-            ax[i].set_ylabel(f'Chain {i}')
-
-
-        if suptitle:
-            plt.suptitle(suptitle, fontsize=fontsize)
-        else:
-            plt.suptitle(f"Rank Plot\n'{key}'", fontsize=fontsize)
-
-        plt.tight_layout()
-
-        if show:
-            plt.show()
-
-        return fig
-
-    def multi_rank_plot(self, keys, figsize=None, bins=10, fontsize=14, suptitle=None,
-                        ncols=3, max_axis_label_len=24, show=False, dpi=130):
-
-        """
-        Plot a grid of rank histograms for multiple parameters.
-
-                Raises if any requested parameter is fixed.  Each subplot shows
-                per-chain rank histograms with a reference uniform-density line.
-
-        Args:
-            keys: List of parameter names.
-            figsize: Figure size tuple.
-            bins: Number of rank bins per histogram.
-            fontsize: Font size for subplot titles.
-            suptitle: Optional super-title.
-            ncols: Number of subplot columns.
-            max_axis_label_len: Maximum characters for subplot titles.
-            show: Whether to call ``plt.show()``.
-            dpi: Figure resolution.
-
-        Returns:
-            Matplotlib Figure object.
-        """
-        for key in keys:
-            if self.fix_params and key in self.fix_params:
-                raise Exception(f"No diagnostic plot available for fixed parameter {key}!")
-
-        key_strs = [str(k) for k in keys]
-        num_keys = len(keys)
-
-        keys = [self.get_key(k) for k in keys]
-        assert len(keys) >= 2
-
-        ncols = min(ncols, num_keys)
-        nrows = int(np.ceil(num_keys / ncols))
-
-        if figsize is None:
-            figsize = (ncols * 2.2, 1.5 + 1.5 * nrows)
-
-        fig, ax = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize, dpi=dpi)
-        if nrows == 1:
-            ax = [ax]
-
-        chains = np.array(self.sample_info_df.chain[~self.sample_info_df.is_burnin])
-        for i in range(len(keys)):
-            r_, c_ = i // ncols, i % ncols
-            x_i = self.get_sample(keys[i])
-            index = np.argsort(x_i)
-
-            for c in range(self.n_chains):
-                ax[r_][c_].hist(index[chains == c], density=False, bins=bins, lw=2, histtype='step', label=f'{c}')
-                ax[r_][c_].set_title(f'ranks "{key_strs[i][:max_axis_label_len]}"', fontsize=fontsize)
-
-            ax[r_][c_].axhline(len(x_i) / (self.n_chains * bins), ls=':', color='k', lw=2)
-
-        if suptitle:
-            plt.suptitle(suptitle, fontsize=fontsize)
-
-        plt.tight_layout()
-
-        if show:
-            plt.show()
-
-        return fig
-
-    def get_chain_full_sample(self, chain, include_burnin=False):
-        """
-        Return a DataFrame of all draws for a single chain, optionally including burn-in.
-
-        Args:
-            chain: Integer chain index (0-based).
-            include_burnin: Whether to include burn-in draws.
-
-        Returns:
-            DataFrame slice of ``sample_df`` for the requested chain.
-        """
-        idx = self.sample_info_df.chain == chain
-        if not include_burnin:
-            idx &= ~self.sample_info_df.is_burnin
-        return self.sample_df.loc[idx]
-
-    def get_samples(self, keys, chain=None, subsample=None, seed=0, include_burnin=False, half=None):
-        """
-        Return a dict of post-burn-in draw arrays for multiple parameters.
-
-        Args:
-            keys: Iterable of parameter names (or callables/indices).
-            chain: Optional chain index to restrict draws.
-            subsample: Optional maximum number of draws to sample.
-            seed: Random seed for sub-sampling.
-            include_burnin: Whether to include burn-in draws.
-            half: Optional ``1`` or ``2`` to restrict to the first or second half of draws.
-
-        Returns:
-            Dict mapping each key to its corresponding draw array or Series.
-        """
-        return {k: self.get_sample(k, chain, subsample, seed, include_burnin=include_burnin, half=half)
-                for k in keys}
-
-    def get_sample(self, key, chain=None, subsample=None, seed=0, include_burnin=False, half=None, return_array=False):
-
-        """
-        Return post-burn-in draws for a single parameter (or callable).
-
-                Filters by chain and/or half if specified, applies random sub-sampling
-                with ``seed`` if ``subsample < len(data)``, and evaluates callable
-                keys row-wise against the draw DataFrame.
-
-        Args:
-            key: Parameter name string, integer index, the literal ``'log_posterior'``, or a callable.
-            chain: Optional integer chain index (0-based).
-            subsample: Optional maximum number of draws; ``None`` returns all.
-            seed: Random seed for reproducible sub-sampling.
-            include_burnin: Whether to include burn-in draws.
-            half: ``1`` or ``2`` to return only the first or second half; ``None`` for all.
-            return_array: Whether to return a NumPy array instead of a Series.
-
-        Returns:
-            Series or NumPy array of draw values for the requested parameter.
-        """
-        if include_burnin:
-            idx = np.full(len(self.sample_df), True)
-        else:
-            idx = ~self.sample_info_df.is_burnin
-
-        if chain is not None:
-            assert isinstance(chain, int) and 0 <= chain < self.n_chains
-            idx &= self.sample_info_df.chain == chain
-
-        key = self.get_key(key)
-
-        if isinstance(key, str):
-            if key == 'log_posterior':
-                data = self.sample_info_df.log_posterior[idx]
-            else:
-                data = self.sample_df[key][idx]
-        else:
-            data = self.sample_df.loc[idx]
-
-        if half is not None:
-            if half == 1:
-                data = data[:len(data) // 2]
-            elif half == 2:
-                data = data[len(data) // 2:]
-            else:
-                raise Exception("`half` must be `None`, `1` or `2`!")
-
-        if subsample is not None and subsample < len(data):
-            rand = random.Random(seed)
-            data = data.iloc[rand.sample(range(len(data)), k=subsample)]
-
-        if isinstance(key, Callable):
-            try:
-                data = pd.Series(data.apply(key, axis=1))
-            except:
-                data = np.array([key(np.asarray(data.loc[x])) for x in data.index])
-
-        if return_array and not isinstance(data, np.ndarray):
-            data = np.array(data)
-        else:
-            data = data.copy()
-
-        return data
-
-    def __getitem__(self, key):
-        """
-        Return the posterior mean of parameter ``key`` (equivalent to ``mean_params[key]``).
-
-        Args:
-            key: Parameter name string or index.
-
-        Returns:
-            Scalar posterior mean value.
-        """
-        return self.mean_params[key]
-
-    def __setitem__(self, key):
-        """
-        Not implemented; ``MCMCResults`` objects are read-only after construction.
-
-        Args:
-            key: Unused.
-        """
-        raise NotImplementedError
-
-    def corr_params(self, keys=None):
-        """
-        Compute the posterior correlation matrix.
-
-                Derived from ``cov_params`` by normalizing each row and column by the
-                corresponding standard deviations.
-
-        Args:
-            keys: Optional subset of parameter names; ``None`` returns the full matrix.
-
-        Returns:
-            DataFrame correlation matrix indexed and columned by parameter names.
-        """
-        X = self.cov_params.copy(deep=True)
-        std = np.diag(X) ** .5
-        X /= std.reshape((-1, 1))
-        X /= std.reshape((1, -1))
-        if keys is None:
-            return X
-        else:
-            return X.loc[keys, keys]
-
-    def to_string(self, keys=None):
-        """
-        Return a pretty-printed string representation of selected object attributes.
-
-        Args:
-            keys: Optional list of attribute names to include; ``None`` serializes everything.
-
-        Returns:
-            String from ``pprint.pformat`` of the (possibly filtered) ``__dict__``.
-        """
-        self_dict = self.__dict__
-        if keys is not None:
-            self_dict = {k: self_dict.get(k, None) for k in keys}
-        return pprint.pformat(self_dict)
-
-    def _get_samples_split_by_chain(self, include_burnin=False, copy=False):
-        """
-        Return a list of per-chain sample arrays, optionally excluding burn-in.
-
-                Each element is a NumPy array view (or copy) of shape
-                ``(n_iterations [- n_burnin], num_params)`` for one chain.
-
-        Args:
-            include_burnin: Whether to include the leading burn-in rows.
-            copy: Whether to return independent copies instead of views.
-
-        Returns:
-            List of ``n_chains`` arrays, each of shape ``(n_samples, num_params)``.
-        """
-        samples = self.sample_df.values
-        burnin_offset = 0 if include_burnin else self.n_burnin
-
-        sample_refs = []
-        for i in range(self.n_chains):
-            start = i * self.n_iterations + burnin_offset
-            end = (i + 1) * self.n_iterations
-            chain = samples[start:end]
-            sample_refs.append(chain.copy() if copy else chain)
-
-        return sample_refs
-
-    def geweke(self, frac1=.1, frac2=.5, bm_taus=None, debug=False):
-        """
-        Compute approximate Geweke z-scores for convergence assessment.
-
-                Compares the mean of the first ``frac1`` fraction of post-burn-in
-                draws to the mean of the last ``frac2`` fraction of draws using
-                batched-means variance estimates.  Under convergence the z-scores
-                should be within ±1.96 for ~95% of parameters.
-
-        Args:
-            frac1: Fraction of post-burn-in draws to use as the 'early' window.
-            frac2: Fraction of post-burn-in draws to use as the 'late' window.
-            bm_taus: Optional batch-mean tau values; auto-selected when ``None``.
-            debug: Whether to print timing.
-
-        Returns:
-            DataFrame of shape ``(num_params, n_chains)`` containing per-chain Geweke z-scores.
-        """
-        t = time.time()
-        if debug:
-            print("Setting approximate Geweke z-scores...", end="")
-        z_scores = geweke_approx(self._get_samples_split_by_chain(include_burnin=False),
-                                 frac1=frac1, frac2=frac2, bm_taus=bm_taus)
-        if debug:
-            print(f"done! ({time.time() - t:0.2f}s)")
-        return pd.DataFrame(z_scores, index=self.param_names, columns=range(self.n_chains))
-
-    def get_ess_from_batched_means(self, taus=None, selection=DEFAULT_BATCHED_MEANS_SELECTION):
-        """
-        Compute ESS using the batched-means estimator for all parameters.
-
-                Delegates to ``get_ess_batched_means_for_chains`` on the post-burn-in
-                chain arrays.  Fixed parameters are zeroed out in the result.
-
-        Args:
-            taus: Optional batch-size candidates; auto-selected when ``None``.
-            selection: Strategy for selecting the batch size (e.g. ``'min'`` or ``'max'``).
-
-        Returns:
-            DataFrame of shape ``(num_params, n_chains)`` with batched-means ESS.
-        """
-        ess = get_ess_batched_means_for_chains(self._get_samples_split_by_chain(include_burnin=False),
-                                               taus=taus, selection=selection)
-        result = pd.DataFrame(ess, index=self.param_names, columns=range(self.n_chains))
-        if self.fix_params:
-            result.loc[[p for p in self.param_names if p in self.fix_params]] = 0
-        return result
-
-    def set_multi_ess(self, debug=False):
-        """
-        Compute and store the multivariate ESS in ``self.m_ess``.
-
-        Args:
-            debug: Whether to print timing.
-        """
-        self.m_ess = self.get_multi_ess(debug=debug)
-
-    def get_multi_ess(self, taus=None, debug=False):
-        """
-        Compute the multivariate ESS for each chain.
-
-                Uses ``multi_ess`` with the pooled posterior covariance
-                ``self.cov_params`` as the reference.
-
-        Args:
-            taus: Optional batch-size candidates for the batched-means estimator.
-            debug: Whether to print timing.
-
-        Returns:
-            Array of shape ``(n_chains,)`` with the multivariate ESS for each chain.
-        """
-        _t = time.time()
-        if debug:
-            print("Computing multi ESS ...", end="")
-        mess = np.array([
-            multi_ess(C, taus, cov_indep=self.cov_params)
-            for C in tqdm(self._get_samples_split_by_chain(), disable=not debug)
-        ])
-        if debug:
-            print(f" done! ({time.time() - _t:.2f}s)")
-        return mess
-
-    def amha(self, n_samples=40_000, inplace=True, debug=False, max_subchain_draws_sample=None,
-             user_prompt_for_more_iters=False,
-             ):
-
-        # TODO fix circular import!
-        """
-        Extend sampling by running additional AMH draws from the last chain states.
-
-                Restarts the adaptive Metropolis sampler from the final draw of each
-                chain with ``n_burnin=0`` (no additional burn-in), forwarding the
-                current proposal covariance (``step_cov``) and scaler from
-                ``other_info``.  When ``inplace=True`` merges the new draws into this
-                object via ``_merge``; otherwise returns the new ``MCMCResults``.
-
-        Args:
-            n_samples: Number of additional post-burn-in draws to collect per chain.
-            inplace: Whether to merge the new draws into ``self`` (True) or return a new object (False).
-            debug: Whether to pass debug=True to the sampler.
-            max_subchain_draws_sample: Override for the maximum subchain draw count; uses the stored option when ``None``.
-            user_prompt_for_more_iters: Whether to prompt the user to continue sampling.
-
-        Returns:
-            ``None`` when ``inplace=True``; new ``MCMCResults`` object when ``inplace=False``.
-        """
-        from kanly.bayes.mcmc.adaptive_metropolis.adaptive_metropolis_mcmc import amha
-
-        assert self.method == AMH_METHOD
-
-        if max_subchain_draws_sample is None:
-            max_subchain_draws_sample = self.options['max_subchain_draws_sample']
-
-        # start chains where they left off
-        x0 = []
-        for c in range(self.n_chains):
-            i_c = self.sample_info_df.index[self.sample_info_df.chain == c][-1]
-            x0.append(self.sample_df.iloc[i_c].values.copy())
-
-        # run new MCMC
-        fit_new = amha(
-            self.log_posterior, x0, start_params_is_original_scale=True,
-            log_posterior_jacobian_adjustment=self.log_posterior_jacobian_adjustment,
-            starting_iter=self.n_iterations,
-
-            step_cov=self.other_info['step_cov'],
-            step_cov_initial_samples=self.n_chains * self.n_samples,
-
-            scaler0=self.other_info['scaler'],
-            param_names=self.param_names, fix_params=self.fix_params,
-            specification_name=self.specification_name, debug=debug,
-            n_chains=self.n_chains, n_burnin=0, n_samples=n_samples,
-            transformations=self.transformations,
-            max_subchain_draws_sample=max_subchain_draws_sample,
-            user_prompt_for_more_iters=user_prompt_for_more_iters,
-            diff_evolution_past_samples=self.other_info['diff_evolution_past_samples'],
-            **{k: self.options[k]
-               for k in [
-                   'max_processes', 'seed', 'target_acceptance_rate', 'draw_size',
-                   'min_scaler', 'max_scaler', 'scaler_adjust_rate', 'scaler_adjust_denom_power',
-                   'thinning', 'pbar_update_cadence', 'bounds', 'do_adaptive',
-                   'max_subchain_draws_burnin', 'do_parallel',
-                   # 'resample_k',
-                   'proposal_df', 'normalize_step_cov',
-                   # 'step_cov_adjust_rate',
-
-                   'do_diff_evolution_mc', 'diff_evolution_frac_burnin', 'diff_evolution_max_draws',
-                   'diff_evolution_weight', 'diff_evolution_jump_cadence',
-
-                   'scalar_jitter_bounds',
-
-                   'stop_adaptation_after_burnin', 'callback_function'
-               ]}
-        )
-
-        if inplace:
-            self._merge(fit_new, debug=debug)
-
-        else:
-            return fit_new
-
-    def get_last_sample(self, n_chains=None):
-        """
-        Return the last draw of each chain as a list of parameter Series.
-
-        Args:
-            n_chains: Number of chains to return; defaults to ``self.n_chains``.
-
-        Returns:
-            List of ``n_chains`` Series, each containing the final draw of one chain.
-        """
-        if n_chains is None:
-            n_chains = self.n_chains
-        return [self.sample_df.loc[(i % (self.n_chains) + 1) * (self.n_iterations) - 1].copy()
-                for i in range(n_chains)]
-
-    def get_inv_transform_draws(self, size=None, seed=0, return_cov=True):
-        """
-        Draw from the posterior and optionally apply the inverse transformation.
-
-                Collects ``size`` draws (or all draws when ``size`` is None) for each
-                parameter and applies ``inv_transform`` to parameters that have a
-                bounded-to-unbounded transformation, converting them back to the
-                unbounded sampling space.
-
-        Args:
-            size: Number of draws to sample; ``None`` uses all post-burn-in draws.
-            seed: Random seed for sub-sampling.
-            return_cov: Whether to also return the covariance matrix of the transformed draws.
-
-        Returns:
-            Array of shape ``(num_draws, num_params)`` of transformed draws, or a 2-tuple ``(draws, draws_cov)`` when ``return_cov=True``.
-        """
-        num_draws = self.n_chains * self.n_samples
-        if size is not None:
-            if size >= self.n_chains * self.n_samples:
-                size = None
-            else:
-                num_draws = size
-        draws = np.zeros((num_draws, self.num_params))
-        for i, p in tqdm(enumerate(self.param_names)):
-            draws[:, i] = self.get_sample(p, subsample=size, seed=seed)
-            if self.transformed_model and i in self.transformations:
-                draws[:, i] = self.transformations[i].inv_transform(draws[:, i])
-
-        if return_cov:
-            draws_cov = np.cov(draws, rowvar=False)
-            return draws, draws_cov
-        else:
-            return draws
-
-    def _merge(self, fit_new, debug=False):
-        """
-        Merge a new ``MCMCResults`` object's draws into this one in-place.
-
-                Interleaves the old and new chain draws into a single contiguous
-                DataFrame (old draws first, new draws appended, per chain),
-                aggregates the per-chain covariance estimates, and recomputes all
-                summary statistics.  Modifies ``sample_df``, ``sample_info_df``,
-                ``n_iterations``, ``n_samples``, ``chain_results``, and
-                ``acceptance_rate`` in place.
-
-        Args:
-            fit_new: New ``MCMCResults`` object to merge; must have the same number of chains.
-            debug: Whether to print timing.
-        """
-
-        _t = time.time()
-        if debug:
-            print("\nMerging old and new MCMC draws...\n")
-
-        assert isinstance(fit_new, MCMCResults)
-        assert self.n_chains == fit_new.n_chains
-
-        sample_df_new = pd.DataFrame(
-            index=range(self.n_chains * (self.n_iterations + fit_new.n_iterations)),
-            columns=self.param_names,
-            dtype=float
-        )
-
-        sample_info_df_new = pd.DataFrame(
-            index=range(self.n_chains * (self.n_iterations + fit_new.n_iterations)),
-            columns=self.sample_info_df.columns,
-        )
-
-        for c in range(self.n_chains):
-            a1, a2 = (c * (self.n_iterations + fit_new.n_iterations),
-                      c * fit_new.n_iterations + (c + 1) * self.n_iterations)
-            a3 = (c + 1) * (self.n_iterations + fit_new.n_iterations)
-
-            for _df1, _df2, _df3 in [(self.sample_df, fit_new.sample_df, sample_df_new),
-                                     (self.sample_info_df, fit_new.sample_info_df, sample_info_df_new)]:
-                _df3.values[a1:a2, :] = _df1[c * self.n_iterations:(c + 1) * self.n_iterations]
-                _df3.values[a2:a3, :] = _df2[c * fit_new.n_iterations:(c + 1) * fit_new.n_iterations]
-
-        self.sample_df = sample_df_new
-        self.sample_info_df = sample_info_df_new
-        self.pids = np.hstack([self.pids, fit_new.pids.copy()])
-
-        for df in [self.sample_df, self.sample_info_df]:
-            df.reset_index(drop=True, inplace=True)
-
-        self.n_iterations = len(self.sample_df) // self.n_chains
-        self.n_samples = self.n_samples + fit_new.n_samples
-        self.set_n_burnin(self.n_burnin, debug=debug)
-
-        self.map_idx, self.max_log_posterior, self.map_params = self.get_map()
-
-        for C, C_new in zip(self.chain_results, fit_new.chain_results):
-            C['cov_draws'], C['mean_draws'] = aggregate_covs(
-                [temp['cov_draws'] for temp in (C, C_new)],
-                [temp['mean_draws'] for temp in (C, C_new)],
-                [temp['n_samples'] + temp['n_burnin'] for temp in (C, C_new)]
-            )
-            for k in ['n_burnin', 'n_samples', 'itr', 'lp_time', 'cov_time', 'draw_time', 'accept_decision_time',
-                      'fit_elapsed', 'setup_time']:
-                C[k] += C_new[k]
-            for k in ['accepteds', 'scalers', 'acceptance_probs']:
-                C[k] = np.hstack([C[k], C_new[k]])
-
-        self.acceptance_rate = np.average([self.acceptance_rate, fit_new.acceptance_rate],
-                                          weights=[self.n_iterations - fit_new.n_iterations, fit_new.n_iterations])
-
-        self.mcmc_time += fit_new.mcmc_time
-        self.other_info = fit_new.other_info.copy()
-
-        gc.collect()
-
-        if debug:
-            print(f"\nDone merging MCMC draws! ({time.time() - _t:.2f}s)\n")
-
-    def __call__(self, *args, **kwargs):
-        """
-        Convenience shorthand for ``get_sample(*args, **kwargs)``.
-
-        Args:
-            *args: Positional arguments forwarded to ``get_sample``.
-            **kwargs: Keyword arguments forwarded to ``get_sample``.
-
-        Returns:
-            Whatever ``get_sample`` returns.
-        """
-        return self.get_sample(*args, **kwargs)
-
-    def plot_credible_intervals(self, param_names, title=None, figsize=(10, 5),
-                                dpi=130, show=False, level=.9, plot_horizontal_line=False, midpoint=None,
-                                sample_size=10_000):
-        """
-        Plot symmetric equi-tailed credible intervals for a set of parameters.
-
-                For each parameter draws a sample, computes the equi-tailed interval
-                at ``level``, and delegates to ``plot_confidence_intervals`` for
-                rendering a horizontal error-bar plot.
-
-        Args:
-            param_names: List of parameter names to plot.
-            title: Optional plot title.
-            figsize: Figure size tuple.
-            dpi: Figure resolution.
-            show: Whether to call ``plt.show()``.
-            level: Coverage probability (e.g. 0.9 for 90% intervals).
-            plot_horizontal_line: Whether to draw a reference horizontal line at zero.
-            midpoint: Point estimate to mark: ``'mean'`` or ``'median'``.
-            sample_size: Number of draws used for the quantile calculation.
-
-        Returns:
-            Matplotlib Figure object from ``plot_confidence_intervals``.
-        """
-
-
-        if midpoint is None:
-            midpoint = 'mean'
-        else:
-            midpoint = midpoint.lower()
-            assert midpoint in ('mean', 'median')
-
-        point_estims = []
-        conf_ints = []
-
-        for p in param_names:
-            x = self.get_sample(p, return_array=True, subsample=sample_size)
-            point_estims.append(x.mean() if midpoint == 'mean' else np.median(x))
-            conf_ints.append(np.quantile(x, [(1 - level) / 2, 1 - (1 - level) / 2]))
-
-        return plot_confidence_intervals(
-            conf_ints, point_estims=point_estims, labels=param_names, title=title, figsize=figsize,
-            dpi=dpi, show=show, level=level, plot_horizontal_line=plot_horizontal_line)
+            fixed_params_transformed = fixed_params
+
+        fixed_param_ind = np.array([self.param_2_idx[k] for k in fixed_params_transformed])
+        fixed_param_vals = np.array(list(fixed_params_transformed.values()))
+        n_unfixed = self.num_params - len(fixed_params)
+        unfixed_param_ind = np.array([i for i in range(self.num_params) if i not in fixed_param_ind])
+
+        def temp_func(z):
+            """Evaluate ``function`` with fixed parameters inserted at their indices.
+
+            Constructs the full parameter vector by placing fixed values at
+            ``fixed_param_ind`` and the free values ``z`` at ``unfixed_param_ind``.
+
+            Args:
+                z: 1-D array of free parameter values (length ``n_unfixed``).
+
+            Returns:
+                Scalar function value at the reconstituted full parameter vector.
+            """
+            x = np.zeros(self.num_params)
+            x[fixed_param_ind] = fixed_param_vals
+            x[unfixed_param_ind] = z
+            return function(x)
+
+        return temp_func, n_unfixed, fixed_param_ind, fixed_param_vals, unfixed_param_ind
+
+    def map(self, start_params, fixed_params=None, use_transformed_scale=True, onesided_fd=None,
+            maxiter=200, H0=1.0, xtol=1e-8, ftol=1e-8, gtol=1e-4, dx_fd=1e-6, momentum=.05, seed=0, debug=False,
+            user_prompt_for_more_iters=False,
+            ) -> BayesianModelMaximizationResult:
+        """Maximum a posteriori (MAP) estimate via bounded BFGS.
+
+        Maximizes ``log_posterior`` (likelihood + priors + bounds).  By default
+        optimization runs in **transformed** unbounded coordinates when
+        ``do_bounded_transform=True``, then maps the solution back to the
+        original scale.
+
+        Parameters
+        ----------
+        start_params, fixed_params : array_like or dict
+            On the **original** parameter scale unless
+            ``use_transformed_scale=False``.
+        use_transformed_scale : bool, default True
+            Optimize ``log_posterior_transformed`` in internal coordinates.
+        onesided_fd, maxiter, H0, xtol, ftol, gtol, dx_fd, momentum, seed, debug,
+        user_prompt_for_more_iters
+            Forwarded to :func:`~kanly.bayes.map.maximum_a_posteriori.bfgs_pqn`.
+
+        Returns
+        -------
+        BayesianModelMaximizationResult
+            Mode, optimization diagnostics, and parameter names.
+
+        See Also
+        --------
+        mle
+        """
+
+        return map(self, start_params, fixed_params=fixed_params, use_transformed_scale=use_transformed_scale, onesided_fd=onesided_fd,
+                   maxiter=maxiter, H0=H0, xtol=xtol, ftol=ftol, gtol=gtol, dx_fd=dx_fd, momentum=momentum, seed=seed,
+                   debug=debug, user_prompt_for_more_iters=user_prompt_for_more_iters)
+
+    def mle(self, start_params, fixed_params=None, use_transformed_scale=True, onesided_fd=None,
+            maxiter=200, H0=1.0, xtol=1e-8, ftol=1e-8, gtol=1e-4, dx_fd=1e-6, momentum=.05, seed=0, debug=False,
+            user_prompt_for_more_iters=False, pbar_update_cadence=.3
+            ) -> BayesianModelMaximizationResult:
+        """Maximum likelihood estimate (flat prior on parameters).
+
+        Same optimizer as :meth:`map`, but maximizes ``log_likelihood`` only
+        (priors ignored).
+
+        Parameters
+        ----------
+        start_params, fixed_params : array_like or dict
+            On the original scale unless ``use_transformed_scale=False``.
+        use_transformed_scale : bool, default True
+            Optimize in transformed coordinates when bounds use reparameterization.
+        onesided_fd, maxiter, H0, xtol, ftol, gtol, dx_fd, momentum, seed, debug,
+        user_prompt_for_more_iters, pbar_update_cadence
+            Optimizer options (see :meth:`map`).
+
+        Returns
+        -------
+        BayesianModelMaximizationResult
+
+        See Also
+        --------
+        map
+        """
+
+        return mle(self, start_params, fixed_params=fixed_params, use_transformed_scale=use_transformed_scale, onesided_fd=onesided_fd,
+                   maxiter=maxiter, H0=H0, xtol=xtol, ftol=ftol, gtol=gtol, dx_fd=dx_fd, momentum=momentum, seed=seed,
+                   debug=debug, user_prompt_for_more_iters=user_prompt_for_more_iters,
+                   pbar_update_cadence=pbar_update_cadence)
+
+    # def get_frozen_function(bmodel, function, fixed_params, return_sub_func=True, transform=False):
+    #     fixed_params_transformed = {
+    #         k: bmodel.transformations.get(k).inv_transform(v)
+    #         if k in bmodel.transformations else v
+    #         for k, v in fixed_params.items()
+    #     }
+    #     fixed_param_ind = np.array([bmodel.param_2_idx[k] for k in FIX_PARAMS])
+    #     fixed_param_vals = np.array(list(fixed_params_transformed.values()))
+    #     n_unfixed = num_params - len(fixed_params)
+    #     unfixed_param_ind = np.array([i for i in range(num_params) if i not in fixed_param_ind])
+    #
+    #     def temp_func(z):
+    #         x = np.zeros(num_params)
+    #         x[fixed_param_ind] = fixed_param_vals
+    #         x[unfixed_param_ind] = z
+    #         return function(x)
+    #
+    #     return temp_func, n_unfixed, unfixed_param_ind
+    #
+    # def get_frozen_function(function, fixed_params):
+    #     fixed_params_transformed = {
+    #         k: bmodel.transformations.get(k).inv_transform(v)
+    #         if k in bmodel.transformations else v
+    #         for k, v in fixed_params.items()
+    #     }
+    #     fixed_param_ind = np.array([bmodel.param_2_idx[k] for k in FIX_PARAMS])
+    #     fixed_param_vals = np.array(list(fixed_params_transformed.values()))
+    #
+    #     #    n_unfixed = num_params - len(fixed_params)
+    #     #    unfixed_param_ind = np.array([i for i in range(num_params) if i not in fixed_param_ind])
+    #
+    #     def temp_func(z):
+    #         x = z.copy()
+    #         x[fixed_param_ind] = fixed_param_vals
+    #         return function(x)
+    #
+    #     return temp_func
+
+# def amha(log_likelihood_function, x0, bounds=None, do_bounded_transform=True, priors=None, param_names=None,
+#          num_params=None, specification_name=None, other_info=None, debug=False, n_chains=DEFAULT_AM_N_CHAINS,
+#          step_cov=None, n_burnin=DEFAULT_AM_N_BURNIN, n_samples=DEFAULT_AM_N_SAMPLES,
+#          max_processes=DEFAULT_AM_MAX_PROCESSES, seed=None, target_acceptance_rate=DEFAULT_AM_TARGET_ACCEPTANCE_RATE,
+#          draw_size=DEFAULT_AM_DRAW_SIZE, scaler0=None, min_scaler=DEFAULT_AM_MIN_SCALER,
+#          max_scaler=DEFAULT_AM_MAX_SCALER, scaler_adjust_rate=DEFAULT_AM_SCALER_ADJUST_RATE,
+#          thinning=DEFAULT_AM_THINNING, scaler_adjust_denom_power=DEFAULT_AM_SCALER_ADJUST_DENOM_POWER,
+#          resample_k=DEFAULT_AM_RESAMPLE_K, pbar_update_cadence=DEFAULT_AM_PBAR_UPDATE_CADENCE,
+#          do_adaptive=DEFAULT_AM_DO_ADAPTIVE,
+#          max_subchain_draws_burnin=DEFAULT_AM_MAX_SUBCHAIN_DRAWS_BURNIN,
+#          max_subchain_draws_sample=DEFAULT_AM_MAX_SUBCHAIN_DRAWS_SAMPlE,
+#          do_parallel=DEFAULT_AM_DO_PARALLEL, user_prompt_for_more_iters=DEFAULT_AM_USER_PROMPT_FOR_MORE_ITERS,
+#          proposal_df=DEFAULT_AM_PROPOSAL_DF, x0_is_original_scale=True,
+#          step_cov_adjust_rate=DEFAULT_AM_STEP_COV_ADJUST_RATE, fix_params=None,
+#          show_r_hat_ever_subchain=False,
+#          normalize_step_cov=DEFAULT_AM_NORMALIZE_STEP_COV
+#          ) -> MCMCResults:
+#     """Adaptive Metropolis Hastings"""
+#
+#     bmodel = BayesianModel(log_likelihood_function, bounds=bounds, do_bounded_transform=do_bounded_transform,
+#                            priors=priors, param_names=param_names, num_params=num_params,
+#                            specification_name=specification_name, other_info=other_info)
+#     fit = bmodel.amha(x0, step_cov=step_cov, debug=debug, specification_name=specification_name, n_chains=n_chains,
+#                       n_burnin=n_burnin, n_samples=n_samples, max_processes=max_processes, seed=seed,
+#                       target_acceptance_rate=target_acceptance_rate, draw_size=draw_size, scaler0=scaler0,
+#                       min_scaler=min_scaler, max_scaler=max_scaler, scaler_adjust_rate=scaler_adjust_rate,
+#                       thinning=thinning, scaler_adjust_denom_power=scaler_adjust_denom_power, resample_k=resample_k,
+#                       pbar_update_cadence=pbar_update_cadence, do_adaptive=do_adaptive,
+#                       max_subchain_draws_burnin=max_subchain_draws_burnin,
+#                       max_subchain_draws_sample=max_subchain_draws_sample,
+#                       do_parallel=do_parallel,
+#                       user_prompt_for_more_iters=user_prompt_for_more_iters, proposal_df=proposal_df,
+#                       x0_is_original_scale=x0_is_original_scale, step_cov_adjust_rate=step_cov_adjust_rate,
+#                       fix_params=fix_params, show_r_hat_ever_subchain=show_r_hat_ever_subchain,
+#                       normalize_step_cov=normalize_step_cov,
+#                       )
+#     return fit
+#
+#
+# def mala(log_likelihood_function, x0, bounds=None, do_bounded_transform=True, priors=None, param_names=None,
+#          num_params=None, specification_name=None, other_info=None, n_chains=DEFAULT_COORD_MALA_N_CHAINS,
+#          n_samples=DEFAULT_COORD_MALA_N_SAMPLES, thinning=DEFAULT_COORD_MALA_THINNING,
+#          resample_k=DEFAULT_COORD_MALA_RESAMPLE_K, target_acceptance_rate=DEFAULT_COORD_MALA_TARGET_ACCEPTANCE_RATE,
+#          do_cauchy=DEFAULT_COORD_MALA_DO_CAUCHY, do_mala=DEFAULT_COORD_MALA_DO_MALA, x0_is_original_scale=True,
+#          debug=DEFAULT_COORD_MALA_DEBUG, pbar_update_cadence=DEFAULT_COORD_MALA_P_BAR_UPDATE_CADENCE,
+#          user_prompt_for_more_iters=DEFAULT_COORD_MALA_USER_PROMPT_FOR_MORE_ITERS,
+#          tau_adjust=DEFAULT_COORD_MALA_TAU_ADJUST, fix_params=None) -> MCMCResults:
+#     """Metropolis Adjusted Langevin MCMC"""
+#
+#     bmodel = BayesianModel(log_likelihood_function, bounds=bounds, do_bounded_transform=do_bounded_transform,
+#                            priors=priors, param_names=param_names, num_params=num_params,
+#                            specification_name=specification_name, other_info=other_info)
+#
+#     fit = bmodel.mala(x0, n_chains=n_chains, n_samples=n_samples,
+#              thinning=thinning, resample_k=resample_k,
+#              target_acceptance_rate=target_acceptance_rate, do_cauchy=do_cauchy,
+#              do_mala=do_mala, x0_is_original_scale=x0_is_original_scale, debug=debug,
+#              pbar_update_cadence=pbar_update_cadence,
+#              user_prompt_for_more_iters=user_prompt_for_more_iters,
+#              tau_adjust=tau_adjust, fix_params=fix_params)
+#
+#     return fit
+#
+# # #
+# if __name__ == '__main__':
+#     from scipy.stats import multivariate_normal
+#     import matplotlib.pyplot as plt
+#     from kanly.api import amha, read
+#
+#     F = multivariate_normal([3, 2.], [[1, .3], [.3, 10]])
+#     # model = BayesianModel(
+#     #                       #bounds={'a': [1, 10_000]},
+#     #                       #priors={'b': 'normal(-10,.5)'}
+#     #                       )
+#     # fit = amha(F.logpdf, [2., .5], param_names=['a', 'b'], debug=True,
+#     #           priors=None,
+#     #           n_burnin=30_000, n_samples=60_000, user_prompt_for_more_iters=False, n_chains=5)
+#     # print(fit)
+#
+#     #bmodel = BayesianModel
+#     fit = amha(F.logpdf, [2., .5], param_names=['a', 'b'], debug=True,
+#                bounds={'a': [1, 10_000]},
+#                priors=None,
+#                n_burnin=10_000,
+#                n_samples=10_000,
+#                user_prompt_for_more_iters=False, n_chains=5,
+#                )
+#     fit.save('fit_mcmc_example.txt')
+#
+#     fit2 = read('fit_mcmc_example.txt')
+#     print(fit2)
+#
+#     print(fit.model.log_posterior_jacobian_adjustment.__doc__)
+#     # print(fit)
+#     # print(fit.ess)
+#     # print(fit.get_ess_from_batched_means(selection='coordinate'))
+#     # print(fit.get_ess_from_batched_means(selection='joint'))
+#     # fit.multi_hist(fit.param_names)
+#     # plt.show()
+# #
+
+#
+#     fit = mod1.amha([.5, 1], debug=True, n_samples=3_000, n_burnin=3_000)
+#     print(fit)
+#
+#     # check transforms
+#     print(fit.map_params)
+#     print(fit.transform(fit.inv_transform(fit.map_params)))
+#
+#     print(fit.max_log_posterior)
+#     print(fit.log_posterior_original(fit.map_params))
+#     print(fit.log_posterior(fit.inv_transform(fit.map_params)))
+#
+# if __name__ == '__main__':
+#     from kanly.api import bayes_nlls_model
+#
+#     np.random.seed(0)
+#     n = 100
+#     x = 1.56 * np.random.randn(n)
+#     z = np.random.rand(n)
+#     y = 3 + 10 * x + np.random.randn(n) * 3
+#     wts = .01 + np.random.rand(n)
+#     data = {'x': x, 'y': y, 'z': z, 'wts': wts, 'g': np.random.randint(0, 12, n)}
+#
+#     # model = bayes_nlls_model(
+#     #     '[y] ~ {a} + {b}*[x]',
+#     #
+#     #     data,
+#     #     debug=False
+#     # )
+#     #
+#     # print(model)
+#     #
+#     # print(model.amha([0,1,1], n_samples=30_000))
+#
+#     model = bayes_nlls_model(
+#         '[y] ~ {a} + {b}*[x]',
+#         data, priors={'a': 'half_norm(0, 25)', 'b': 'flat(14, 33)'},
+#         debug=True
+#     )
+#
+#     print(model)
+#     print(model.amha([20, 30, 1], n_samples=10_000))
+# #     print(model.amha([20, 30, 1], n_samples=10_000, do_parallel=False))
+# #     print(model.mala([20, 30, 1], n_samples=10_000))
