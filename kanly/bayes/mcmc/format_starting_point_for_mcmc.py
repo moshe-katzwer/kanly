@@ -15,7 +15,9 @@ def format_starting_point_for_mcmc(x0, x0_is_original_scale, n_chains, transform
         x0_is_original_scale: Whether ``x0`` is on original bounded model scale.
         n_chains: Number of chains to initialize.
         transformations: Optional transform mapping keyed by name or index.
-        fix_params: Optional fixed-parameter mapping keyed by name or index.
+        fix_params: Fixed parameters keyed by name or index, on the same
+            scale as x0. The returned fixed mappings contain the values on
+            the original model scale and unbounded sampling scale, respectively.
         param_names: Optional ordered parameter names.
         debug: If True, print normalization/validation timing.
     """
@@ -77,9 +79,15 @@ def format_starting_point_for_mcmc(x0, x0_is_original_scale, n_chains, transform
                 {i: f.inv_transform(fix_params_transformed[i]) for i, f in transformations.items()
                  if i in fix_params_transformed})
 
-    if np.any(np.isnan(x0s)):
-        raise Exception("Starting point has nan values.  Please check the supplied starting point, "
-                        "as well as any transformations or fixed parameters.")
+    elif transformations and fix_params:
+        # The kernel already has the caller's sampling-space values. Store
+        # original-scale fixed values alongside the original-scale result draws.
+        fix_params = {i: transformations[i](v) if i in transformations else v
+                      for i, v in fix_params.items()}
+
+    if not np.all(np.isfinite(x0s)):
+        raise ValueError("Starting parameters must be finite in sampling space after applying "
+                         "bounds and fixed values.")
 
     if debug:
         print(f'done! ({time.time() - __t:.2f}s)\n')
