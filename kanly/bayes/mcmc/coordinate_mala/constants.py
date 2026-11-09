@@ -12,12 +12,13 @@ METHOD = 'CD-MALA'  # Coordinate MALA
 # ── Chain topology ────────────────────────────────────────────────────────────
 DEFAULT_COORD_MALA_N_CHAINS = 4         # Number of parallel chains.
 DEFAULT_COORD_MALA_N_SAMPLES = 20_000   # Total draws per chain (burn-in included).
-# Fraction of total draws treated as burn-in; first (frac_burnin * n_samples) draws
-# are discarded from posterior summaries in MCMCResults.
+# Fraction of the initially requested draws used for adaptation and discarded
+# from posterior summaries. Proposal tuning and the DE pool freeze afterward.
 DEFAULT_COORD_MALA_FRAC_BURNIN = .25
 DEFAULT_COORD_MALA_THINNING = 1         # Store every k-th draw; 1 = keep all.
 # Maximum draws per sub-chain; total draws are split into batches of this size
-# so that tau and the DE pool can be updated between sub-chains.
+# with a separate boundary at the end of warm-up. Tau and the DE pool can
+# be updated between warm-up sub-chains only.
 DEFAULT_COORD_MALA_MAX_SUBCHAIN_DRAWS = 5_000
 
 # ── Proposal and adaptation ───────────────────────────────────────────────────
@@ -30,7 +31,7 @@ DEFAULT_COORD_MALA_DO_MALA = True
 # Whether to use Cauchy (heavy-tailed) innovations instead of Gaussian.
 # Cauchy proposals can improve mixing when the target has heavy tails.
 DEFAULT_COORD_MALA_DO_CAUCHY = False
-# Learning rate for the per-coordinate tau adaptation rule:
+# Learning rate for the per-coordinate tau adaptation rule during warm-up:
 #   tau[coord] *= 1 + tau_adjust * (accepted - target_accept)
 # Larger values adapt faster but may overshoot.
 DEFAULT_COORD_MALA_TAU_ADJUST = .25
@@ -45,7 +46,7 @@ DEFAULT_COORD_MALA_USER_PROMPT_FOR_MORE_ITERS = False  # Ask user to continue sa
 # DE jump (difference of two past samples) instead of a coordinate MALA step.
 # This helps escape correlated or multimodal regions that coordinate moves miss.
 DEFAULT_COORD_MALA_DIFF_EVOLUTION_STEP_CADENCE = 20
-# Fraction of each chain's history to skip when building the DE pool;
+# Fraction of each chain's warm-up history to skip when building the DE pool;
 # avoids using very early warm-up draws that may be far from the mode.
 DEFAULT_COORD_MALA_DIFF_EVOLUTION_FRAC_BURNIN = .5
 # Maximum size of the DE past-sample pool.
