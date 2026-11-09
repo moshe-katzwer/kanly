@@ -8,7 +8,6 @@ from abc import abstractmethod
 from numba import njit  # don't delete!
 
 from kanly.utils.logit_functions import expit, logit, log_d_expit
-from kanly.bayes.mcmc.aggregate_covariances import get_total_covariance_from_batches
 from kanly.dill_object import DillObject
 
 LOWER_BOUND = 'LOWER_BOUND'
@@ -30,7 +29,7 @@ class TransformedParameter(DillObject):
     --------------------------------------------------------------------------------------------
     x in (a,    inf)   |   x = a + exp(y)                   |   y = log(x - a)
     x in (-inf, b  )   |   x = b - exp(y)                   |   y = log(b - x)
-    x in (a,    b  )   |   x = a + (b-a) * log(y / (1-y))   |   y = 1 / (1+exp{-(x-a)/(b-a)})
+    x in (a,    b  )   |   x = a + (b-a) / (1+exp(-y))    |   y = log((x-a)/(b-x))
     --------------------------------------------------------------------------------------------
     [-inf < a < b < inf]
 
@@ -96,8 +95,12 @@ class TransformedParameter(DillObject):
             self.inv_transform_str = f'logit(({{{self.name}}} - ({lb}))/({ub - lb}))'
             self.transform = lambda z: lb + (ub - lb) * expit(z)
             self.inv_transform = lambda z: logit((z - lb) / (ub - lb))
-            self.lp_adjust = log_d_expit
-            self.lp_adjust_str = f'log_d_expit({{{self.name}}})'
+            log_width = np.log(ub - lb)
+            self.lp_adjust = lambda z: log_width - np.logaddexp(0.0, -z) - np.logaddexp(0.0, z)
+            self.lp_adjust_str = (
+                f'({log_width} - np.logaddexp(0.0, -{{{self.name}}})'
+                f' - np.logaddexp(0.0, {{{self.name}}}))'
+            )
             self.type = INTERVAL
 
     @staticmethod
@@ -263,37 +266,46 @@ def get_transformation_vector_functions(transformations, param_names, debug=Fals
     _lp_adj_base = exect_dict['_lp_jacobian_adjustment_base']
 
     def _transform(params, inplace=False):
-        """Apply the forward bounded→unbounded transformation to the parameter vector.
+        """Map an unbounded sampling vector to the original parameter space.
 
         Copies ``params`` (unless ``inplace=True``) and then calls the
         Numba-JIT compiled ``_transform_base`` kernel generated from
         ``trans_func_str``.
 
         Args:
-            params: Parameter vector in the original (bounded) space.
-            inplace: When ``True``, modifies ``params`` in place (avoids a
-                copy allocation); when ``False`` (default) works on a fresh copy.
+            params: Parameter vector in the unbounded sampling space.
+            inplace: When ``True``, requires a floating-point NumPy array and
+                modifies it in place; otherwise works on a fresh floating copy.
 
         Returns:
-            NumPy array of the same length as ``params`` in the unbounded space.
+            NumPy array in the original (possibly bounded) parameter space.
         """
-        params = np.array(params, copy=not inplace)
+        if inplace:
+            if not isinstance(params, np.ndarray) or not np.issubdtype(params.dtype, np.floating):
+                raise ValueError('inplace=True requires a floating-point NumPy array')
+        else:
+            params = np.array(params, dtype=float, copy=True)
         return _tr_base(params)
 
     def _inv_transform(params, inplace=False):
-        """Apply the inverse unbounded→bounded transformation to the parameter vector.
+        """Map an original parameter vector to the unbounded sampling space.
 
         Copies ``params`` (unless ``inplace=True``) and then calls the
         Numba-JIT compiled ``_inv_transform_base`` kernel.
 
         Args:
-            params: Parameter vector in the unbounded sampling space.
-            inplace: When ``True``, modifies ``params`` in place.
+            params: Parameter vector in the original (possibly bounded) space.
+            inplace: When ``True``, requires a floating-point NumPy array and
+                modifies it in place; otherwise works on a fresh floating copy.
 
         Returns:
-            NumPy array in the original (bounded) parameter space.
+            NumPy array in the unbounded sampling space.
         """
-        params = np.array(params, copy=not inplace)
+        if inplace:
+            if not isinstance(params, np.ndarray) or not np.issubdtype(params.dtype, np.floating):
+                raise ValueError('inplace=True requires a floating-point NumPy array')
+        else:
+            params = np.array(params, dtype=float, copy=True)
         return _inv_tr_base(params)
 
     def _lp_jacobian_adjustment(params):
@@ -316,41 +328,77 @@ def get_transformation_vector_functions(transformations, param_names, debug=Fals
     return _transform, _inv_transform, _lp_jacobian_adjustment, trans_func_str, inv_trans_func_str, lp_adj_func_str
 
 
-def convert_samples_to_unbounded_space(chain_results, transformations, num_params, debug=False, key='samples', window_start=None):
-    """
-    Converts *inplace* the chain results, converts the samples back to the original bounded parameter
-    space from the unbounded parameter transformed space.
+def convert_samples_to_original_space(chain_results, transformations, num_params, debug=False, key='samples', window_start=None):
+    """Summarize unbounded draws, then map stored draws to the original space.
+
+    The returned population covariance and mean are always computed on the
+    unbounded sampling scale, including models with no transformations.
+    ``window_start`` excludes warm-up from those statistics; all stored draws
+    are subsequently converted for presentation. Each result dictionary is
+    updated in place with a floating-point sample array.
 
     Args:
         chain_results: List of per-chain result dictionaries.
-        transformations: Mapping from index to forward transform callable.
+        transformations: Optional mapping from index to forward transform callable.
         num_params: Number of parameters.
         debug: Debug mode flag.
         key: Entry in chain dict containing sample arrays.
-        window_start: Optional trimming start index for covariance/mean estimate.
+        window_start: Optional first retained row for covariance/mean estimates.
+
+    Returns:
+        Covariance with shape ``(num_params, num_params)`` and mean with shape
+        ``(num_params,)``. A single retained draw has zero population covariance.
     """
-    if len(transformations):
-        if debug:
-            print("Computing variance-covariance on unbounded scale...", end="")
+    transformations = {} if transformations is None else transformations
+    start = 0 if window_start is None else window_start
+    if isinstance(start, (bool, np.bool_)) or not isinstance(start, (int, np.integer)) or start < 0:
+        raise ValueError('window_start must be a nonnegative integer or None')
+    if debug:
+        print("Computing variance-covariance on unbounded scale...", end="")
 
-        cov_params_unbndd, mean_params_unbndd = get_total_covariance_from_batches([
-            c[key] for c in chain_results], window_start=window_start)
+    sample_arrays = []
+    count = 0
+    mean = np.zeros(num_params, dtype=float)
+    sum_squared_deviations = np.zeros((num_params, num_params), dtype=float)
+    for chain in chain_results:
+        samples = np.asarray(chain[key], dtype=float)
+        if samples.ndim != 2 or samples.shape[1] != num_params:
+            raise ValueError(f'{key} must have shape (n_draws, num_params)')
+        if start > len(samples):
+            raise ValueError('window_start exceeds the number of stored draws')
+        sample_arrays.append(samples)
+        retained = samples[start:]
+        batch_count = len(retained)
+        if not batch_count:
+            continue
+        batch_mean = retained.mean(axis=0)
+        centered = retained - batch_mean
+        delta = batch_mean - mean
+        combined_count = count + batch_count
+        sum_squared_deviations += centered.T @ centered
+        sum_squared_deviations += np.outer(delta, delta) * (count * batch_count / combined_count)
+        mean += delta * (batch_count / combined_count)
+        count = combined_count
+    if not count:
+        raise ValueError('At least one retained draw is required to summarize samples')
+    covariance = sum_squared_deviations / count
 
-        if debug:
-            print('done!')
-
-        if debug:
+    if debug:
+        print('done!')
+        if transformations:
             print("Transforming results back to original parameter space...", end="")
 
-        # transform the results
-        for c in chain_results:
-            for i in range(num_params):
-                c[key][:, i] = transformations.get(i, lambda x: x)(c[key][:, i])
+    for chain, samples in zip(chain_results, sample_arrays):
+        original_samples = samples.copy()
+        for index, transform in transformations.items():
+            original_samples[:, index] = transform(original_samples[:, index])
+        chain[key] = original_samples
 
-        if debug:
-            print('done!')
+    if debug and transformations:
+        print('done!')
+    return covariance, mean
 
-    else:
-        cov_params_unbndd, mean_params_unbndd = None, None
 
-    return cov_params_unbndd, mean_params_unbndd
+# Historical name pointed in the opposite direction. Keep existing callers
+# working while the samplers use the explicit original-space name.
+convert_samples_to_unbounded_space = convert_samples_to_original_space
