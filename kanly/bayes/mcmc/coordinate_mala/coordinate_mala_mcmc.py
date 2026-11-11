@@ -28,6 +28,7 @@ from __future__ import absolute_import, print_function
 
 import os
 import time
+from math import isfinite
 
 import numpy as np
 from scipy.stats import cauchy
@@ -51,12 +52,31 @@ from kanly.bayes.mcmc.coordinate_mala.constants import (
     METHOD as CD_MALA_METHOD, DEFAULT_COORD_MALA_FRAC_BURNIN
 )
 
-from kanly.bayes.mcmc.format_starting_point_for_mcmc import format_starting_point_for_mcmc
+from kanly.bayes.mcmc.format_starting_point_for_mcmc import (
+    format_starting_point_for_mcmc, validate_parameter_index,
+)
 from kanly.bayes.mcmc.diagnostics.diagnostics import get_diagnostic_update_message
 from kanly.bayes.mcmc.mcmc_results import MCMCResults
 from kanly.bayes.parameter_transformations import convert_samples_to_original_space
 from kanly.utils.print_options import print_options
 from kanly.utils.user_prompt_for_more_iters import user_prompt_for_more_iters_method
+
+
+def _check_sampling_bounds(bounds, starts, num_params):
+    """Validate hard bounds and formatted starts before evaluating the target."""
+    if bounds is None:
+        return None
+    bounds = np.asarray(bounds, dtype=float)
+    if bounds.shape != (2, num_params):
+        raise ValueError('bounds must contain lower and upper vectors of length num_params')
+    lower, upper = bounds
+    if not np.all(lower <= upper):
+        raise ValueError('bounds must be ordered and may not contain NaN')
+    if not np.all((lower <= starts) & (starts <= upper)):
+        raise ValueError('Starting point is outside the hard sampling bounds')
+    if np.all(np.isneginf(lower)) and np.all(np.isposinf(upper)):
+        return None
+    return bounds
 
 
 @np.errstate(all='ignore')
@@ -66,7 +86,7 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
                    pbar_update_cadence=DEFAULT_COORD_MALA_P_BAR_UPDATE_CADENCE, do_mala=DEFAULT_COORD_MALA_DO_MALA,
                    debug=False, tau_adjust=DEFAULT_COORD_MALA_TAU_ADJUST, bloc=0, fix_param_set=None,
                    position=0, diff_evolution_step_cadence=DEFAULT_COORD_MALA_DIFF_EVOLUTION_STEP_CADENCE,
-                   past_samples=None, diff_evolution_scale=1.0, n_warmup=0):
+                   past_samples=None, diff_evolution_scale=1.0, n_warmup=0, bounds=None):
 
     """Run a single coordinate-wise MALA (or random-walk Metropolis) chain.
 
@@ -115,6 +135,8 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
             adapted using a 0.234-target rule during warm-up only.
         n_warmup: Number of the ``n_samples`` stored draws reserved for
             adaptation.  Defaults to zero (fixed-proposal sampling).
+        bounds: Optional pair of inclusive lower and upper bound vectors in
+            sampling coordinates. Impossible probes and proposals skip the target.
 
     Returns:
         Dict with keys: ``'samples'`` (2-D array of shape ``(n_samples, p)``),
@@ -125,13 +147,13 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
     """
     __t = time.time()
 
-    if lp_adj_func is None:
-        lp_adj_func = lambda x: 0.0
-
     x0 = np.array(x0_start, dtype=float, copy=True)
     if x0.ndim != 1 or not len(x0) or not np.all(np.isfinite(x0)):
         raise ValueError('x0_start must be a nonempty finite one-dimensional vector')
     p = len(x0)
+    bounds = _check_sampling_bounds(bounds, x0, p)
+    if bounds is not None:
+        lower, upper = bounds
     if not isinstance(n_samples, (int, np.integer)) or n_samples < 0:
         raise ValueError('n_samples must be a nonnegative integer')
     if not isinstance(thinning, (int, np.integer)) or thinning < 1:
@@ -154,40 +176,37 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
 
     last_update_time = 0
 
-    def deriv_lp(i, value, f0=None, dx=1e-6):
-        """Compute the finite-difference partial derivative of the log-posterior at coordinate ``i``.
+    def evaluate(x):
+        lp = lp_func(x)
+        adjustment = lp_adj_func(x) if lp_adj_func is not None and isfinite(lp) else 0.0
+        return lp, adjustment
 
-        Uses a forward difference where finite, a backward difference at a
-        support boundary, and zero drift if neither finite difference is
-        available.  This same deterministic rule is used in both proposal
-        densities of the Hastings correction.  The Jacobian adjustment is
-        included in every evaluation.
+    def deriv_lp(i, x, adjusted_lp):
+        """Use the same forward, backward, then zero drift rule at both endpoints."""
+        xi = x[i]
+        di = max(min(abs(xi), 1.) * 1e-6, 1e-12)
+        probe = None
+        for step in (di, -di):
+            candidate = xi + step
+            if not isfinite(candidate) or (bounds is not None and not lower[i] <= candidate <= upper[i]):
+                continue
+            if candidate == xi:
+                return 0.0
+            if probe is None:
+                probe = x.copy()
+            probe[i] = candidate
+            lp, adjustment = evaluate(probe)
+            slope = (lp + adjustment - adjusted_lp) / step
+            if isfinite(slope):
+                return slope
+        return 0.0
 
-        Args:
-            i: Coordinate index at which to differentiate.
-            value: Current parameter vector (1-D array).
-            f0: Pre-evaluated log-posterior (+ Jacobian adjustment) at ``value``;
-                re-evaluated from ``lp_func`` when ``None``.
-            dx: Relative finite-difference step size.
+    # These derivatives belong to the entire current state. A change in
+    # any coordinate can change all partials of a coupled log-posterior.
+    current_derivatives = {}
 
-        Returns:
-            Scalar finite-difference estimate of ``d/dx_i log_π(value)``.
-        """
-        if f0 is None:
-            f0 = lp_func(value) + lp_adj_func(value)
-        di = max(min(np.abs(value[i]), 1.) * dx, 1e-12)
-        value1 = np.array(value)
-        value1[i] += di
-        fi = lp_func(value1) + lp_adj_func(value1)
-
-        val = (fi - f0) / di
-        if np.isfinite(val):
-            return val
-        value1[i] = value[i] - di
-        fi = lp_func(value1) + lp_adj_func(value1)
-        val = (f0 - fi) / di
-        return val if np.isfinite(val) else 0.0
-
+    if fix_param_set is not None:
+        fix_param_set = {validate_parameter_index(i, p, 'fix_param_set') for i in fix_param_set}
     rand = np.random.RandomState(seed)
     if fix_param_set:
         rand_coord = rand.choice(list(set(range(p)) - set(fix_param_set)),
@@ -205,8 +224,7 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
     draws = np.zeros((n_samples, p))
     log_posteriors = np.zeros(n_samples)
 
-    lp0 = lp_func(x0)
-    lp_adj0 = lp_adj_func(x0)
+    lp0, lp_adj0 = evaluate(x0)
     if not np.isfinite(lp0 + lp_adj0):
         raise ValueError('Starting point must have a finite adjusted log-posterior')
 
@@ -224,16 +242,16 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
     for itr, (coord, innov, log_uniform) in enumerate(zip(rand_coord, rand_innovation, rand_log_uniform)):
 
         adapting = itr < n_warmup * thinning
-        if past_samples is None:
+        de_pool = None
+        if diff_evolution_step_cadence and itr >= 100 and itr % diff_evolution_step_cadence == 0:
             # Only completed warm-up draws can enter the proposal pool.
             # Once warm-up ends, both slice limits stay fixed.
-            history_end = min(itr // thinning, n_warmup)
-            de_pool = draws[history_end // 2:history_end]
-        else:
             de_pool = past_samples
+            if de_pool is None:
+                history_end = min(itr // thinning, n_warmup)
+                de_pool = draws[history_end // 2:history_end]
 
-        if (diff_evolution_step_cadence and itr >= 100
-                and itr % diff_evolution_step_cadence == 0 and len(de_pool) >= 2):
+        if de_pool is not None and len(de_pool) >= 2:
             # differential evolution step:
             rnd_draw_idx = rand.randint(len(de_pool), size=2)
             direction = de_pool[rnd_draw_idx[0]] - de_pool[rnd_draw_idx[1]]
@@ -241,33 +259,42 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
                 direction[list(fix_param_set)] = 0.0
 
             x1 = x0 + diff_evolution_scale * direction
-            lp1 = lp_func(x1)
-            lp_adj1 = lp_adj_func(x1)
-
-            accepted = int(np.isfinite(lp1 + lp_adj1) and log_uniform < lp1 + lp_adj1 - (lp0 + lp_adj0))
-            if accepted:
-                x0, lp0, lp_adj0 = x1, lp1, lp_adj1
+            # Repeated history rows produce a valid self-proposal.
+            if np.array_equal(x1, x0):
+                accepted = 1
+            elif np.all(np.isfinite(x1)) and (bounds is None or np.all((lower <= x1) & (x1 <= upper))):
+                lp1, lp_adj1 = evaluate(x1)
+                accepted = int(isfinite(lp1 + lp_adj1) and log_uniform < lp1 + lp_adj1 - (lp0 + lp_adj0))
+                if accepted:
+                    x0, lp0, lp_adj0 = x1, lp1, lp_adj1
+                    current_derivatives.clear()
+            else:
+                accepted = 0
             if adapting:
                 diff_evolution_scale *= (1 + .05 * (accepted - .234))
 
         else:
             # coordinate mala step
             if do_mala:
-                deriv0 = deriv_lp(coord, x0, f0=lp0 + lp_adj0)
+                if coord not in current_derivatives:
+                    current_derivatives[coord] = deriv_lp(coord, x0, lp0 + lp_adj0)
+                deriv0 = current_derivatives[coord]
             else:
                 deriv0 = 0
 
-            x1 = np.array(x0)
-            x1[coord] += tau[coord] * deriv0 + np.sqrt(2 * tau[coord]) * innov
+            candidate = x0[coord] + (tau[coord] * deriv0 + np.sqrt(2 * tau[coord]) * innov)
+            lp1, lp_adj1 = -np.inf, 0.0
+            # An increment can round away at the scale of this coordinate.
+            accepted = int(candidate == x0[coord])
+            if not accepted and isfinite(candidate) and (bounds is None or lower[coord] <= candidate <= upper[coord]):
+                x1 = x0.copy()
+                x1[coord] = candidate
+                lp1, lp_adj1 = evaluate(x1)
 
-            lp1 = lp_func(x1)
-            lp_adj1 = lp_adj_func(x1)
-
-            accepted = 0
-            if np.isfinite(lp1 + lp_adj1):
+            if isfinite(lp1 + lp_adj1):
 
                 if do_mala:
-                    deriv1 = deriv_lp(coord, x1, f0=lp1 + lp_adj1)
+                    deriv1 = deriv_lp(coord, x1, lp1 + lp_adj1)
 
                     if do_cauchy:
 
@@ -296,6 +323,9 @@ def run_mala_chain(lp_func, lp_adj_func, x0_start, seed, n_samples, tau_start=No
                 if log_uniform < log_accept_prob:
                     x0, lp0, lp_adj0 = x1, lp1, lp_adj1
                     accepted = 1
+                    if do_mala:
+                        current_derivatives.clear()
+                        current_derivatives[coord] = deriv1
 
             if adapting:
                 tau[coord] *= 1 + tau_adjust * (accepted - target_accept)
@@ -402,7 +432,7 @@ def mala(log_posterior, start_params, seed=0,
          diff_evolution_frac_burnin=DEFAULT_COORD_MALA_DIFF_EVOLUTION_FRAC_BURNIN,
          diff_evolution_max_draws=DEFAULT_COORD_MALA_DIFF_EVOLUTION_MAX_DRAWS,
          callback_function=None,
-         tau0=None
+         tau0=None, bounds=None
          ) -> MCMCResults:
     """Run Coordinate MALA MCMC across multiple parallel chains.
 
@@ -438,6 +468,8 @@ def mala(log_posterior, start_params, seed=0,
             before sampling.
         transformations: Dict ``{param_index: TransformedParameter}`` for
             parameters reparameterized to an unbounded space.
+        bounds: Optional pair of inclusive lower and upper vectors on the
+            sampling scale, after any reparameterization.
         param_names: List of parameter name strings.  Auto-generated when ``None``.
         specification_name: Optional display label for the model run.
         n_chains: Number of parallel MCMC chains.
@@ -537,6 +569,7 @@ def mala(log_posterior, start_params, seed=0,
                                        debug=debug)
 
     fix_param_idx = fix_params.keys() if fix_params else None
+    bounds = _check_sampling_bounds(bounds, x0s_formatted, num_params)
     check_starting_point(x0s_formatted, log_posterior, log_posterior_jacobian_adjustment, debug)
 
     if debug:
@@ -634,7 +667,7 @@ def mala(log_posterior, start_params, seed=0,
                         do_cauchy,
                         pbar_update_cadence, do_mala, debug, tau_adjust, bloc,
                         fix_param_idx, pos, diff_evolution_step_cadence,
-                        past_samples_id, diff_evolution_scale, n_warmup_bloc
+                        past_samples_id, diff_evolution_scale, n_warmup_bloc, bounds
                     )
                     for pos, (start_params, seed_chain) in enumerate(zip(x0s_formatted, rand.randint(0, 3_000_000, n_chains)))
                 ]
@@ -756,6 +789,7 @@ def mala(log_posterior, start_params, seed=0,
         diff_evolution_frac_burnin=diff_evolution_frac_burnin,
         callback_function=callback_function,
         tau0=tau0,
+        bounds=bounds,
     )
     other_info = dict(
         tau_final=np.mean([c['tau'] for c in chain_results_master], axis=0),
