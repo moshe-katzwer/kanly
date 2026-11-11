@@ -12,7 +12,9 @@ from scipy.stats._multivariate import multi_rv_frozen
 
 from kanly import __version__
 from kanly.bayes.map.maximum_a_posteriori import map, mle, BayesianModelMaximizationResult
-from kanly.bayes.mcmc.adaptive_metropolis.adaptive_metropolis_mcmc import amha as amha_internal
+from kanly.bayes.mcmc.adaptive_metropolis.adaptive_metropolis_mcmc import (
+    amha as amha_internal, _validate_scaler0,
+)
 from kanly.bayes.mcmc.adaptive_metropolis.constants import \
     DEFAULT_AM_N_BURNIN, DEFAULT_AM_N_SAMPLES, \
     DEFAULT_AM_N_CHAINS, \
@@ -299,9 +301,7 @@ class BayesianModel(ParameterCollection):
         def _log_likelihood(params):
             """Evaluate the log-likelihood including any hard-bound log-barrier.
 
-            Adds ``lp_bounds_log_pdf(params)`` (which returns ``-inf`` when
-            ``params`` violates any hard bound, and 0 otherwise) to the
-            user-supplied log-likelihood function.
+            Check the hard bounds before calling the user likelihood.
 
             Args:
                 params: Parameter vector in the original (bounded) space.
@@ -309,7 +309,10 @@ class BayesianModel(ParameterCollection):
             Returns:
                 Scalar log-likelihood value (``-inf`` if bounds are violated).
             """
-            return self.log_likelihood_function(params) + self.lp_bounds_log_pdf(params)
+            barrier = self.lp_bounds_log_pdf(params)
+            if barrier == -np.inf:
+                return -np.inf
+            return self.log_likelihood_function(params) + barrier
 
         self._log_likelihood_bounded = _log_likelihood
         if self.transformations is not None and len(self.transformations):
@@ -349,7 +352,7 @@ class BayesianModel(ParameterCollection):
         def _log_posterior(params):
             """Evaluate the log-posterior in the original (bounded) parameter space.
 
-            Sums log-likelihood, log-prior, and the hard-bound log-barrier.
+            Check the hard bounds before evaluating the likelihood and priors.
 
             Args:
                 params: Parameter vector in the original (possibly bounded) space.
@@ -357,7 +360,10 @@ class BayesianModel(ParameterCollection):
             Returns:
                 Scalar log-posterior value (``-inf`` if bounds are violated).
             """
-            return self.log_likelihood_function(params) + self.log_pdf_prior(params) + self.lp_bounds_log_pdf(params)
+            barrier = self.lp_bounds_log_pdf(params)
+            if barrier == -np.inf:
+                return -np.inf
+            return self.log_likelihood_function(params) + self.log_pdf_prior(params) + barrier
 
         self.log_posterior = _log_posterior
         self.log_posterior.__doc__ = \
@@ -429,8 +435,8 @@ class BayesianModel(ParameterCollection):
         self.bounds = {k: tuple(v) for k, v in bounds.items()}
         self.do_bounded_transform = do_bounded_transform
 
-        if do_bounded_transform and len(bounds):
-            # Enforce bounds through reparameterization (preferred for MCMC stability).
+        if do_bounded_transform or not bounds:
+            # Sampling coordinates have no hard bounds to check.
             self.lp_bounds_log_pdf = lambda x: 0.0
             transformations = bounds_2_transformations(bounds)
         else:
@@ -857,8 +863,8 @@ class BayesianModel(ParameterCollection):
             How often to attempt a full-scale DE jump.
         scalar_jitter_bounds : tuple
             Bounds on extra scalar jitter in proposals.
-        stop_adaptation_after_burnin : bool
-            If ``True``, freeze ``step_cov``/``scaler`` adaptation after burn-in.
+        stop_adaptation_after_burnin : bool, default True
+            Freeze the proposal scale, covariance, and DE history after burn-in.
         callback_function : callable, optional
             ``callback(params) -> str`` each retained draw.
 
@@ -937,6 +943,8 @@ class BayesianModel(ParameterCollection):
         partial derivatives of ``log_posterior_transformed``.  With
         ``do_mala=True`` (default), proposals include Langevin drift toward
         higher density; with ``do_mala=False``, plain coordinate random walk.
+        Explicit hard bounds are checked in sampling coordinates before
+        evaluating proposals and finite-difference probes.
         Per-coordinate step sizes ``tau`` adapt toward
         ``target_acceptance_rate``.  Periodic full-dimensional DE steps use
         ``diff_evolution_step_cadence``.
@@ -1004,6 +1012,7 @@ class BayesianModel(ParameterCollection):
 
         fit = mala_internal(
             self.log_posterior_transformed, start_params,
+            bounds=self.bounds_dict_2_array() if self.bounds and not self.do_bounded_transform else None,
             log_posterior_jacobian_adjustment=self.log_posterior_jacobian_adjustment,
             n_chains=n_chains, n_samples=n_samples, frac_burnin=frac_burnin, thinning=thinning,
             # resample_k=resample_k,
@@ -1194,12 +1203,8 @@ class BayesianModel(ParameterCollection):
                 * Burnin: specified by number of draws in `n_burnin`, and
                 * Sampling: specified by the number of draws in `n_samples`.
 
-            Essentially the burnin samples are used to tune to the sampling algorithm, but are not included in
-            the final results.  If `stop_adaptation_after_burnin=True`, then there are no further adaptations in
-            the sampling distribution after the burnin samples are complete, otherwise there are still some small
-            adaptations.  In practice this doesn't matter much and can lead to faster convergence, but in theory
-            the sample only asymptotically converges to the correct target distribution if the adaptations go to zero.
-            Note that burnin samples are not discarded, in the final results they are just labeled as burnin.
+            By default, AMHA tunes its proposal during burn-in and freezes it for retained sampling.
+            The results label burn-in draws and exclude them from posterior summaries.
 
             This is a very simplified version of the code, but essentially the code essentially runs as follows:
 
@@ -1337,10 +1342,8 @@ class BayesianModel(ParameterCollection):
             diff_evolution_jump_cadence: default np.inf; cadence with which to try a full (scaler=1) jump in direction of
                                          differential evolution direction (x(i1) - x(i2)) where x(i1),x(i2) are the D.E.
                                          draws at iteration i.  Don't experiment with this.
-            stop_adaptation_after_burnin: default False. If True, freeze proposal
-                                          adaptation after the burn-in phase.  For long chains this
-                                          rarely changes practical results; in theory adaptation must
-                                          vanish for exact asymptotic correctness.
+            stop_adaptation_after_burnin: default True. Freeze the proposal scale, covariance, and DE
+                                          history after burn-in. Set False to continue adaptation.
 
             do_mala_cd_warmup: default False. If True, run coordinate MALA warmup before AMHA.
                                Recommended for strongly correlated or badly scaled posteriors.
@@ -1451,6 +1454,7 @@ class BayesianModel(ParameterCollection):
         self.check_bounds_satisfied(start_params, start_params_is_original_scale)
 
         if do_mala_cd_warmup:
+            _validate_scaler0(scaler0)
 
             if debug:
                 print('\n' * 3 + '=' * 100)
